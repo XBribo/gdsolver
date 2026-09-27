@@ -1217,6 +1217,7 @@ inline int applyRotation(State& c, double uPrev, double dxUsed, long long t,
                 YSET(c.y) = (float)bestY;
                 c.flip = c.flip ? 0 : 1;
                 VYSET(c.vy) = (float)(1.0 * gs);   // the teleport's own +-1.000
+                c.spiderJumpT = 0;   // GD's +0x820 (State::spiderJumpT)
                 c.grounded = 1;
                 c.snapObj = nullptr;
             }
@@ -1539,6 +1540,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         ++g_frameRevReach[g_threadSlot & (kThreadSlots - 1)].n[s.frame][s.rev ? 1 : 0];
     State c = s;
     c.tpSkip = 0;   // one tick of life: set again only by this tick's teleport
+    // The spider's teleport clock ages a tick; a teleport this tick sets it back to 0.
+    c.spiderJumpT = (uint8_t)std::min<int>(kSpiderJumpGraceTicks, (int)s.spiderJumpT + 1);
     c.ogLinger = 0; // --upsidecoyote: re-earned every tick by the cube branch
     for (int i = 0; i < 3; ++i) c.portSeen[i] = -1;   // --portalonce: this tick's overlaps
     // --stickseam: a tie lives only as long as the ride; the grounded block
@@ -3005,6 +3008,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             if (hazTgt) DIE("spider/tp-hazard", nullptr);
             impulsedThisTick = IMPULSE();
             spiderWarpedThisTick = true;
+            c.spiderJumpT = 0;   // GD's +0x820 (State::spiderJumpT)
             if (g_touchCensus) g_tcBranch |= 1;
             // ...and the block-pin has to let go. `pinnedOnBlock` was armed
             // above for a player standing on a solid, and `releasePin` puts y
@@ -4528,6 +4532,12 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                             CLAMP0O("cube/flipgrace", o);
                             break;
                         }
+                        // A spider within 0.04 s of its teleport is spared the side kill of a solid
+                        // whose right edge is left of the inner box's right edge (State::spiderJumpT).
+                        // GD compares world x, so only in frame 0, where the model's x is world x.
+                        if (c.mode == 6 && c.frame == 0 && c.spiderJumpT < kSpiderJumpGraceTicks
+                            && o->cx + o->hw < sx + pInner)
+                            break;
                         DIE("cube/solid-side", o);
                     }
                 }
@@ -13035,6 +13045,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         YSET(c.y) = (float)tgt;
                         c.flip = c.flip ? 0 : 1;
                         VYSET(c.vy) = (float)gs;
+                        c.spiderJumpT = 0;   // GD's +0x820 (State::spiderJumpT)
                         if (g_touchCensus) g_tcBranch |= 2;
                         // whatever held us up is a level away now
                         c.snapObj = nullptr;

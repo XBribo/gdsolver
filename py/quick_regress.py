@@ -99,6 +99,7 @@ from gdtas import runtmp
 from gdtas.paths import DATA, LEVEL_DATA, LEVELDP_EXE, WORKERS_ROOT
 
 REF = LEVEL_DATA / "gdref"
+REF_RESOLUTION = 25   # the resolution index the colds play at (cold_regress.run_resolution)
 BASELINE = REF / "baseline.json"
 # Only the columns the reference needs. The first half is what diff_trace
 # reads, the second half is what building --start needs (the same columns
@@ -1196,6 +1197,18 @@ def main(argv=None) -> int:
 
     try:
         if a.record:
+            # The reference is GD's own run, and a saw's hit radius follows the
+            # profile's resolution: recorded on a hand-configured worker at
+            # index 8, five accepted solutions died where they clear at 25.
+            # The colds play at 25, so the reference is recorded there or not at all.
+            from cold_regress import run_resolution
+            res_idx, why = run_resolution(list(a.pool))
+            if res_idx != REF_RESOLUTION:
+                print(f"refused: the reference is recorded at resolution index "
+                      f"{REF_RESOLUTION}, and worker(s) {a.pool} play at "
+                      f"{res_idx if res_idx is not None else 'an unknown index'}"
+                      + (f" ({why})" if why else ""))
+                return 2
             cuts = {}
             if (REF / "cut.json").exists():
                 cuts = json.loads((REF / "cut.json").read_text())
@@ -1207,8 +1220,14 @@ def main(argv=None) -> int:
                 for f in futs:
                     r = f.result()
                     res.append(r)
+                    # A level recorded here gets THIS recording's cut, and no cut
+                    # means none: keeping the old entry cut the new reference at a
+                    # tick from another solution (or another worker's death, which
+                    # truncated lv12 to 5 sections and lv18 to none).
                     if r.get("cut") is not None:
                         cuts[str(r["level"])] = r["cut"]
+                    elif r["status"] in ("OK", "GD-DEAD"):
+                        cuts.pop(str(r["level"]), None)
             (REF / "cut.json").write_text(json.dumps(cuts, indent=1))
             for r in sorted(res, key=lambda r: r["level"]):
                 print(f"lv{r['level']:<3} {r['status']:<9} {r['note']}")

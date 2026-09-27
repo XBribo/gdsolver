@@ -22,6 +22,11 @@ Under Replay and Solve a **Coins** switch makes the goal every coin as well as
 the end. Level selection is the game's own, so any level can be picked. (The
 menu can be turned off in the mod's settings; the play button then just plays.)
 
+When a level has a Random or Advanced Random trigger, or an area or enter effect
+with a random variance, the menu says so. While the bot drives, the game's random seeds are
+set to the same values on every attempt, so a solution is found for, and
+replays, one fixed draw; playing yourself is untouched.
+
 A solve runs **fast, dark and silent**. Candidate attempts mostly die, and each
 one at normal speed would cost the length of the song, so the frames go to a
 headless loop instead. When a candidate finally clears, the level restarts and
@@ -40,14 +45,19 @@ not for changing one.
 ## What it can solve
 
 **All 22 official levels**, from cold — no stored solutions, no hints, nothing
-but the level — with every coin or without, and the 17 levels of Meltdown, World
-and SubZero, the six of them that have coins with every coin as well. That is
-also the supported set.
+but the level — with every coin or without, and the 16 levels of Meltdown, World
+and SubZero and The Challenge, the six of them that have coins with every coin as
+well. That is also the supported set. (Those 17 are not in the main game's level
+list: the solver reads them from level files, which are not distributed with it.)
 
 Custom levels are **not supported yet**. Nothing in the design is specific to
 the official levels and many custom ones already solve as they are, but the
-physics model has only been measured against what the official levels use, so a
-level leaning on something it has never met is a level it is wrong about.
+physics model is measured against what those levels, and the calibration levels
+that come with the source, use, so a level leaning on something it has never met
+is a level it is wrong about. Where
+the model has no answer, the section solver searches the game itself, and a plan
+the game clears is a solution however it was found. Platformer levels are
+refused: the search has no steering input to choose.
 
 ## Nothing is recorded while it drives
 

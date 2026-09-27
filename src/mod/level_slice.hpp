@@ -198,39 +198,60 @@ inline void forgetLayer() {
 // harness): the copy was built and its solve started, then the original went on running under a
 // PlayLayer::get() that named the copy, and every hook took it for a layer on its way out. The
 // suite waits for the same thing (SuiteKeeper). The level is held still until the new one takes
-// over.
-inline constexpr int kSwapWaitFrames = 1200;
-inline void swapWhenClear(geode::Ref<GJGameLevel> keep, int frames) {
-    geode::Loader::get()->queueInMainThread([keep, frames] {
+// over. The wait is capped in time, not frames: cfg fps sets the frame rate, and at fps=1000 a
+// cap of 1,200 frames would give up after 1.2 s, well inside an ordinary fade.
+inline constexpr std::chrono::seconds kSwapWait{20};
+
+// Why the scene cannot be replaced yet, or nullptr when it can. A running transition is not the
+// only way to be early: the play menu's level page builds the PlayLayer in playStep3 and starts the
+// fade to it only in playStep4, frames later (LevelInfoLayer 0x2fd190 / 0x2fd310 in 2.2081, the
+// page of an online level). The session's first solve runs in between,
+// while the running scene is still the level page and no transition is in sight, and a swap there
+// put the copy on screen only for the fade to replace it with the level itself: the original ran
+// undriven, PlayLayer::get() named a copy that had no scene, the loop stood still, and Escape
+// crashed in pauseGame, which adds the pause menu to that copy's missing parent (reported on the
+// play menu, 2026-09-27, on two heavy online levels). So the layer the session is on has to be the
+// one on screen, with no scene change queued behind it.
+inline const char* sceneBusy() {
+    auto* dir = cocos2d::CCDirector::sharedDirector();
+    auto* running = dir->getRunningScene();
+    if (!running) return "no running scene";
+    if (geode::cast::typeinfo_cast<cocos2d::CCTransitionScene*>(running)) return "a transition runs";
+    if (dir->getNextScene()) return "a scene change is queued";
+    auto* pl = PlayLayer::get();
+    if (!pl || pl->getParent() != running) return "the level is not on screen yet";
+    return nullptr;
+}
+
+inline void swapWhenClear(geode::Ref<GJGameLevel> keep, int frames, std::string waitedFor = {},
+                          std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now()) {
+    geode::Loader::get()->queueInMainThread([keep, frames, waitedFor, since] {
         if (!g_started || g_sessionOver) return;   // the session ended in the meantime
-        auto* dir = cocos2d::CCDirector::sharedDirector();
-        auto* running = dir->getRunningScene();
-        const bool busy = !running
-                          || geode::cast::typeinfo_cast<cocos2d::CCTransitionScene*>(running);
-        if (busy && frames < kSwapWaitFrames) {
-            swapWhenClear(keep, frames + 1);
+        const char* busy = sceneBusy();
+        std::string seen = waitedFor;
+        if (busy && seen.find(busy) == std::string::npos) seen += std::string(seen.empty() ? "" : ", ") + busy;
+        if (busy && std::chrono::steady_clock::now() - since < kSwapWait) {
+            swapWhenClear(keep, frames + 1, seen, since);
             return;
         }
         writeResult(busy ? "slice: the scene was still changing after " + std::to_string(frames)
-                               + " frames - swapping anyway"
+                               + " frames (" + busy + ") - swapping anyway"
                          : "slice: swapping the level in (waited " + std::to_string(frames)
-                               + " frame(s) for the scene to settle)");
+                               + " frame(s) for the scene to settle"
+                               + (seen.empty() ? "" : ": " + seen) + ")");
         g_forceCleanStart = true;
         g_swapInit = true;
-        dir->replaceScene(PlayLayer::scene(keep.data(), false, false));
+        cocos2d::CCDirector::sharedDirector()->replaceScene(PlayLayer::scene(keep.data(), false, false));
     });
 }
 
 // The census (cfg slicecount) ends the session the same way, once the scene has settled: leaving
 // a level inside its entry fade leaves the layer up, and a suite waiting for it gives up.
-inline void endWhenClear(int frames) {
-    geode::Loader::get()->queueInMainThread([frames] {
+inline void endWhenClear(std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now()) {
+    geode::Loader::get()->queueInMainThread([since] {
         if (!g_started || g_sessionOver) return;
-        auto* running = cocos2d::CCDirector::sharedDirector()->getRunningScene();
-        const bool busy = !running
-                          || geode::cast::typeinfo_cast<cocos2d::CCTransitionScene*>(running);
-        if (busy && frames < kSwapWaitFrames) {
-            endWhenClear(frames + 1);
+        if (sceneBusy() && std::chrono::steady_clock::now() - since < kSwapWait) {
+            endWhenClear(since);
             return;
         }
         endSession("slice_count");
@@ -286,7 +307,7 @@ inline bool maybeSlice(GJBaseGameLayer* l) {
         g_cut = slice::Cut{};
         g_raw.clear();
         g_paused = true;
-        endWhenClear(0);
+        endWhenClear();
         return true;
     }
     if ((long long)g_cut.dropped < (long long)sliceMin()) {

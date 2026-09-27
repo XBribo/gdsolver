@@ -151,11 +151,15 @@ the answer. An `UNVERIFIED` leaf is that guard working: no false plan is spliced
 
 It also searches the game as it is, random numbers included. The model plans an
 Area Move with a random variance against the whole box it can land in; the search
-sees the block wherever this attempt's seeds put it, and the game does not put the
-seeds back on a checkpoint restore. A stretch it solves there can depend on that
-attempt's numbers. The replay from the start of the level usually catches such a
-plan, since the seeds have moved on by then. (Planned: warn in the play menu about
-a level that relies on random numbers, and solve it with the seed fixed.)
+sees the block wherever the game's seeds put it. While the bot drives, the mod sets
+those seeds to the same values before every attempt and every checkpoint restore,
+so every run from the start of the level meets the same draw. A restore therefore
+starts the search from the attempt's first values, not from the ones the run from
+the start has reached by then, and a stretch it solves after a Random trigger can
+depend on that difference; the replay from the start of the level catches such a
+plan. The play menu says when a level has a Random or Advanced Random trigger, or
+an area or enter effect with a random variance; a spawn delay's or an Advanced
+Follow's variance is not detected yet.
 
 ## 7. Cost
 
@@ -174,10 +178,12 @@ a level that relies on random numbers, and solve it with the seed fixed.)
     level the working set went from 4.7 GB to 710 MB; `secmem:` prints the
     footprint at the end of a search);
   * the game re-parents every sprite layer through its shader layer twice per
-    restore, and on a long search that was the part that grew. With
-    `secshaderskip=1` it is skipped while the search runs and done again by the
-    first real reset after it; the search itself is unchanged (identical layer
-    fingerprints). Off by default.
+    restore, and on a long search that was the part that grew. It is skipped
+    while the search runs and done again by the first real reset after it
+    (`secshaderskip`, on by default); the search itself is unchanged (identical
+    layer fingerprints). On a heavy custom level solved cold with and without it,
+    the restore went from 74 to 12 µs and the whole solve from 470 to 328 s, with
+    the same rounds and the same search layers.
 * Rendering and the visibility pass are held off for the whole search: the search
   moves the world back and forth through geometry it does not restore.
 * The search yields a frame every `secslicems` (12 ms) so the game window stays
@@ -219,7 +225,7 @@ The search's own keys (by hand; a rung sets what it needs): `sectarget`,
 `sectargety` / `sectargetydir`, `sectargetdepth`, `sechorizon`, `seccap`, `secgrace`
 (600), `secmaxdoomed` (500), `seccoins` (1), `secsnap` (0 checkpoint, 1 snapshot,
 2 sweep and decide), `secverifyevery` (0; a rung uses 20), `secslicems` (12),
-`secshaderskip` (0). The remaining `sec*` keys are measurement switches.
+`secshaderskip` (1). The remaining `sec*` keys are measurement switches.
 
 ## 10. What it writes to result.txt
 

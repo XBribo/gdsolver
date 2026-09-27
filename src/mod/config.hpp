@@ -1119,11 +1119,53 @@ inline bool g_inPostCollP1 = false;
 // another one in the same game starts from wherever that one left them: on lv22 the solids an
 // Area Move pushes at t=14,275-14,370 then sit up to 2 px elsewhere than in a fresh game.
 inline bool g_rngFresh = false;
-// cfg `rngseed=<ee0>,<ef8>`: set the two never-reseeded seeds (see g_rngFresh) to these
-// values on every level load. For measuring which objects depend on them: the same plan
-// replayed under several seeds shows every position the seeds can move.
+// cfg `rngseed=<ee0>,<ef8>`: the values rngfix (below) sets the two never-reseeded seeds (see
+// g_rngFresh) to, instead of its own. For measuring which objects depend on them: the same
+// plan replayed under several seeds shows every position the seeds can move.
 inline bool g_rngSeedSet = false;
 inline long long g_rngSeedEE0 = 0, g_rngSeedEF8 = 0;
+// cfg `rngfix` (on; 0 = off): while the mod drives, the two never-reseeded seeds are set before
+// the level is built and again before every reset (checkpoint restores included), so the Area
+// Move variance table (filled from 0x6c2ef8 when the level is built) and every object's variance
+// index (drawn from 0x6c2ee0 by resetObject on each attempt) are the same on every attempt and
+// in every game. The values are those a fresh process has when it builds its first level,
+// measured on two launches (e90=0, ee0=2531011, ef8=0; e90 is reseeded by resetLevel itself),
+// so the fixed level is the one a freshly started game shows on its first attempt. Measured on
+// lv22 before this: the same plan flown as attempt 3, 5, 7 and 11 of a game put group 330's
+// blocks up to 42 px apart at t=14,300, and as far apart again with the seeds set only when the
+// level was built (rngseed). Playing a level yourself, with no session open, is untouched.
+// rngseed=, when given, supplies the values instead.
+inline bool g_rngFix = true;
+constexpr long long kRngFixEE0 = 2531011, kRngFixEF8 = 0;
+// The third seed, 0x6c2e90, drives the Random and Advanced Random triggers, spawn-delay
+// variance, Advanced Follow and a few more (every reader: GJBaseGameLayer::tryGetObject,
+// processAdvancedFollowAction, modifyGroupPhysics, RandTriggerGameObject / SpawnTriggerGameObject
+// / EffectGameObject::triggerObject). PlayLayer::resetLevel (0x3b90f4) reseeds it on every
+// attempt from the clock -- gettimeofday, seconds times microseconds -- unless GD's own replay
+// flag is set (m_useReplay, +0x3190, with m_replayRandSeed at +0x32f0), and keeps the value it
+// drew at +0x32e0 (m_randomSeed). So those triggers fire differently on every attempt of every
+// game. rngfix puts both back to kRngFixE90 right after the reset returns. Setting GD's replay
+// flag instead would switch on its replay system as well. If anything had drawn from the seed
+// between the reseed and the end of the reset, the seed would no longer equal +0x32e0; that is
+// counted (g_rngDrawnInReset) rather than assumed not to happen.
+constexpr long long kRngFixE90 = 0;
+constexpr size_t kRandomSeedOff = 0x32e0;   // PlayLayer (GJBaseGameLayer::m_randomSeed)
+inline long long g_rngDrawnInReset = 0;     // resets whose trigger seed was drawn before rngfix
+inline void rngFixAfterReset(void* layer) {
+    if (!botDriving() || !g_rngFix || !layer) return;
+    auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
+    auto& seed = *reinterpret_cast<long long*>(base + 0x6c2e90);
+    auto& kept = *reinterpret_cast<long long*>(reinterpret_cast<char*>(layer) + kRandomSeedOff);
+    if (seed != kept) ++g_rngDrawnInReset;
+    seed = kRngFixE90;
+    kept = kRngFixE90;
+}
+inline void rngFixApply() {
+    if (!botDriving() || !(g_rngFix || g_rngSeedSet)) return;
+    auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
+    *reinterpret_cast<long long*>(base + 0x6c2ee0) = g_rngSeedSet ? g_rngSeedEE0 : kRngFixEE0;
+    *reinterpret_cast<long long*>(base + 0x6c2ef8) = g_rngSeedSet ? g_rngSeedEF8 : kRngFixEF8;
+}
 inline long long g_areaT0 = 0, g_areaT1 = -1;
 inline std::vector<int> g_areaUids;
 inline std::vector<GameObject*> g_areaObjs;

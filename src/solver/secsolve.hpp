@@ -349,13 +349,16 @@ inline bool g_boundOn = true;
 constexpr double kBoundMargin = 3000.0;
 inline double g_boxX0 = 0.0, g_boxX1 = 0.0, g_boxY0 = 0.0, g_boxY1 = 0.0;
 inline long long g_boundSkips = 0;
-// cfg `secshaderskip=1` (EXPERIMENT, off by default): inside a search, leave the shader layer as
-// it is. resetLevel calls GJBaseGameLayer::updateShaderLayer twice per restore (once through
-// resetLevelVariables), and it moves the layers that hold every object's sprite in and out of the
-// shader's container; each move walks the whole subtree through onExit / onEnter, Geode's hooks
-// on them included. A late restore of a long search (a heavy custom level's slice, 09-26) spent
-// 87% of its time there, and the cost grew with the number of restores.
-inline bool g_shaderSkip = false;
+// cfg `secshaderskip` (on; 0 = off): inside a search, leave the shader layer as it is. resetLevel
+// calls GJBaseGameLayer::updateShaderLayer twice per restore (once through resetLevelVariables),
+// and it moves the layers that hold every object's sprite in and out of the shader's container;
+// each move walks the whole subtree through onExit / onEnter, Geode's hooks on them included. A
+// late restore of a long search (a heavy custom level's slice, 09-26) spent 87% of its time there,
+// and the cost grew with the number of restores.
+// On by default since it was measured to change nothing but the time: a heavy custom level solved
+// cold with and without it made the same 50 rounds ([fp] line for line) through the same 8,707
+// search layers (every layer's fingerprint), in 328 s against 470 s -- the restore 74 -> 12 us.
+inline bool g_shaderSkip = true;
 inline long long g_shaderSkips = 0;
 // After how many doomed exits to give up with "nothing from this entry"
 // (cfg `secmaxdoomed`). Each one costs a replay + 10 grace lines ≈ 1,300 steps,

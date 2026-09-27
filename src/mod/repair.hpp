@@ -121,6 +121,11 @@ struct AnchorRow {
     // of every tick -- is the first thing cfg `slopetrace` measures.
     int onSlope = 0, slopeUnder = 0, slopeUid = -1;
     double slopeStart = 0.0, totalTime = 0.0;
+    // The time of the spider's last teleport, the double spiderTestJumpInternal writes at
+    // +0x820 and collidedWithObjectInternal holds against +0xaa0: under 0.04 s after it, a
+    // solid's side does not kill (0x393756, the model's State::spiderJumpT). Sent as its age in
+    // ticks in the hist payload (version 3).
+    double spiderStamp = 0.0;
 };
 
 // GD's MAX GAMEPLAY Y (layer+0x36a8), refreshed every recorded tick and passed
@@ -318,6 +323,7 @@ inline void record(GJBaseGameLayer* l, long long t) {
         r.slopeUid = ramp ? ramp->m_uniqueID : -1;
         r.slopeStart = *reinterpret_cast<double const*>(pb + 0x598);
         r.totalTime = *reinterpret_cast<double const*>(pb + 0xaa0);
+        r.spiderStamp = *reinterpret_cast<double const*>(pb + 0x820);
     }
     // ...and GD's MAX GAMEPLAY Y, the world-y bound whose crossing (two ticks
     // running) is the environment kill with a NULL object. Written by
@@ -2564,16 +2570,22 @@ inline std::string portalPayload(long long t0) {
 // cfg `histpayload=1`: the per-body history values --start does not carry, as
 // dp's versioned `hist` value (one transport, never another
 // positional field). Version 1 is the press latch; version 2 adds GD's Free Mode
-// byte (AnchorRow::freeMode). Empty when the anchor row is missing -- dp then keeps
+// byte (AnchorRow::freeMode); version 3 the ticks since the spider's teleport
+// (AnchorRow::spiderStamp). Empty when the anchor row is missing -- dp then keeps
 // its default rather than a guess.
 inline std::string histPayload(long long t0) {
     const AnchorRow* r = anchors::row(t0);
     if (!r || !r->valid) return std::string();
     const int ps = (r->b985 && !r->b986) ? 1 : 0;
     const int ps2 = (r->b985_2 > 0 && r->b986_2 == 0) ? 1 : 0;
-    return "owns=hist;hist=2|3|pressSpent:" + std::to_string(ps)
+    // Ticks at 240 per second, rounded: both are the attempt clock's doubles. A stamp ahead of
+    // the clock (none written this attempt) says nothing, and -1 leaves dp's default.
+    const double since = r->totalTime - r->spiderStamp;
+    const long long age = (since >= 0.0) ? std::llround(since * 240.0) : -1;
+    return "owns=hist;hist=3|4|pressSpent:" + std::to_string(ps)
          + ",pressSpent2:" + std::to_string(ps2)
-         + ",freeMode:" + std::to_string(r->freeMode);
+         + ",freeMode:" + std::to_string(r->freeMode)
+         + ",spiderJumpT:" + std::to_string(std::min<long long>(age, 255));
 }
 
 // The payloads joined, so a call site asks once. Any part may be absent; `owns`
@@ -2995,7 +3007,20 @@ inline const char* fixupWhy(int w) {
 }
 
 // Record the transition into tick t: the model's state at t-1 with GD's observed deltas.
-inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>& m) {
+// `revive`: the record is the verdict "the model killed a run GD carried on" (fixupPass). The
+// model's own transition is GD's then, so the delta can be zero -- and it still has to go on file
+// as a real record, because what it carries is the verdict: dp's applyFixup clears `dead` for any
+// delta record it matches, zero or not. Filed as a no-op mark it never reached dp, and the mark
+// then answered "a record already covers this state" to every later try at the same state.
+// SubZero 4002 (2026-09-27): a spider walking into the side of a 3 px slab right after its
+// teleport lives in the game (hbox hit=1 and no kill, t=21,290-21,296) and died in the model at
+// t=21,291 on identical states; both tries at the verdict came back "already right", then
+// "already covered". Only a death inside the recorder's window is revived. Letting a refused
+// clear's resim run on to the finish revived two deaths 5,600 ticks past its anchor (t=17,434 and
+// 17,946, a wave section, anchor 11,789), and the whole-level searches that pass there then cost
+// 56/177/60 s -> 246/220/182 s; whether those two were real is not known.
+inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>& m,
+                      bool revive = false) {
     if (g_fixupCount >= kFixupCap) return FixupCapped;
     auto mPrev = m.find(t - 1), mCur = m.find(t);
     if (mPrev == m.end() || mCur == m.end()) return FixupNoTrace;
@@ -3062,7 +3087,7 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
                                    - (mCur->second.y2 - mPrev->second.y2) : 0.0;
     const double eDvy2 = dual ? (gCur ? gCur->v2 - gPrev->v2 : 0.0)
                                    - (mCur->second.vy2 - mPrev->second.vy2) : 0.0;
-    const bool noop = (kill == 0 && std::fabs(eDy) < kNoopEps
+    const bool noop = (kill == 0 && !revive && std::fabs(eDy) < kNoopEps
                        && std::fabs(eDvy) < kNoopEps
                        && std::fabs(eDy2) < kNoopEps
                        && std::fabs(eDvy2) < kNoopEps);
@@ -3090,8 +3115,10 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
     // gate: covered by a record the solver keeps back is a model wall. It REPLACES FixupOnFile
     // and nothing else, so every other outcome -- a refined record written over a disagreeing
     // one above all -- stays exactly what it was (putting the test first cost lv22 one record).
+    // ...a revive is not covered by a no-op mark: the mark says "looked at", the revive says
+    // "GD lives here", and only the second one reaches dp.
     if (fixupOnFile(g_fixupPath, key, dyG, dvG)
-        || fixupOnFile(g_fixupNoopPath, key, dyG, dvG))
+        || (!revive && fixupOnFile(g_fixupNoopPath, key, dyG, dvG)))
         return mCur->second.fxblk >= 0 ? FixupBlockedDyn : FixupOnFile;
     char dual2[160] = "";
     if (dual) {
@@ -3309,9 +3336,9 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
                      nx ? nx->nearorb : -1, p.bandf, p.bandc);
         }
         snprintf(b, sizeof(b), "dpsolve:   [fixup] t=%lld x=%.1f mode=%d in=%d "
-                 "dy=%.3f dvy=%.3f kill=%d edy=%.3f edvy=%.3f%s%s%s (%d total)",
+                 "dy=%.3f dvy=%.3f kill=%d edy=%.3f edvy=%.3f%s%s%s%s (%d total)",
                  t, mPrev->second.x, mPrev->second.mode, act, dyG, dvG, kill,
-                 eDy, eDvy, e2, gd, md, g_fixupCount);
+                 eDy, eDvy, e2, gd, md, revive ? " revive" : "", g_fixupCount);
     }
     writeResult(b);
     // KILL-ONLY: the second veto hit (see g_killVetoIter). The p2 halves are
@@ -3596,7 +3623,7 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
     if (real == 0) {
         if (modelDied >= 0 && modelDied < deathTick && anchors::row(modelDied + 1)) {
             // The model killed a run GD carried on: the delta record revives it
-            verdictWhy = writeFixup(modelDied, 0, m);
+            verdictWhy = writeFixup(modelDied, 0, m, /*revive=*/true);
             if (verdictWhy == FixupReal) ++real, ++made, autoNoteRecord(modelDied, deathTick);
         } else if ((modelDied < 0 || modelDied > deathTick) && agreedAtDeath
                    && anchors::row(deathTick - 1) && m.find(deathTick) != m.end()) {

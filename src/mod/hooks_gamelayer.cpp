@@ -2915,6 +2915,18 @@ class $modify(GJBaseGameLayer) {
         // elements (1.8 GB of capacity) at the end of one section search of a custom level
         // (09-26), each doubling copying all of them. A released node now keeps 8 bytes.
         std::vector<std::unique_ptr<GJGameState>> states;
+        // ...and a released node's state goes here rather than being freed, for the next node
+        // to take: a state assigned into one that has been used keeps its vectors' capacity and
+        // its ordered maps' nodes (psnap::assignState), where a new one allocates every element
+        // again and a freed one frees them. The pool never holds more than the most states that
+        // were live at once, which is what the search needed anyway.
+        std::vector<std::unique_ptr<GJGameState>> statePool;
+        auto newState = [&statePool]() {
+            if (statePool.empty()) return std::make_unique<GJGameState>();
+            std::unique_ptr<GJGameState> s = std::move(statePool.back());
+            statePool.pop_back();
+            return s;
+        };
         // The player-side "already touched" bookkeeping (orbs/pads/slopes)
         std::vector<std::unique_ptr<psnap::Touch>> touches;
         // ...and the object side of it: which portals, pads and rings in reach have been
@@ -3138,7 +3150,8 @@ class $modify(GJBaseGameLayer) {
                     gd::vector<PulseEffectAction> tmp;
                     std::swap(pulses[(size_t)ni], tmp);
                 }
-                if ((size_t)ni < states.size()) states[(size_t)ni].reset();
+                if ((size_t)ni < states.size() && states[(size_t)ni])
+                    statePool.push_back(std::move(states[(size_t)ni]));
                 if ((size_t)ni < touches.size()) touches[(size_t)ni].reset();
                 if ((size_t)ni < worlds.size())
                     std::vector<uint8_t>().swap(worlds[(size_t)ni]);
@@ -3745,7 +3758,7 @@ class $modify(GJBaseGameLayer) {
                         g_cps.push_back(nullptr);
                         snaps.emplace_back();
                         pulses.emplace_back();
-                        states.push_back(std::make_unique<GJGameState>());
+                        states.push_back(newState());
                         touches.push_back(std::make_unique<psnap::Touch>());
                         acts.emplace_back(std::move(actHere));
                         actSigs.push_back(actSigHere);
@@ -3778,7 +3791,7 @@ class $modify(GJBaseGameLayer) {
                         // For the stacking check. Taken at the same instant as the checkpoint
                         if (g_overlay) {
                             snaps.emplace_back(); pulses.emplace_back();
-                            states.push_back(std::make_unique<GJGameState>());
+                            states.push_back(newState());
                             touches.push_back(std::make_unique<psnap::Touch>());
                             acts.emplace_back();
                             psnap::capture(p, this, snaps.back());
@@ -4060,7 +4073,7 @@ class $modify(GJBaseGameLayer) {
                     // the continuation grows from the old snapshot.
                     psnap::capture(vp, this, snaps[(size_t)ni]);
                     psnap::captureEM(this, pulses[(size_t)ni]);
-                    if (!states[(size_t)ni]) states[(size_t)ni] = std::make_unique<GJGameState>();
+                    if (!states[(size_t)ni]) states[(size_t)ni] = newState();
                     if (!touches[(size_t)ni]) touches[(size_t)ni] = std::make_unique<psnap::Touch>();
                     psnap::captureState(this, *states[(size_t)ni]);
                     psnap::captureTouch(vp, *touches[(size_t)ni], this);

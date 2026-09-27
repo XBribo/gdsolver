@@ -56,6 +56,17 @@ session, no plan and no solution file to start from — one with coins
 runs ended every level with every coin, as the game itself counted them. The
 same runs are the regression baseline.
 
+**v0.3.2 was not re-measured for these tables.** It fixes the game's random
+seeds while the bot drives, corrects a few rules and speeds up section searches
+(see the [changelog](changelog.md)), so some counts and times differ from the
+ones below. Before release it was run the same way — the 22 levels with and
+without coins, the 17 spin-off levels without coins and the six of them with
+coins, each suite in one game session — and every level cleared, with every
+coin in the coin runs. The counts that moved: Dash 26 → 30 without coins and
+39 → 41 with them, Press Start 29 → 28 without coins, and Nock Em 56 → 57 and
+Power Trip 103 → 104 with coins. Those runs shared the machine, so their times
+are not comparable with the tables.
+
 Every cell reads **with every coin**, then in brackets **the end of the level
 alone**.
 
@@ -121,9 +132,11 @@ normally reproducible, and `py/cold_regress.py` compares the `[fp]` line each
 round prints against `data/cold_baseline.json` (`data/cold_baseline_coins.json`
 for a coin run); a change is reported, not failed. The spin-off levels have
 baselines of their own, kept with their level files. The one level known to vary
-from run to run is SubZero 4003 with coins: its section searches can take a
-different route each time (102 to 106 rounds over three runs of this build, all
-clearing with every coin).
+from run to run was SubZero 4003 with coins: its section searches could take a
+different route each time (102 to 106 rounds over three runs of the v0.3.0 build,
+all clearing with every coin). The cause was the game's random seeds, which v0.3.2
+fixes while the bot drives; every run of it since — seven, over four builds — has
+taken 104 rounds.
 
 It is not a fidelity score. It counts what the loop had to do, and that depends
 on which corridor the search happens to walk as much as on where the model is
@@ -214,11 +227,12 @@ Around that loop:
   [docs/LEVEL_SLICE.md](docs/LEVEL_SLICE.md).
 * **Moving geometry** is the game's own recording of each replay, joined at the
   tick the last replay died to a recording of the level played with no input.
-  An Area Move whose distance the game draws from random seeds it never resets
-  lands somewhere else on every attempt, so the model treats the whole box it can
-  land in as deadly while the object is solid, so the model's plans do not depend
-  on the seeds (Area Rotate and Area Scale with a variance, and an Advanced
-  Follow's, are not covered yet; the `areaenv:` line counts them).
+  Some of it the game draws from random seeds (an Area Move's distance, Random
+  triggers). While the bot drives, the seeds are set to the same values before
+  every attempt, so every attempt meets the same draw; the model still treats the
+  whole box an Area Move can land in as deadly while the object is solid, so its
+  plans do not depend on the draw (Area Rotate and Area Scale with a variance, and
+  an Advanced Follow's, are not covered yet; the `areaenv:` line counts them).
 
 * **`dp/`** — the solver core (`leveldp`, also linked into the mod). States are
   *exact*; the per-layer hash only deduplicates and never snaps a state, so every

@@ -632,12 +632,78 @@ inline void restoreTouch(PlayerObject* p, const Touch& in, GJBaseGameLayer* l = 
     if (auto* p2 = partner(p, l); p2 && in.second) restoreTouchOne(p2, *in.second);
 }
 
-inline void captureState(GJBaseGameLayer* l, GJGameState& out) {
-    if (l) out = l->m_gameState;
+// A GJGameState copied the plain way rebuilds every ordered map in it node by node: MSVC's
+// std::map copy-assignment clears the destination and allocates a node per element. A section
+// search copies the state in both directions many times a layer -- a snapshot per child, a restore
+// per expansion -- and between two states of one search those maps differ in a few entries at
+// most. Sampled on a heavy custom level's search: GJGameState's assignment and destruction were
+// ~16% of the main thread, the two maps keyed by (event, id) about half of that, with the heap
+// under them on top.
+//
+// So the ordered maps are brought level with the source in place: walked in key order together,
+// what the destination lacks inserted where it goes, what it has extra erased, a value that
+// differs assigned. The result holds exactly the source's keys and values in the source's order,
+// which is all anything reads of an ordered map; only the nodes are not new. Everything else is
+// the plain member-wise assignment, done with the maps moved out of both sides for its duration
+// (a swap: O(1), and it puts the very same nodes back).
+template <class M>
+inline void syncOrderedMap(M& dst, const M& src) {
+    auto d = dst.begin();
+    auto s = src.begin();
+    const auto less = dst.key_comp();
+    while (s != src.end()) {
+        if (d == dst.end() || less(s->first, d->first)) {
+            d = std::next(dst.emplace_hint(d, *s));
+            ++s;
+        } else if (less(d->first, s->first)) {
+            d = dst.erase(d);
+        } else {
+            d->second = s->second;   // a vector keeps its capacity; a scalar is a scalar
+            ++d;
+            ++s;
+        }
+    }
+    while (d != dst.end()) d = dst.erase(d);
 }
 
-inline void restoreState(GJBaseGameLayer* l, const GJGameState& in) {
-    if (l) l->m_gameState = in;
+inline void assignState(GJGameState& dst, GJGameState& src) {
+    if (&dst == &src) return;
+    // Empty maps to park the four in while the rest is assigned (held across calls: an MSVC map
+    // allocates its head node on construction).
+    static decltype(dst.m_activatedObjectIDs) d0, s0;
+    static decltype(dst.m_unkMapPairGJGameEventIntVectorEventTriggerInstance) d1, s1;
+    static decltype(dst.m_unkMapPairGJGameEventIntInt) d2, s2;
+    static decltype(dst.m_proximityVolumeRelated) d3, s3;
+    d0.swap(dst.m_activatedObjectIDs);
+    s0.swap(src.m_activatedObjectIDs);
+    d1.swap(dst.m_unkMapPairGJGameEventIntVectorEventTriggerInstance);
+    s1.swap(src.m_unkMapPairGJGameEventIntVectorEventTriggerInstance);
+    d2.swap(dst.m_unkMapPairGJGameEventIntInt);
+    s2.swap(src.m_unkMapPairGJGameEventIntInt);
+    d3.swap(dst.m_proximityVolumeRelated);
+    s3.swap(src.m_proximityVolumeRelated);
+    dst = src;   // every other member; the four maps are empty on both sides here
+    dst.m_activatedObjectIDs.swap(d0);
+    src.m_activatedObjectIDs.swap(s0);
+    dst.m_unkMapPairGJGameEventIntVectorEventTriggerInstance.swap(d1);
+    src.m_unkMapPairGJGameEventIntVectorEventTriggerInstance.swap(s1);
+    dst.m_unkMapPairGJGameEventIntInt.swap(d2);
+    src.m_unkMapPairGJGameEventIntInt.swap(s2);
+    dst.m_proximityVolumeRelated.swap(d3);
+    src.m_proximityVolumeRelated.swap(s3);
+    syncOrderedMap(dst.m_activatedObjectIDs, src.m_activatedObjectIDs);
+    syncOrderedMap(dst.m_unkMapPairGJGameEventIntVectorEventTriggerInstance,
+                   src.m_unkMapPairGJGameEventIntVectorEventTriggerInstance);
+    syncOrderedMap(dst.m_unkMapPairGJGameEventIntInt, src.m_unkMapPairGJGameEventIntInt);
+    syncOrderedMap(dst.m_proximityVolumeRelated, src.m_proximityVolumeRelated);
+}
+
+inline void captureState(GJBaseGameLayer* l, GJGameState& out) {
+    if (l) assignState(out, l->m_gameState);
+}
+
+inline void restoreState(GJBaseGameLayer* l, GJGameState& in) {
+    if (l) assignState(l->m_gameState, in);
 }
 
 // OBJECT-SIDE ACTIVATION: what GD's own checkpoint carries and the player snapshot did not.

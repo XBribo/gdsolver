@@ -296,7 +296,7 @@ measuring is also the boundary of what is supported.
   a route that plans to collect a coin would actually be paid for it. The
   measurement on the v0.3.0 solutions: the same verdict on 18 of the 23 coins
   GD credited on the coins-off ones and on 50 of 66 on the coin ones, never a
-  pickup GD did not credit, and the rest real ones missed — see COIN_RADIUS in
+  pickup GD did not credit, and the rest real pickups it missed — see COIN_RADIUS in
   `src/solver/solver.hpp`.
   `itemcnt:` reports GD's item counters, which is what actually gates the coins
   that have to be made to appear (lv21's third and lv22's third). How each layer

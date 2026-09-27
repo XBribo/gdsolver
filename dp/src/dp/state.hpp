@@ -184,6 +184,17 @@ struct State {
     // armT uses it. NOT carried by --start yet: an anchor taken inside the arm's
     // 2-tick window would need it, and nothing has measured one.
     uint8_t slideT = 255;
+    // Ticks since the SPIDER last teleported -- its tap, a spider pad or a spider orb --
+    // saturating at kSpiderJumpGraceTicks. GD stamps the time in spiderTestJumpInternal
+    // (player+0x820) and collidedWithObjectInternal (0x391a70, the side-kill block after the
+    // push-outs) spares a solid's side kill while the player is a spider (+0x9be), `now - that
+    // < 0.04` and the object's right edge is left of the inner box's right edge. 0.04 s is 9.6
+    // ticks, so ages 0..9 are spared. Measured on SubZero 4002 with coins, t=21,290: the spider
+    // teleports onto a slab with a 3x30 wall (id 1202 turned 90) inside its box, runs left
+    // through it with the centre crossing it by t=21,296, and GD never kills (hit=1 throughout).
+    // 255 = never, as for flipT. Carried by the anchor in the hist payload (version 3,
+    // `spiderJumpT`), from GD's stamp against its clock.
+    uint8_t spiderJumpT = 255;
     // GD's flying band, carried PER STATE. It has to be: the band is written
     // when a mode portal actually fires, and firing needs the player's box to
     // touch the portal in y as well as x. lv1 offers two lanes into its last

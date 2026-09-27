@@ -443,9 +443,14 @@ inline const char* const kHistNames[] = {"pressSpent", "pressSpent2"};
 // band (see kBandFreeKnown in bands.hpp). A version carries every name it knows,
 // so a version-1 payload is still complete and leaves the byte unknown.
 // nullptr pads the shorter version.
-inline std::array<const char*, 3> histNamesFor(int version) {
-    if (version == 2) return {"pressSpent", "pressSpent2", "freeMode"};
-    return {kHistNames[0], kHistNames[1], nullptr};
+// Version 3 adds `spiderJumpT`: ticks since GD's spider teleport stamp
+// (player+0x820 against the clock at +0xaa0), State::spiderJumpT. An anchor
+// taken inside that window otherwise starts saturated and kills on the solid
+// side GD spares.
+inline std::array<const char*, 4> histNamesFor(int version) {
+    if (version == 3) return {"pressSpent", "pressSpent2", "freeMode", "spiderJumpT"};
+    if (version == 2) return {"pressSpent", "pressSpent2", "freeMode", nullptr};
+    return {kHistNames[0], kHistNames[1], nullptr, nullptr};
 }
 // Which subsystems this payload claims. The lock and the rotation queue keep
 // their own seeding until someone measures a reason to move them.

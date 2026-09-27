@@ -513,6 +513,10 @@ inline bool loadTraceCfg(const std::string& key, const std::string& val) {
         g_rngFresh = (val == "1");
         return true;
     }
+    if (key == "rngfix") {
+        g_rngFix = (val != "0");
+        return true;
+    }
     if (key == "rngseed") {
         auto c = val.find(',');
         long long a = 0, b = 0;
@@ -1161,6 +1165,11 @@ inline void endSession(const std::string& why) {
     writeResult("level record changed: "
         + progressDiff(g_progressAtStart, sampleProgress(g_progressLevel))
         + " (restored " + std::to_string(g_progressRestores) + ")");
+    // rngfix: resets that had already drawn from the trigger seed before it was put back (see
+    // rngFixAfterReset). Non-zero means some trigger fired inside the reset itself.
+    if (g_rngFix) writeResult("rngfix: trigger seed drawn inside a reset " +
+                              std::to_string(g_rngDrawnInReset) + " times");
+    g_rngDrawnInReset = 0;
     // Corridor clearance table (cfg clearance=1). Written out from the samples gathered during
     // the run
     clearance::write(g_cfg.levelId);

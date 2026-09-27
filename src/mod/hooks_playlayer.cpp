@@ -109,13 +109,14 @@ class $modify(PlayLayer) {
             writeResult(b);
             saved = true;
         }
-        // cfg `rngseed` (see g_rngSeedSet): explicit values for the two unreseeded seeds.
-        if (g_rngSeedSet) {
-            auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
-            *reinterpret_cast<long long*>(base + 0x6c2ee0) = g_rngSeedEE0;
-            *reinterpret_cast<long long*>(base + 0x6c2ef8) = g_rngSeedEF8;
+        // cfg `rngfix` / `rngseed` (see g_rngFix): the seeds the level is built with. resetLevel
+        // sets them again before every attempt.
+        rngFixApply();
+        if (botDriving() && (g_rngFix || g_rngSeedSet)) {
             char b[128];
-            snprintf(b, sizeof(b), "rngseed: ee0=%lld ef8=%lld", g_rngSeedEE0, g_rngSeedEF8);
+            snprintf(b, sizeof(b), "rngfix: GD's random seeds fixed on every attempt (ee0=%lld ef8=%lld%s)",
+                     g_rngSeedSet ? g_rngSeedEE0 : kRngFixEE0, g_rngSeedSet ? g_rngSeedEF8 : kRngFixEF8,
+                     g_rngSeedSet ? ", from cfg rngseed" : "");
             writeResult(b);
         }
         // `swaplevel`: how long the whole swap took, measured from the command to a layer
@@ -161,13 +162,16 @@ class $modify(PlayLayer) {
     }
 
     void resetLevel() {
+        // GD's random seeds first, before anything the reset draws from them (see g_rngFix):
+        // every attempt and every checkpoint restore of a session starts from the same values.
+        rngFixApply();
         // A reset of an old layer (embers awaiting the scene swap) must not touch the books
-        if (this != PlayLayer::get()) { PlayLayer::resetLevel(); restoreProgress(); return; }
+        if (this != PlayLayer::get()) { PlayLayer::resetLevel(); rngFixAfterReset(this); restoreProgress(); return; }
         // A section-solver restore is "inside the search", so it must not touch the mod's
         // bookkeeping at all. Letting it through runs a grouptrace rebuild, POI rebuild and
         // retry logging on every restore, turning a restore that should take 2ms into tens
         // of ms and mixing up the recordings too.
-        if (secsolve::g_active) { PlayLayer::resetLevel(); restoreProgress(); return; }
+        if (secsolve::g_active) { PlayLayer::resetLevel(); rngFixAfterReset(this); restoreProgress(); return; }
         hookdepth::Guard hg(hookdepth::RESET);
         stallwatch::Mark sm(stallwatch::RESET);
         // Early heap-corruption check (cfg `heapcheck=N`). Fired at attempt boundaries so
@@ -309,6 +313,7 @@ class $modify(PlayLayer) {
             writeResult(rb);
         }
         PlayLayer::resetLevel();
+        rngFixAfterReset(this);   // the trigger seed GD just drew from the clock (see g_rngFix)
         // The objects' on/off as the reset left them, before the first update (see
         // grouptrace::snapshotInit for why this phase and not the recording's first row).
         if (!ckptRestore && grouptrace::g_on) grouptrace::snapshotInit();
@@ -359,6 +364,15 @@ class $modify(PlayLayer) {
     // is indistinguishable from a hang).
     // A manual pause (Escape, unfocused=false) is let through
     void pauseGame(bool unfocused) {
+        // GD adds the pause menu to this layer's parent, and a layer without one is a crash
+        // (read at pauseGame+0x2aa). That only happens to a layer that has lost its scene --
+        // which the slice swap once caused (level_slice.hpp, sceneBusy) -- and the game must not
+        // go down for it.
+        if (!this->getParent()) {
+            writeResult("pause: refused - the layer has no scene to put the pause menu in");
+            log::warn("pause: refused - the layer has no scene to put the pause menu in");
+            return;
+        }
         if (unfocused && g_started && !g_sessionOver) {
             ++g_unfocusPauseBlocked;
             if (g_unfocusPauseBlocked <= 3)

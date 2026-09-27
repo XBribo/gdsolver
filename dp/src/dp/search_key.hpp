@@ -422,6 +422,11 @@ inline uint64_t keyOf(const State& s, long long t) {
            // every existing key stays bit-identical.
            // --bonkarm puts the gate back, so it puts the bit back with it.
            ^ ((s.armT < kArmTicks) ? 0xFF51AFD7ED558CCDull : 0)
+           // The spider's teleport age while it still spares a side kill (State::spiderJumpT):
+           // two spiders at the same (y, vy) answer a wall inside their box differently for the
+           // ticks that are left. 0 outside the window, so every other key is bit-identical.
+           ^ ((s.spiderJumpT < kSpiderJumpGraceTicks)
+                  ? ((uint64_t)(s.spiderJumpT + 1) * 0x94D049BB133111EBull) : 0)
            // --coins: the collected set (State::coins). Same argument as the
            // trigger mask -- a state that took the coin and one that flew
            // through the same cell without it answer the rest of the level

@@ -2096,9 +2096,10 @@ inline int cliMainOnce(int argc, char** argv) {
                 const size_t b2 = (b1 == std::string::npos) ? b1
                                                             : v.find('|', b1 + 1);
                 if (b2 == std::string::npos
-                    || (v.substr(0, b1) != "1" && v.substr(0, b1) != "2")) {
+                    || (v.substr(0, b1) != "1" && v.substr(0, b1) != "2"
+                        && v.substr(0, b1) != "3")) {
                     std::printf("seed payload rejected: hist '%s' is not version "
-                                "1 or 2 (version|count|name:value,...)\n", v.c_str());
+                                "1, 2 or 3 (version|count|name:value,...)\n", v.c_str());
                     return 2;
                 }
                 histVersion = std::atoi(v.substr(0, b1).c_str());
@@ -2293,12 +2294,15 @@ inline int cliMainOnce(int argc, char** argv) {
                 init.bandBranch = (uint8_t)((init.bandBranch & ~kBandFree)
                                             | kBandFreeKnown
                                             | (h.second != 0 ? kBandFree : 0));
+            else if (h.first == "spiderJumpT" && h.second >= 0)
+                init.spiderJumpT = (uint8_t)std::min(h.second, kSpiderJumpGraceTicks);
         }
         std::printf("seed: hist=payload v%d pressSpent=%d pressSpent2=%d "
-                    "freeMode=%s\n", histVersion, (int)init.pressSpent,
+                    "freeMode=%s spiderJumpT=%d\n", histVersion, (int)init.pressSpent,
                     (int)init.pressSpent2,
                     !(init.bandBranch & kBandFreeKnown) ? "unknown"
-                    : (init.bandBranch & kBandFree) ? "1" : "0");
+                    : (init.bandBranch & kBandFree) ? "1" : "0",
+                    (int)init.spiderJumpT);
     }
     // ...and at the level's own start the byte is known: resetLevel leaves
     // [layer+0x311] clear and only a mode portal writes it. Known only when the

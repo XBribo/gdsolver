@@ -97,10 +97,14 @@ section solver finds a way through the game itself — slowly, and not always.
 * **Randomness the model cannot box in.** An Area Move with a random variance is
   planned against the whole box it can land in. Area Rotate and Area Scale with a
   variance, and an Advanced Follow's, are not covered yet; the session's
-  `areaenv:` line counts them. The section solver searches the game with whatever
-  this attempt's random numbers are, so a stretch it solves there can depend on
-  them (planned: warn in the play menu, and solve such a level with the seed
-  fixed).
+  `areaenv:` line counts them. While the bot drives, the game's random seeds are
+  set to the same values before every attempt, so each attempt meets the same draw
+  and a solution is one for that draw; the play menu says when a level has a
+  Random or Advanced Random trigger, or an area or enter effect with a random
+  variance (a spawn delay's or an Advanced Follow's variance is not detected yet).
+  The section solver's checkpoint restores start it from the attempt's
+  first values too, so a stretch it solves after a Random trigger can still fail
+  on the replay from the start, which then refuses it.
 
 ### In the model, but measured less
 
@@ -166,6 +170,7 @@ one disagreement at a time.
 
 Outside the subset the loop still tries, and a level clears if the game lets it.
 What is planned is to say so up front and afterwards: a warning in the play menu
-when a level uses something the model does not have (or depends on random
-numbers), and a clear reported as either the model's alone or one with stretches
-the section solver found.
+when a level uses something the model does not have, and a clear reported as
+either the model's alone or one with stretches the section solver found. (The
+menu already says when a level has a Random trigger or an effect with a random
+variance.)

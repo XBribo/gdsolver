@@ -1,3 +1,35 @@
+# v0.3.2
+
+ * **Solving a heavy level from its online page no longer stalls, and Escape no
+   longer crashes the game.** A level with 10,000 objects the run cannot depend on
+   is solved on a copy (level slicing, v0.3.0). The page of an online level builds
+   the level and starts the fade to it a few frames later, and the copy was swapped
+   in between: the fade then put the level itself back on screen, where it ran with
+   nothing driving it while the solve waited on the copy, and pausing reached for a
+   copy that was no longer on screen. The swap now waits until the level it
+   replaces is the one on screen, with no scene change pending, for up to 20 s.
+ * **Random numbers are fixed while the bot drives.** The game draws Random and
+   Advanced Random triggers, spawn delays and area effect variances from seeds it
+   either reseeds from the clock on every attempt or never resets, so the same
+   plan met a slightly different level each time. While a solve or replay runs,
+   the seeds are set to the same values before every attempt; playing yourself is
+   untouched. The play menu says when a level has a Random or Advanced Random
+   trigger, or an area or enter effect with a random variance (a spawn delay's or
+   an Advanced Follow's variance is not detected yet). SubZero's Power Trip with coins,
+   which took 102 to 106 rounds depending on the run, now takes the same rounds
+   every time.
+ * **A spider just after its teleport can pass through a solid's side**, as in the
+   game: for 0.04 s after it, the side of a block that does not reach past its
+   front does not kill it. The model killed there, and a solve that starts inside
+   that window is now told how long ago the teleport was.
+ * **A death the model makes and the game does not is learnt.** When the two agreed
+   on the state and differed only on the kill, the correction was filed as a no-op
+   and never reached the solver, so the same death came back round after round.
+ * **Section searches are faster.** The shader layer is no longer refreshed on every
+   restore inside a search (a restore went from 74 to 12 us on a heavy level), and
+   copying the game state during a search no longer rebuilds its maps. Neither
+   changes what the search finds.
+
 # v0.3.1
 
  * **The release workflow builds again.** v0.3.0 turned the touch mask into a

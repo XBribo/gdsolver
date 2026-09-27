@@ -289,6 +289,7 @@ inline std::string modCfg() {
     put(s, "dparg", g_cfg.dpArgs);
     put(s, "presstrace", g_pressT0, g_pressT1);
     put(s, "rngfresh", g_rngFresh);
+    put(s, "rngfix", g_rngFix);
     put(s, "rngseed", g_rngSeedEE0, g_rngSeedEF8);
     put(s, "areatrace", g_areaUids);
     put(s, "sticktrace", g_stickT0, g_stickT1);

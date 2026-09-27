@@ -19,6 +19,12 @@ platformer mode, so its play button just plays it.
 The choice is made per play. The menu opens on Replay when a solution for the level is stored (with Coins ticked when the coin solution is), and on Solve when none is. Turning the mod setting **Choose
 the mode on Play** off removes the menu, and the play button then just plays the level.
 
+When the level has a Random or Advanced Random trigger, or an area or enter effect with a random
+variance, a line under the modes says so (a spawn delay's or an Advanced Follow's variance is not
+detected yet). While the bot drives, the game's
+random seeds are set to the same values before every attempt, so a solve and a replay meet the
+same draw every time; playing the level yourself is untouched (cfg `rngfix`, on by default).
+
 **It runs fast, dark and silent until it has something to show.** Candidate replays mostly
 die and each one at normal speed would cost the length of the song, so the screen goes to the
 fast loop and stays there. When a candidate finally clears, the level restarts and the solution is

@@ -44,6 +44,7 @@ inline bool wanted() {
 struct LevelFacts {
     bool platformer = false;
     int coins = 0;
+    bool random = false;   // uses the game's random numbers (isRandomObject)
 };
 
 // The key's value in a "k,v,k,v" run, or empty.
@@ -59,6 +60,30 @@ inline std::string_view valueOf(std::string_view kv, std::string_view key) {
         p = c2 + 1;
     }
     return {};
+}
+
+// Does this object make the level depend on GD's random numbers? A Random or Advanced Random
+// trigger (1912, 2068) always does. An area or enter effect trigger (3006-3015, 3017-3021) does
+// when any of its variances is set: the keys are the ones EnterEffectObject::getSaveString
+// (0x496630) writes for the fields EnterEffectInstance::loadValuesFromObject (0x1387a0) copies
+// into the variances areaenv reads -- 223 length, 221 offset, 253 offset y, 219 distance,
+// 232 angle, 238 x move, 240 y move, 234 x scale, 236 y scale, 285 rotation. -99 is an edit
+// trigger's "leave as it is". Checked on lv22: its Area Move writes 222,1500 and 223,500 (length
+// 1500 +- 500) and its Edit Area Move 218,700 and 219,150 (distance 700 +- 150).
+inline bool isRandomObject(std::string_view obj, std::string_view id) {
+    if (id == "1912" || id == "2068") return true;
+    int n = 0;
+    for (char ch : id) {
+        if (ch < '0' || ch > '9') return false;
+        n = n * 10 + (ch - '0');
+    }
+    if (n < 3006 || n > 3021 || n == 3016) return false;
+    for (std::string_view key : {"223", "221", "253", "219", "232", "238", "240", "234", "236",
+                                 "285"}) {
+        const auto v = valueOf(obj, key);
+        if (!v.empty() && v != "0" && v != "-99") return true;
+    }
+    return false;
 }
 
 inline LevelFacts readLevel(GJGameLevel* level, bool mainLevel) {
@@ -93,6 +118,7 @@ inline LevelFacts readLevel(GJGameLevel* level, bool mainLevel) {
                                                  ? std::string_view::npos : end - pos - 1);
         const auto id = valueOf(obj, "1");
         if (id == "142" || id == "1329") ++f.coins;
+        if (!f.random && isRandomObject(obj, id)) f.random = true;
         pos = end;
     }
     return f;
@@ -137,6 +163,7 @@ protected:
     CCMenuItemToggler* m_coinToggle = nullptr;
     cocos2d::CCLabelBMFont* m_coinLabel = nullptr;
     cocos2d::CCLabelBMFont* m_note = nullptr;
+    cocos2d::CCLabelBMFont* m_rngNote = nullptr;
     ButtonSprite* m_startSpr = nullptr;
     CCMenuItemSpriteExtra* m_startBtn = nullptr;
 
@@ -148,6 +175,7 @@ protected:
     static constexpr float kW = 340.f, kH = 260.f;
     static constexpr float kModeY = 42.f, kDescY = 2.f, kCoinY = -34.f;
     static constexpr float kNoteY = 64.f, kStartY = 32.f;   // from the bottom edge
+    static constexpr float kRngNoteY = 78.f;   // just above the bot note, below the Coins row
 
     bool init(GJGameLevel* level, LevelFacts facts, std::function<void()> play) {
         using namespace cocos2d;
@@ -236,6 +264,12 @@ protected:
         m_note->setOpacity(150);
         m_note->setID("bot-note"_spr);
         m_mainLayer->addChildAtPosition(m_note, Anchor::Bottom, ccp(0, kNoteY));
+        m_rngNote = CCLabelBMFont::create("This level uses random numbers: fixed while the bot drives.",
+                                          "chatFont.fnt");
+        m_rngNote->setScale(.55f);
+        m_rngNote->setColor({255, 230, 150});
+        m_rngNote->setID("random-note"_spr);
+        m_mainLayer->addChildAtPosition(m_rngNote, Anchor::Bottom, ccp(0, kRngNoteY));
 
         m_startSpr = ButtonSprite::create("Start", "goldFont.fnt", "GJ_button_01.png", .9f);
         m_startBtn = CCMenuItemSpriteExtra::create(m_startSpr, this,
@@ -264,6 +298,9 @@ protected:
         // Saying so here, rather than letting the session find out after the level has loaded,
         // is the point of asking before the level starts.
         const bool ok = m_mode != UI_MODE_REPLAY || hasSolution();
+        // A level that draws on the game's random numbers is solved and replayed with them fixed
+        // (rngfix): said here, so a replay outside the mod that goes differently is no surprise.
+        m_rngNote->setVisible(bot && m_facts.random);
         m_desc->setString(ok ? describe(m_mode, m_coins)
                              : (m_coins ? "No stored coin solution for this level yet.\n"
                                           "Solve it with Coins on first."
