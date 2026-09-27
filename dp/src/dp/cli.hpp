@@ -3342,7 +3342,7 @@ inline int cliMainOnce(int argc, char** argv) {
     // instead. One such tap per call -- State::taps is a single number; a
     // second one keeps the fire-once reading and says so.
     struct TapGive {
-        TouchMask bit = 0;
+        TouchMask bit{};
         int item = 0, per = 0;
         double armX = 0.0, closeX = 1e18;
         // GD's terms for the two ends (TouchTrig::tapChan): the channel each

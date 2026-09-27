@@ -48,7 +48,8 @@ where custom levels and platformer mode stand.
 
 ## Results
 
-The tables are cold regression runs of the v0.3.0 build (2026-09-27) —
+The tables are cold regression runs of the v0.3.0 build (2026-09-27; v0.3.1
+builds to the same code, see the [changelog](changelog.md)) —
 `python py/cold_regress.py --one-session`, the whole suite inside a single game
 session, no plan and no solution file to start from — one with coins
 (`--cfg coinroute=1 coins=1`) and one for the end of the level alone. The coin

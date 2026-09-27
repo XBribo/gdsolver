@@ -1,3 +1,15 @@
+# v0.3.1
+
+ * **The release workflow builds again.** v0.3.0 turned the touch mask into a
+   fixed-width bit set, and one line still initialised it from `0`. The compiler
+   used for desk builds (MSVC) accepted that; the one the release workflow uses
+   (clang) does not, so the workflow failed, and the package on the v0.3.0
+   release is a desk build rather than one the workflow made from the public
+   tree. The line is now standard C++, and the desk build of it is the same
+   machine code as v0.3.0's apart from its build timestamp: nothing the solver
+   does changes, and the v0.3.0 results stand. This release's package is built
+   by the workflow from this commit.
+
 # v0.3.0
 
  * **The spin-off levels.** Beyond the 22 main levels, the 17 official levels of
