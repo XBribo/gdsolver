@@ -1,7 +1,7 @@
 # The iteration map
 
 On while a solve runs, off in a replay until `F10` asks. (The transport it shares a corner with —
-the seek bar, the arrow keys — is in the [README](../README.md#the-iteration-map-f10); this
+the seek bar, the arrow keys — is in [RUNNING.md](RUNNING.md#the-iteration-map-f10); this
 document is about reading what the map draws.)
 
 A cold run reports one number — *cleared in 62 rounds* — and that number says nothing about
@@ -142,8 +142,8 @@ model was wrong, is exact either way.
 
 **They have no tails.** A tail is a point every eight ticks and the log holds one line per round,
 so the trajectories were never written down and cannot be recovered from it — only a run recording
-as it goes has them. Every file currently in `data/` was rebuilt this way, so replaying a stored
-map shows deaths, columns and fixups but no fan. The overlay says `[no tails in this map]` rather
+as it goes has them. A map rebuilt from a log shows deaths, columns and fixups but no fan. The
+overlay says `[no tails in this map]` rather
 than drawing nothing without explanation; re-solve the level to get one with tails.
 
 To watch a replay with the map already on:

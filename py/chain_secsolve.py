@@ -15,7 +15,7 @@ because the MOD's verification only ever speaks about "from the section CP".
 If a section comes back EXHAUSTED (search failure), MOVE THE ENTRANCE BACKWARD
 and solve again. It means "no sequence of presses gets through from that
 entrance" = the entrance itself is already a dead end, so widening the cap does
-not help (measured, docs/HANDOFF.md update 42).
+not help (measured).
 """
 from __future__ import annotations
 import argparse

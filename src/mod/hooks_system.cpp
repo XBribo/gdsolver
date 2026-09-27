@@ -147,6 +147,18 @@ class $modify(FMODAudioEngine) {
                                                 start, end, fadeIn, fadeOut, loop, effectID,
                                                 override, uniqueID, minInterval, group);
     }
+    // A section search steps and restores the level tens of thousands of times, and every step
+    // runs GJBaseGameLayer::processActivatedAudioTriggers -> processSongState, which seeks the
+    // song to where the game is. With the player's own save that seek dominated the search:
+    // sampled on a worker given the Steam game's save, ~64% of the main thread sat under
+    // setMusicTimeMS (channelForChannelID, into fmod and the heap), and a rung that took 6.7 s
+    // with a worker's save took 59 s (the Steam game's 59.5 s). The search plays nothing -- the
+    // screen and the sound are off -- so while it runs the seek is skipped. Nothing physical
+    // reads the song position.
+    void setMusicTimeMS(unsigned int time, bool dontWait, int musicID) {
+        if (secsolve::g_active) { ++g_secSongSeeksSkipped; return; }
+        FMODAudioEngine::setMusicTimeMS(time, dontWait, musicID);
+    }
     // (playEffectAsync is inline on Windows and cannot be hooked. It forwards into the queued
     // path above, which is hooked, so nothing is lost by not having it.)
     int playEffect(gd::string path, float speed, float unknown, float volume) {

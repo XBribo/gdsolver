@@ -5,7 +5,7 @@
 	},
 	"id": "gdsolver.solver",
 	"name": "GD Solver",
-	"version": "v0.2.0",
+	"version": "v0.3.0",
 	"developers": ["gdsolver"],
 	"description": "Automatically finds an input sequence that clears a level, with the game itself as the verifier.",
 	"tags": ["gameplay", "utility", "offline", "cheat"],
@@ -17,6 +17,12 @@
 		"url": "https://github.com/gdsolver/gdsolver/issues"
 	},
 	"settings": {
+		"play-menu": {
+			"type": "bool",
+			"name": "Choose the mode on Play",
+			"description": "A level's play button opens a menu: Normal, Replay or Solve. Off, the play button just plays the level, as without the mod.",
+			"default": true
+		},
 		"key-overlay": {
 			"type": "keybind",
 			"name": "Hide the overlay",

@@ -17,6 +17,7 @@ namespace p1 {
 #include "solver/clearance.hpp"
 #include "solver/psnap.hpp"
 #include "solver/secsolve.hpp"
+#include "solver/route.hpp"
 
 // ---- Stage B self-test (cfg `dpselftest=1`) ----
 // Build the objrects table in memory and hand it to the solver core that is now linked into

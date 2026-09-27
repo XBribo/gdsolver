@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""brief-017 part A: where is a truth run worth doing?
+"""Where is a truth run worth doing?
 
-    python py/sections.py --levels 22 --census C:\\GD-lab\\data\\census_div.json
+    python py/sections.py --levels 22 --census <census.json>
 
 A verified solution only ever walks where the model believed it could, so the
 places the model is WRONG do not all show up the same way. Four sources see
@@ -102,7 +102,7 @@ def veto_ticks(lv: int, boxes, track: Path | None = None) -> list[tuple[int, str
     """A veto is recorded in x, and the sections are in ticks. Translate through
     a trajectory: the first tick the run is inside the box.
 
-    The trajectory is brief-017 part B's own dump.csv when one is given -- that
+    The trajectory is a previous pass's own dump.csv when one is given -- that
     pass already writes tick, x and y for the whole level, so the conversion
     does not depend on whether a level happens to have a gdref. gdref is the
     fallback, and a level with neither has its boxes REPORTED AND DROPPED

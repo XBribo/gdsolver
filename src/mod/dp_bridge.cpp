@@ -39,6 +39,7 @@ LevelStats statsFromCsv(const std::string& csv) {
     s.orbs = L.orbs.size();
     s.moving = L.dyn.size();
     s.maxX = L.maxX;
+    s.unsupported = L.unsupported;
     return s;
 }
 
@@ -62,6 +63,10 @@ int solveInProcess(const std::string& csv, const std::vector<std::string>& args)
     return rc;
 }
 
+std::vector<double> prepMarks() {
+    return std::vector<double>(std::begin(dp::g_prepMark), std::end(dp::g_prepMark));
+}
+
 SolveProgress progress() {
     SolveProgress p;
     p.running = dp::g_progress.running.load(std::memory_order_acquire);
@@ -76,9 +81,11 @@ SolveProgress progress() {
 SolveOutcome outcome() {
     SolveOutcome o;
     o.verdict = dp::g_outcome.verdict;
+    o.horizonCut = dp::g_outcome.horizonCut;
     o.deepT = dp::g_outcome.deepT;
     o.deepX = dp::g_outcome.deepX;
     o.capHits = dp::g_outcome.capHits;
+    o.workStates = dp::g_outcome.workStates;
     o.cancelT = dp::g_outcome.cancelT;
     o.resimDead = dp::g_outcome.resimDead;
     o.resimFirst = dp::g_outcome.resimFirst;
@@ -86,17 +93,18 @@ SolveOutcome outcome() {
     o.resimUid = dp::g_outcome.resimUid;
     o.resimObjX = dp::g_outcome.resimObjX;
     o.resimObjY = dp::g_outcome.resimObjY;
-    o.resimTrig = dp::g_outcome.resimTrig;
+    o.resimTrig = dp::g_outcome.resimTrig.word(0);   // the whole mask while kTouchBits <= 64
     o.resimFrame = dp::g_outcome.resimFrame;
     o.replayDiedT = dp::g_outcome.replayDiedT;
     o.rejoinT = dp::g_outcome.rejoinT;
     o.rejoinBadT = dp::g_outcome.rejoinBadT;
     o.rejoinBadWhy = dp::g_outcome.rejoinBadWhy;
-    o.needTrigMask = dp::g_outcome.needTrigMask;
-    o.needTrigPassed = dp::g_outcome.needTrigPassed;
+    o.needTrigMask = dp::g_outcome.needTrigMask.word(0);
+    o.needTrigPassed = dp::g_outcome.needTrigPassed.word(0);
     o.seedRotQ = dp::g_outcome.seedRotQ;
     o.rotQOrder = dp::g_outcome.rotQOrder;
     o.coinGates = dp::g_outcome.coinGates;
+    o.coinNoPrune = dp::g_outcome.coinNoPrune;
     o.startRotHit = dp::g_outcome.startRotHit;
     o.startRotGiven = dp::g_outcome.startRotGiven;
     o.startRotMiss = dp::g_outcome.startRotMiss;
@@ -109,6 +117,7 @@ SolveOutcome outcome() {
     o.trigDroppedAhead = dp::g_outcome.trigDroppedAhead;
     o.trigMaxKeptX = dp::g_outcome.trigMaxKeptX;
     o.trigMapSig = dp::g_outcome.trigMapSig;
+    o.unsupported = dp::g_outcome.unsupported;
     return o;
 }
 
@@ -150,6 +159,21 @@ std::string coreVersion() {
     // No version string exists in dp/ yet; the compile stamp of this TU is what identifies
     // the core that is linked in, and it moves whenever dp/ is rebuilt
     return std::string("dp core built ") + __DATE__ + " " + __TIME__;
+}
+
+std::string defaultsProfile() {
+    dp::resetInvocationState();
+    const std::string list = dp::defaultsProfile();
+    uint64_t h = 1469598103934665603ULL;   // FNV-1a of the list, so two runs compare by one field
+    for (char c : list) {
+        h ^= (uint8_t)c;
+        h *= 1099511628211ULL;
+    }
+    std::string core = coreVersion();
+    for (char& c : core) if (c == ' ') c = '_';
+    char fnv[24];
+    std::snprintf(fnv, sizeof(fnv), "%016llx", (unsigned long long)h);
+    return "core=" + core + " fnv=" + fnv + " " + list;
 }
 
 }  // namespace dpbridge

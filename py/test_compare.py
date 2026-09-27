@@ -4,7 +4,7 @@
     python py/test_compare.py            # all
     python py/test_compare.py -v         # with names
 
-Seven of the nine mis-comparisons listed in the campaign notes are mechanical,
+Seven of the nine mis-comparisons found during the 2026-09-05/06 sweep are mechanical,
 and each is pinned here in BOTH directions: under the mistaken conditions
 gdtas.compare refuses (or returns something whose sign, half or coverage makes
 the mistake visible), and under the correct conditions it reproduces the

@@ -15,8 +15,8 @@ between sessions.
     python py/gdghidra.py --funcs collision            # search names (regex)
 
 The project lives in the private lab (GDSOLVER_LAB), holds the imported
-worker exe, and is created once by a headless import + auto-analysis run
-(see the lab notes for the exact command). Symbols come from the same
+worker exe, and is created once by a headless import + auto-analysis run.
+Symbols come from the same
 2.2081 Broma that gddisasm.py reads, so both tools agree on names.
 
 Traps:
@@ -80,7 +80,7 @@ def _program(save: bool = False):
         gd = [f for f in files if f.getName().startswith("GeometryDash")]
         if not gd:
             raise SystemExit(f"no GeometryDash program in {PROJECT_DIR}; "
-                             "run the headless import first (lab notes)")
+                             "run the headless import first")
         with pyghidra.program_context(project, gd[0].getPathname()) as program:
             yield program
             if save:

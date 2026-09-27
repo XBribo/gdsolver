@@ -104,7 +104,7 @@ def solve_case(lv: int, t0: int, horizon: int, exe: Path, tmp: runtmp.RunTmp,
         return {"verdict": "SKIP", "note": "no groups"}
     r = gd[t0]
     # `reach_lv{lv}_{t0}` carries NO RUN IDENTITY, and --tmp defaulted to a
-    # machine-wide C:\GDtmp\reach, so two runs wrote the same paths. Same hole
+    # shared machine-wide temp directory, so two runs wrote the same paths. Same hole
     # and same fix as fixcensus / quick_regress / verify: private by default,
     # fingerprinted when a --tmp is named by hand. All three suffixes are
     # reserved together because they belong to one case -- the .txt written
@@ -260,7 +260,7 @@ def gd_survives(res: dict, horizon: int, worker_id: int, tmp: runtmp.RunTmp,
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--leveldp", default=str(LEVELDP_EXE))
-    # WAS r"C:\GDtmp\reach" -- machine-wide, shared by every checkout and every
+    # WAS a shared machine-wide temp directory -- shared by every checkout and every
     # concurrent run, with file names that carry no run identity. Unset, the run
     # now gets a directory only it can name; name one by hand and it behaves as
     # before, with the fingerprints making the sharing detectable.

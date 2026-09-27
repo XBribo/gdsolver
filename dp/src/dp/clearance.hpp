@@ -29,7 +29,7 @@
 //
 // Y ONLY.  x is fixed by the layer -- every state in a layer has travelled the
 // same distance -- so the vertical gap is the only room the search can
-// actually choose to keep.  (The census in the lab note measured x penetration
+// actually choose to keep.  (A census measured x penetration
 // too; that says where the state ended up, not what the DP could have done.)
 // ---------------------------------------------------------------------------
 

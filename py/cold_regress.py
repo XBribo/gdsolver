@@ -69,8 +69,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import cold_manifest
 from gdtas.paths import BUILD_MOD, DATA
-from gdtas.worker import run_session
+from gdtas.worker import run_session, snapshot_mod
 
 BASELINE = DATA / "cold_baseline.json"
 
@@ -148,7 +149,7 @@ def _run_meta(a) -> dict:
     """What produced a run: the commit, the package and its sha256, the cfg, the
     levels and the resolution. Written beside a one-session run's log so the
     baseline can be adopted from that run later (--adopt) without running it
-    again -- the two-stage bless of AUD-20260922-28."""
+    again -- the two-stage bless."""
     import hashlib
     import subprocess
     head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -439,7 +440,7 @@ def read_result(txt: str, timed_out: bool = False) -> dict:
     # count below other than zero means the box was not verified against the game, and a level
     # solved against an unverified box is not seed-independent. `solver_box_kills` is not a
     # fault: the box is conservative by design, and a non-zero count says the search was pruned
-    # by uncertainty and not only by the level (audit AUD-20260920-01).
+    # by uncertainty and not only by the level.
     areaenv = ""
     ae = re.search(r"^areaenv: (.*)$", txt, re.M)
     if ae:
@@ -496,7 +497,7 @@ def report(results: list[dict], base: dict, a) -> int:
             if d:
                 mark = f"  (baseline {b['iters']}, {d:+d})"
             # Over the cap is a thing to look at, not a failure: iterations are
-            # not a verdict (REGRESSION_OPERATING_DESIGN 3.6, AUD-20260922-28).
+            # not a verdict.
             # The wall and stall clocks are what protect the machine.
             if r["iters"] > iter_cap(r["lv"], base):
                 over_cap.append(f"lv{r['lv']}: {r['iters']} iterations against a cap of "
@@ -590,7 +591,7 @@ def report(results: list[dict], base: dict, a) -> int:
         # coins: blessing a 2/3 would make the miss the expectation.
         short = [f"lv{r['lv']} {r.get('coins') or 'none'}" for r in results
                  if coins and r["cleared"] and not _all_coins(r.get("coins", ""))]
-        # A baseline has to say where it was measured (AUD-20260922-28).
+        # A baseline has to say where it was measured.
         if getattr(a, "resolution", None) is None:
             bad.append("the profile's resolution is unknown, so a baseline from this "
                        "run could not say where it was measured")
@@ -675,8 +676,9 @@ def main(argv=None) -> int:
     # THE PER-LEVEL CLOCK. A level that solves but takes an hour is a red
     # signal, not a result worth waiting for: the user's ruling of 2026-09-03
     # is to drop it early, keep what it had, and go and find out why. The cap
-    # is about twice the release build's own time -- 20 minutes on Windows,
-    # and Wine is roughly half as fast again, so --wine scales it by 1.5.
+    # is about twice the release build's own time -- 20 minutes on a Windows
+    # worker; slower workers scale it with --budget-scale (1.5 for ones
+    # roughly half as fast again).
     # Left at None the two arrangements resolve it differently, because they
     # mean different things by "budget": in parallel it IS the per-level clock,
     # while --one-session multiplies it by the level count into one cap for the
@@ -687,12 +689,12 @@ def main(argv=None) -> int:
     # to hand this same number to the mod as a level deadline rather than to
     # add a second clock out here.
     ap.add_argument("--budget", type=float, default=None,
-                    help="wall-clock seconds per level (default 1200, or 1800 "
-                         "with --wine; in --one-session, seconds per level "
+                    help="wall-clock seconds per level (default 1200 times "
+                         "--budget-scale; in --one-session, seconds per level "
                          "summed into one cap for the whole game, default 3600)")
-    ap.add_argument("--wine", action="store_true",
-                    help="the workers are the Wine container's -- scale the "
-                         "per-level cap by 1.5")
+    ap.add_argument("--budget-scale", type=float, default=1.0,
+                    help="multiply the default per-level cap, for workers slower "
+                         "than a Windows one (1.5 for half as fast again)")
     ap.add_argument("--cfg", nargs="*", default=[],
                     help="extra autorun.cfg keys, e.g. dpfingerprint=0")
     ap.add_argument("--one-session", action="store_true",
@@ -705,7 +707,7 @@ def main(argv=None) -> int:
     # desk -- different configuration, so not obviously the same arithmetic.
     ap.add_argument("--mod", type=Path, default=BUILD_MOD,
                     help="the .geode to run (default: the local build)")
-    # The second stage of a bless (AUD-20260922-28): a --one-session run leaves
+    # The second stage of a bless: a --one-session run leaves
     # coldlog_suite.txt and coldlog_suite.meta.json in data/; copied to a folder
     # and reviewed, the baseline is adopted from them here, without running GD.
     ap.add_argument("--adopt", type=Path, default=None,
@@ -719,6 +721,16 @@ def main(argv=None) -> int:
         return 1
     if a.mod != BUILD_MOD:
         print(f"measuring {a.mod}\n  (not the local build at {BUILD_MOD})")
+    # PIN THE PACKAGE ONCE, here, and measure the pinned copy from now on. The
+    # workers snapshot it by content hash anyway, but they do it at each launch:
+    # between this run's meta and that snapshot the main line can rebuild, and
+    # then the meta names one package while the game loads another. Reading the
+    # immutable copy for both closes that window (the meta being written after
+    # the suite -- the other half of this -- was fixed in e2a1dde).
+    pinned, digest = snapshot_mod(a.mod)
+    if pinned != a.mod:
+        print(f"  pinned as {pinned.name} ({digest})")
+    a.mod = pinned
 
     coins = coin_cfg(list(a.cfg))
     if coins is None:
@@ -746,7 +758,7 @@ def main(argv=None) -> int:
         return 2
     if a.resolution is None:
         # Fail closed: a run that cannot say where it was measured is neither
-        # compared nor blessed (AUD-20260922-28).
+        # compared nor blessed.
         print(f"refused: worker {','.join(str(w) for w in used)} has a hand-configured "
               f"profile without a resolution key, so this run could not say what it measured")
         return 2
@@ -766,9 +778,15 @@ def main(argv=None) -> int:
     if a.bless and not a.one_session:
         print("--bless runs --one-session (the numbers have to come from an "
               "arrangement in which the mod cleans up between levels)")
+    # What this run is, in data/cold_manifest.json beside the logs (py/cold_manifest.py):
+    # compare two runs with `cold_manifest.py compare`, not by what their folders are called.
+    cold_manifest.start(DATA, mod=a.mod, cfg=CFG + list(a.cfg), levels=list(a.levels),
+                        arrangement="one-session" if one_session_mode else "per-level",
+                        resolution=a.resolution, coins=coins)
+    logs = {lv: DATA / f"coldlog_lv{lv}.txt" for lv in a.levels}
     # A suite has no per-level clock to set, so its default stays where it was;
-    # the parallel arrangement takes the 20-minute cap (x1.5 under Wine).
-    per_level = a.budget if a.budget else (1800.0 if a.wine else 1200.0)
+    # the parallel arrangement takes the 20-minute cap (times --budget-scale).
+    per_level = a.budget if a.budget else 1200.0 * a.budget_scale
     if one_session_mode:
         wid = a.pool[0]
         # --budget is per level; a suite spends it end to end. It is a cap, not a
@@ -776,10 +794,15 @@ def main(argv=None) -> int:
         budget = (a.budget if a.budget else 3600.0) * len(a.levels)
         print(f"  worker {wid}: {','.join(str(l) for l in a.levels)} "
               f"in ONE game (cap {budget / 3600:.1f} h)")
-        results = one_session(a.levels, wid, budget, list(a.cfg), DATA, a.mod)
         # ...and what produced it, beside the log, so the run can be reviewed and
         # its baseline adopted later with --adopt instead of being run again.
+        # TAKEN BEFORE THE RUN: the worker copies build/'s package at launch, so
+        # a build that lands while the suite is running does not change what is
+        # being measured -- but it does change what a hash taken afterwards
+        # reads. On 2026-09-23 a mid-run build left a frozen log claiming a
+        # package the run never loaded, and --adopt believes this file.
         a.run_meta = _run_meta(a)
+        results = one_session(a.levels, wid, budget, list(a.cfg), DATA, a.mod)
         (DATA / "coldlog_suite.meta.json").write_text(
             json.dumps(a.run_meta, indent=1, sort_keys=True), encoding="utf-8")
         for r in results:
@@ -787,11 +810,12 @@ def main(argv=None) -> int:
             print(f"lv{r['lv']:<3} {r['why']:<40} iters={r['iters']:<4}"
                   f"deepest t={r['deepest_t']:<6} x={r['deepest_x']:<9.0f}"
                   f"fx={r['fx']:<4} record={r['record']}", flush=True)
+        cold_manifest.finish(DATA, logs)
         return report(results, base, a)
 
     buckets = assign(a.levels, a.pool)
     print(f"  per-level cap {per_level:.0f}s"
-          + (" (Wine)" if a.wine else "")
+          + (f" (x{a.budget_scale:g})" if a.budget_scale != 1.0 else "")
           + ("" if a.budget else " -- the default; --budget overrides"))
     for w in a.pool:
         if buckets[w]:
@@ -830,6 +854,7 @@ def main(argv=None) -> int:
         for got in ex.map(run_bucket, busy):
             results.extend(got)
 
+    cold_manifest.finish(DATA, logs)
     return report(results, base, a)
 
 

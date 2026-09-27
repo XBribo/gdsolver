@@ -24,6 +24,9 @@ struct LevelStats {
     bool ok = false;
     std::size_t objs = 0, portals = 0, pads = 0, orbs = 0, moving = 0;
     double maxX = 0.0;
+    // Non-empty when the parser refused the level (dp Level::unsupported, e.g. more
+    // gravity portals than the latch holds). Nothing may be solved on it then.
+    std::string unsupported;
 };
 
 // Parse a CSV held in memory (the same bytes that go into objrects.txt).
@@ -40,6 +43,10 @@ int solveInProcess(const std::string& csv, const std::vector<std::string>& args)
 // One line naming the build of the solver core that is linked in. Written to result.txt at
 // session start so a run can always say which solver produced it.
 std::string coreVersion();
+// The core's built-in default profile: `core=<build> fnv=<hash of the list> name=value ...`, every
+// global a call's reset sets to a constant, read right after that reset (tools/gen_effective_cfg.py
+// generates the list). Resets the core's per-call globals, so only while no solve is running.
+std::string defaultsProfile();
 
 // Where the search has got to, sampled from another thread while solveInProcess runs. The CLI
 // shows the same three numbers by printing a line every 500 ticks; on screen they have to be
@@ -69,9 +76,12 @@ enum { OutcomeFailed = 0, OutcomePartial = 1, OutcomeSolved = 2, OutcomeCancelle
 
 struct SolveOutcome {
     int verdict = OutcomeFailed;
+    // OutcomeSolved by outliving --horizon rather than by reaching the end (dp progress.hpp).
+    bool horizonCut = false;
     long long deepT = -1;
     double deepX = -1.0;
     long long capHits = -1;
+    long long workStates = 0;   // dp's SearchOutcome::workStates: the search's own work
     // OutcomeCancelled only: the layer the search was on when it saw the cancel. -1 otherwise.
     long long cancelT = -1;
     // Ticks of the emitted plan on which the model itself fired a kill, counted
@@ -110,6 +120,8 @@ struct SolveOutcome {
     std::string rotQOrder;
     // Where a tap-gated coin is lost for good (dp progress.hpp, coinGates).
     std::string coinGates;
+    // The coins dp does not call missed when passed (dp progress.hpp, coinNoPrune).
+    std::string coinNoPrune;
     int startRotHit = -1, startRotGiven = -1;
     std::string startRotMiss;
     // What the touch window did on this call (dp progress.hpp has what each
@@ -125,8 +137,14 @@ struct SolveOutcome {
     long long trigDroppedBehind = 0, trigDroppedAhead = 0;
     double trigMaxKeptX = 0.0;
     unsigned long long trigMapSig = 0;   // over the kept uids IN BIT ORDER
+    // The load refused the level (dp Level::unsupported); the call returned 2 and
+    // searched nothing. Empty otherwise.
+    std::string unsupported;
 };
 SolveOutcome outcome();
+// Seconds into the last call at the end of each part of its preparation (dp::g_prepMark: arguments,
+// group recordings, touch/auto triggers, the level, the rest of the tables; -1 = not reached).
+std::vector<double> prepMarks();
 
 // ---- checkpoints: lineages to fly while the search is still running ------------------------
 //
@@ -158,8 +176,8 @@ unsigned long long checkCall();
 bool passCheckpoint(unsigned long long call, std::size_t index);
 
 // Ask the search in flight to stop. It leaves the layer loop at the next layer (or its wait for
-// judgements), publishes OutcomeCancelled, writes no plan and returns a distinct rc. Cleared by
-// the caller before the next search call.
+// judgements), publishes OutcomeCancelled, writes no plan and returns a distinct rc -- whether or
+// not the checkpoint channel is subscribed. Cleared by the caller before the next search call.
 void cancelSearch(bool on);
 // Kills by the Area Move boxes (hazard twins) over the life of the process (dp::g_envKills);
 // take the difference across the span to be counted.

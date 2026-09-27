@@ -648,7 +648,7 @@ RATCHET = """
   g_musicHeld g_musicPaused g_needTrigDropped g_needTrigSuspect
   g_needUnseen g_nextSnap g_noKill g_nowTick
   g_off g_overlay g_overlayHidden g_pad
-  g_panel g_pauseAtX g_pausedForSpeed g_pcCalls
+  g_pauseAtX g_pausedForSpeed g_pcCalls
   g_pendingLayer g_phantomBands g_phantomHits g_phantomLifted
   g_phantomScale g_phase g_pitch g_plan
   g_planPath g_prevFilter g_prevTerminate g_progressAtStart

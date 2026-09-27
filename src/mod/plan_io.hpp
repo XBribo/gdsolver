@@ -4,6 +4,26 @@
 
 namespace p1 {
 
+// The level slice (mod/level_slice.hpp): where this session stands. Declared here, ahead of the
+// loop and the session reset that ask it.
+namespace levelslice {
+enum Phase {
+    Off = 0,     // the level itself, as chosen (no slice, or not decided yet)
+    Sliced,      // solving on a copy without the objects the run cannot depend on
+    Verifying,   // back on the level itself, flying the plan that cleared the copy
+    Whole,       // the plan did not hold there: solving on the level itself from here on
+};
+inline int g_phase = Off;
+inline void reset();
+inline bool maybeSlice(GJBaseGameLayer* l);
+inline bool takeCarry(std::vector<InputCmd>& out);
+inline bool takeLight(std::vector<InputCmd>& out);
+inline bool onVerifyDeath(long long dt, float deathX);
+inline bool maybeCheckWall();
+inline bool onGiveUp(const char* reason);
+inline std::string summary();
+}  // namespace levelslice
+
 inline void resetSessionState() {
     g_started = false; g_sessionOver = false; g_uiSession = false;
     g_attempt = 0; g_finishedAttempts = 0;
@@ -11,6 +31,7 @@ inline void resetSessionState() {
     g_frame = 0; g_tick = 0; g_traceLines = 0; g_gameFrame = 0;
     g_endzoneBurn = false;   // carried into the next session, rendering would stay stopped
     g_endzoneLockStart = {};
+    g_secRenderWas = -1;     // ...and the same for a section solve's hold (secRenderHold)
     speedgate::reset();      // the level changes, so rebuild
     g_paused = false; g_stepTicks = 0; g_realtimeOverride = false;
     g_dpShowSolution = false;   // a finished solve must not make the next session start as one
@@ -41,6 +62,8 @@ inline void resetSessionState() {
     // is the same shape as the recording leak that hid under a green 22/22.
     touchseed::reset();
     portalseed::reset();
+    padseed::reset();
+    ringseed::reset();
     // Only a panel Solve session turns this on (session.hpp), and nothing ever turned it back
     // off: g_objs kept pointing at the outgoing level's GameObjects, and the next session --
     // Replay, Normal, another Solve -- inherited them. Measured (2026-08-24): solving lv16, then
@@ -55,7 +78,7 @@ inline void resetSessionState() {
     // The HUD's progress numbers. g_hudVerifiedX is a running maximum (onDeath only ever raises
     // it) and nothing lowered it again, so a second solve in the same process opened showing the
     // PREVIOUS level's deepest x measured against the NEW level's length. Measured (2026-08-24):
-    // solving 1474319 after another level started the bar at 54.3% with iter 1 not yet run.
+    // solving a custom level after another level started the bar at 54.3% with iter 1 not yet run.
     // giveUp()'s "stopped at N%" reads the same field, so it reported that figure too.
     g_hudIter = 0;
     g_hudFixups = 0; g_hudFixupCap = 0;
@@ -79,14 +102,20 @@ inline void resetSessionState() {
     solver::g_coinGdTick.clear();
     solver::g_coinGdUnmatched = 0;
     solver::g_coinMissFired = false;
+    solver::g_coinMissIdx = -1;
+    solver::g_endTriggers = 0;
+    solver::g_endTriggerFiredTick = -1;
     solver::g_hasRotGameplay = false;
     solver::g_itemCounts.clear();
     solver::g_coinGates.clear();
+    solver::g_coinNoMiss.clear();
     solver::g_coinLogLines = 0;
+    route::clear();   // cfg routeprereq: one level's prerequisites, built with its coins
     // The iteration map belongs to one level's run. Left behind, the next session's F10 would
     // draw the PREVIOUS level's rounds over this one -- the same family of bug as the grouptrace
     // and HUD leaks above, and just as convincing to look at.
     itermap::clear();
+    levelslice::reset();
     // The PREFERENCE is deliberately not reset here. Until someone expresses one it is not a
     // stored value at all -- mapWanted() reads it off the session's mode, so a solve draws the map
     // and a replay does not without anything having to be reset between them. Once F10 or cfg
@@ -99,6 +128,7 @@ inline void resetSessionState() {
     g_progressRestores = 0;
     g_soundWhileSolving = 0;
     g_soundBlockedWhileSolving = 0;
+    g_secSongSeeksSkipped = 0;
     g_silenceReasserts = 0;
     notify::g_forced = 0;
     if (g_trace.is_open()) g_trace.close();

@@ -399,7 +399,7 @@ def run_pool(level: int, ticks: list[int], a) -> list[dict]:
 
 def record(a) -> int:
     # Only OUR pool matters: worker 98/99 belong to the resident MCP session and
-    # a Wine container's GD does not appear here at all. A worker of the
+    # a GD running in a container does not appear here at all. A worker of the
     # mainline batch pool (90-97) that is not in our pool is still worth saying
     # out loud -- it means a cold run is in progress.
     busy = busy_worker_ids()

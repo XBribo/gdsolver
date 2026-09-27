@@ -11,14 +11,16 @@ had and carries on from there.
 
 ## Using it
 
-A small panel appears on the screens a level is started from — the main-level
-wheel and any individual level's own page. It switches between three modes:
+Press a level's play button — on the main-level wheel or on any individual
+level's own page — and a menu asks how to play it:
 
 * **Normal** — the game as it is. Nothing is touched.
 * **Replay** — replay a solution already stored for this level.
 * **Solve** — solve the level here and now.
 
-Level selection is the game's own, so any level can be picked.
+Under Replay and Solve a **Coins** switch makes the goal every coin as well as
+the end. Level selection is the game's own, so any level can be picked. (The
+menu can be turned off in the mod's settings; the play button then just plays.)
 
 A solve runs **fast, dark and silent**. Candidate attempts mostly die, and each
 one at normal speed would cost the length of the song, so the frames go to a
@@ -38,7 +40,9 @@ not for changing one.
 ## What it can solve
 
 **All 22 official levels**, from cold — no stored solutions, no hints, nothing
-but the level. That is also the supported set.
+but the level — with every coin or without, and the 17 levels of Meltdown, World
+and SubZero, the six of them that have coins with every coin as well. That is
+also the supported set.
 
 Custom levels are **not supported yet**. Nothing in the design is specific to
 the official levels and many custom ones already solve as they are, but the

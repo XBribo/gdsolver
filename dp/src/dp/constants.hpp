@@ -107,7 +107,7 @@ inline bool g_oldLatency = false;   // --old-latency
 // itself. (--no-ringmode, held-fires-in-every-mode, is gone since the flag clean-up.)
 // --oriringnow: a ROTATED ring (Obj::oriented) is decided by the row after the
 // press alone, not by whichever of the press row and that row is nearer (the
-// ring loop's `usePre`). On since AUD-20260921-21, and always on since the flag
+// ring loop's `usePre`). On since 2026-09-21, and always on since the flag
 // clean-up. The measurement is at the ring loop.
 // --swingpushtol: the swing's push-out onto a face needs the face within
 // kLandTol, as GD's face pick does; beyond it the contact is a side hit.
@@ -143,10 +143,9 @@ inline std::vector<std::pair<const char*, long long>> g_dieReconWhy;
 // PLAN dies. Contiguity (last - first + 1 == dead) separates "one corpse
 // re-dying every tick" from "several deaths", which share a total.
 inline long long g_resimDead = 0;
-// --bonkarm (default off): the plain head bonk's discriminant is the id-1859 arm
-// (State::armT) instead of the `robot || mini cube` proxy. See the bonk gate in
-// step.hpp. Declared here, beside kArmTicks, because the search key reads it too.
-inline bool g_bonkArm = false;
+// The plain head bonk's discriminant is the id-1859 arm (State::armT), not the `robot ||
+// mini cube` proxy: always so since 2026-09-26 (it was --bonkarm). See the bonk gate in
+// step.hpp; the search key reads armT for it too.
 // --witnessframe: the witness walk binds the geometry of the frame the
 // call STARTS in, as --replay does, instead of frame 0. Not print-only: the walk also
 // fills modeAt, which sets the emitted plan's edge latencies. See cli.hpp at rLf.
@@ -242,7 +241,7 @@ inline long long g_gfireSum = 0;      // sum of (max-min) over those
 inline int g_gfireMax = 0;            // widest spread seen, in ticks
 inline int g_resimUid = -1;
 inline float g_resimObjX = 0.f, g_resimObjY = 0.f;
-inline TouchMask g_resimTrig = 0;  // the walk's own trigger mask at that tick
+inline TouchMask g_resimTrig{};  // the walk's own trigger mask at that tick
 // ...and the FRAME the walk was in. g_resimObjX/Y are read in whatever frame
 // the resim currently occupies (the loop re-binds rLf = &frameLevel(L,
 // c.frame)), so two walks that report different positions may be reporting the
@@ -333,7 +332,7 @@ inline bool g_noSlopeSeat = false; // --no-slopeseat
 
 // A NORMAL-SIZE UFO that flaps while seated on a floor ramp leaves at this
 // value instead of its plain 6.871. Measured on the calibration rig
-// `calib_ufojump` (14 cells, Wine worker 99): the two control cells, pressing
+// `calib_ufojump` (14 cells, worker 99): the two control cells, pressing
 // on the flat run-up, return 6.8710 and 6.6480 exactly, and every one of the
 // six normal sweep cells returns 8.0000 -- at |m| 0.5, 1 and 2, and at both 1
 // and 3 ramps. So it is an ASSIGNMENT, not a bonus added to the jump:
@@ -512,7 +511,7 @@ inline bool g_noSatRotRaw = false;      // --no-satrotraw
 // turned by the player's own rotation.
 //
 // GD's gate, read out of `GJBaseGameLayer::collisionCheckObjects` (2.2081 win
-// 0x214960; lab note measure-pad-activation-shape-2026-09-06), reaches
+// 0x214960; measured 2026-09-06), reaches
 // `activatedByPlayer` (vt +0x558, via bumpPlayer 0x2179d0, its only call site)
 // for a type-8 pad iff BOTH of
 //    inclusive AABB overlap of player->getObjectRect() and obj->getObjectRect()
@@ -994,7 +993,7 @@ inline bool g_lawSeatOnSlope = false;
 // --pinminnoswing: --ceilpinmin's two arms (the entry at any depth, the min
 // clamp) leave the swing out. Its witnesses are a ship (lv19) and a UFO (lv20);
 // on lv22's swing corridor the search frontier dies with it and not without
-// (the anchor-2070 call of the bfa39aa Wine cold). Off by default.
+// (the anchor-2070 call of the bfa39aa cold run). Off by default.
 inline bool g_pinMinNoSwing = false;
 // --mpushsign: a flight push-out onto a rising face keeps max(vy, face) only when
 // the updated vy already rises, the player was not on a ramp and the face is not
@@ -1045,7 +1044,7 @@ inline bool g_pinMinNoSwing = false;
 // clamped under the BAND's ceiling by position, keeping a downward vy, where
 // the clamp used to need vy > 0. Measured together (lv20 t=9,233..9,235) and
 // meant to be used together: either alone clamps a tick early or not at all.
-// ON BY DEFAULT since 2026-09-20 (audit AUD-20260920-08), AS ONE UNIT. GD's y
+// ON BY DEFAULT since 2026-09-20, AS ONE UNIT. GD's y
 // at t=9,235 is exactly `pmax - pHalf` = 510 - 9 -- it pins an upright ball
 // under the band's ceiling BY POSITION while vy is still downward, and the tick
 // right after a teleport skips that clamp. Accepted as a pair and not as two
@@ -1054,7 +1053,7 @@ inline bool g_pinMinNoSwing = false;
 // --stickrelease: the downhill release is undone when a solid moving away from
 // the player is within 5*dt of its foot -- GD's postCollision stick re-land
 // runs after the release stamp (step.hpp, the release branch).
-// ON BY DEFAULT since 2026-09-20 (audit AUD-20260920-08), PAIRED WITH
+// ON BY DEFAULT since 2026-09-20, PAIRED WITH
 // --recinterp. Measured on the game at lv22 t=6,680: GD seats the ball on the
 // moving solid uid6067 exactly 15.000 above its top and an injected y=365 falls
 // back to the same face, and the pair reproduces that to 0.003 px. The pair is
@@ -1062,7 +1061,7 @@ inline bool g_pinMinNoSwing = false;
 // without --recinterp `dcy` is exactly 0 and this branch's gate never opens --
 // the flag alone fixes the sectioned instruments and does nothing at all in a
 // run from t=0. Both always on since the flag clean-up.
-// SCOPE (audit AUD-20260920-09): the acceptance rests on the local t=6,680
+// SCOPE: the acceptance rests on the local t=6,680
 // measurement and the corpus/census/deathref/cold gates. It does NOT rest on
 // "lv22's first whole-run divergence moved to 11,342" -- that instrument does
 // not load 120 of the level's 152 touch triggers past x=2,283.

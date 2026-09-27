@@ -1,8 +1,7 @@
 // Measured Ship constants.
 //
-// Every number here was recovered from GD state dumps by
-// src/tools/calibrate.cpp; none of it is guessed. See docs/model-spec.md for
-// the derivation and docs/findings.md for the measurement log.
+// Every number here was recovered from GD state dumps by a calibration
+// tool; none of it is guessed.
 //
 // Update rule (player frame, "up" positive; the world frame is obtained by
 // multiplying by -1 when gravity is flipped):
@@ -17,7 +16,7 @@
 // The sign flip on the switch threshold is NOT a player-frame mirror: under
 // flipped gravity GD compares against the same *world*-frame velocity, so the
 // branch boundary lands on the opposite side in the player frame. This is
-// measured, not assumed -- see docs/findings.md "gravity-flipped asymmetry".
+// measured, not assumed.
 #pragma once
 
 #include "models/speed.hpp"
@@ -55,7 +54,7 @@ struct ShipParams {
     double yScale = 0.225;
 
     // Horizontal advance per tick. This is the ONLY quantity that depends on
-    // m_playerSpeed -- see dxPerTickForSpeed() and docs/findings.md finding 19.
+    // m_playerSpeed -- see dxPerTickForSpeed().
     double dxPerTick = 1.29825;
 
     static ShipParams normal() { return ShipParams{}; }
@@ -192,7 +191,7 @@ struct ShipParams {
 
 // A plan command at tick k first affects the velocity transition observed at
 // dump tick k+2. Measured: 0 mismatches in 7,485 labelled ship ticks at this
-// offset, 36+ at any other. See docs/findings.md "input latency".
+// offset, 36+ at any other.
 inline constexpr int kInputLatencyTicks = 2;
 
 }  // namespace gdapprox

@@ -26,8 +26,8 @@ enum class Verdict {
 
 const char* toString(Verdict v);
 
-// How much clearance is "clearly" one way or the other. Both are in px.
-// See docs/benchmark.md for the measurement that sets the defaults.
+// How much clearance is "clearly" one way or the other. Both are in px,
+// and the defaults were set by measurement.
 struct MarginPolicy {
     // Clearance at or above this counts as clearly safe.
     double safeAbove = 8.0;

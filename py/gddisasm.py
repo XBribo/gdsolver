@@ -13,7 +13,7 @@ that order just repeats generalisations from a single data point.
 Traps:
 - THE ALIGNMENT POINT MUST BE THE HEAD OF A FUNCTION. Starting mid-function
   reads displacement bytes as instructions and produces plausible-looking fake
-  results (docs/findings.md). `--sym` always points at the head, so start from
+  results. `--sym` always points at the head, so start from
   the head and walk down to the address you want.
 - THE INSTALLED GD IS 2.2081 ([[gd-binary-is-2-2081]]). Looking things up in
   the 2.208 bindings reads a different function. The default is pinned here.
@@ -25,7 +25,11 @@ from __future__ import annotations
 import argparse
 import re
 import struct
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gdtas.paths import REPO, worker_dir  # noqa: E402
 
 try:
     import capstone
@@ -38,14 +42,14 @@ except ImportError:                                            # pragma: no cove
 # number does not matter.
 def _worker_exe() -> Path:
     for w in (99, 98, 97, 96, 95, 94, 93, 92, 91, 90):
-        p = Path(r"C:\GD-workers\worker-%d\GeometryDash-worker-%d.exe" % (w, w))
+        p = worker_dir(w) / f"GeometryDash-worker-{w}.exe"
         if p.exists():
             return p
-    return Path(r"C:\GD-workers\worker-99\GeometryDash-worker-99.exe")
+    return worker_dir(99) / "GeometryDash-worker-99.exe"
 
 
 EXE = _worker_exe()
-BRO = Path(r"C:\GD\build\_deps\bindings-src\bindings\2.2081\GeometryDash.bro")
+BRO = REPO / "build" / "_deps" / "bindings-src" / "bindings" / "2.2081" / "GeometryDash.bro"
 
 
 class PE:

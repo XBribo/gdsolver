@@ -43,7 +43,7 @@ cost.
 AND ITS OWN TRACES ARE GUARDED TOO (2026-09-07), because the guard above closed
 one channel and left the other open. Every section writes a trace named
 `fc_lv{lv}_{t0}` -- LEVEL AND TICK, NO RUN IDENTITY -- and `--tmp` defaulted to
-a shared `C:\\GDtmp\\fixcensus`, so two runs on one machine wrote the same
+a shared machine-wide temp directory, so two runs on one machine wrote the same
 thousand paths. That is invisible to the input guard: a trace is this run's
 output, not one of its declared inputs, so every fingerprint verifies and the
 census is still a mixture. The default is now a directory only this run can
@@ -379,7 +379,7 @@ def main(argv=None) -> int:
                          "consumption loop over the recording (rotseed.seed_sim)")
     ap.add_argument("--json", default="", dest="json_out",
                     help="write the divergences themselves (with their ticks) "
-                         "to this file -- brief-017's section list needs WHERE "
+                         "to this file -- the section list needs WHERE "
                          "they are, which the family baseline does not carry")
     a = ap.parse_args(argv)
     qr.NO_SPENTPAD = bool(a.no_spentpad)
@@ -601,7 +601,7 @@ def census_report(found: list[dict], n_segs: int, elapsed: float, *,
     if waivers:
         found, waived = census_waivers.split(found)
     # --json: the divergences themselves, not the family aggregate. The blessed
-    # baseline is {family: {level: count}} and carries no ticks, so brief-017's
+    # baseline is {family: {level: count}} and carries no ticks, so the
     # section list -- which needs WHERE each divergence is -- cannot be built
     # from it. This writes what `found` already holds: lv, t, x, cause, in, edy,
     # edvy, one record per diverging section.

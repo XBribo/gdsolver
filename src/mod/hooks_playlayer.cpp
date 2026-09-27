@@ -44,6 +44,8 @@ class $modify(PlayLayer) {
         if (g_started && !g_sessionOver && g_cfg.fastdt > 0
             && g_cfg.skipRender && !g_realtimeOverride) return;
         if (g_endzoneBurn) return;   // burning through the end-zone effects: stop visibility too
+        // A section solve's search: off, as in every worker's search (secRenderHold).
+        if (g_secRenderWas >= 0) return;
         // Old method (visrefresh=1 only): after render skip ends, clobber the visible
         // section bounds to force a recompute. Clobbering makes the routine that adds all
         // sections up to the current position in one frame crash, so it is OFF by default
@@ -62,22 +64,33 @@ class $modify(PlayLayer) {
     void safeUpdateVisibility(float dt) {
         __try {
             PlayLayer::updateVisibility(dt);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        } __except (visAvNote(GetExceptionInformation())) {
             logVisibilityCrashSwallowed();
         }
     }
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        // Depending on the panel mode, auto-configure a session whichever level is entered.
-        // Level selection can use the game's own UI as is (custom levels included).
+        // A session is configured here for the level the play menu's Start was pressed for, in
+        // the mode it chose. Level selection is the game's own UI as is (custom levels included).
         // A session in progress (g_started && !g_sessionOver) (including autorun.cfg
         // launches) is not interfered with. Leftovers of a finished session count as absent
         // (uiConfigureSession resets everything)
-        bool want = (!g_started || g_sessionOver) && g_uiMode > 0 && level;
+        const bool armed = level && g_uiArmedLevel == level;
+        if (g_uiArmedLevel && !armed)
+            log::info("play menu: armed for another level, entering {} unarmed",
+                      level ? level->m_levelID.value() : -1);
+        g_uiArmedLevel = nullptr;   // one entry per Start, whatever is decided below
+        bool want = (!g_started || g_sessionOver) && g_uiMode > 0 && armed;
         if (want) uiConfigureSession(level->m_levelID.value());
         // Sample the level's own record before it has run a tick, so the session-end line can
-        // state whether anything was written into it (see progressDiff).
-        g_progressLevel = level;
-        g_progressAtStart = sampleProgress(level);
+        // state whether anything was written into it (see progressDiff). A level a slice swap
+        // brings in (level_slice.hpp) is not sampled: the record the line speaks for stays the
+        // one of the level the session was started on.
+        if (levelslice::g_swapInit) {
+            levelslice::g_swapInit = false;
+        } else {
+            g_progressLevel = level;
+            g_progressAtStart = sampleProgress(level);
+        }
         // cfg `rngfresh` (see g_rngFresh): the first level keeps the seeds it found and
         // saves them; every later level of the same game starts from those values again.
         if (g_rngFresh) {
@@ -104,6 +117,23 @@ class $modify(PlayLayer) {
             char b[128];
             snprintf(b, sizeof(b), "rngseed: ee0=%lld ef8=%lld", g_rngSeedEE0, g_rngSeedEF8);
             writeResult(b);
+        }
+        // `swaplevel`: how long the whole swap took, measured from the command to a layer
+        // that has its objects. The build of the level string is reported separately, so
+        // the two together say where the cost is.
+        if (g_swapTiming) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok = PlayLayer::init(level, useReplay, dontCreateObjects);
+            const auto now = std::chrono::steady_clock::now();
+            char b[192];
+            snprintf(b, sizeof(b), "swaplevel: layer built in %lld ms, %lld ms since the command "
+                     "(objects=%d)",
+                     (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count(),
+                     (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - g_swapT0).count(),
+                     level ? (int)level->m_objectCount : -1);
+            writeResult(b);
+            g_swapTiming = false;
+            return ok;
         }
         return PlayLayer::init(level, useReplay, dontCreateObjects);
     }
@@ -209,6 +239,8 @@ class $modify(PlayLayer) {
             g_tick = 0;
             g_gameFrame = 0;   // rotation does not carry across attempts
             anchors::onAttemptStart();   // the re-anchor record is per attempt
+            padseed::reset();            // ...and so are the pads it seeds (cfg dpspentpad)
+            ringseed::reset();           // ...and the rings (dp --spentorb)
             itermap::onAttemptStart();   // ...and so is the seek bar's tick -> x record
             solver::g_coinPickupTick.assign(solver::g_coins.size(), -1);
             // GD's verdict is per attempt for the same reason ours is. GD's own
@@ -220,6 +252,10 @@ class $modify(PlayLayer) {
             solver::g_coinGdTick.assign(solver::g_coins.size(), -1);
             solver::g_coinGdUnmatched = 0;
             solver::g_coinMissFired = false;   // the miss request is one per attempt
+            solver::g_coinMissIdx = -1;
+            solver::g_endTriggerFiredTick = -1;
+            for (auto& lg : solver::g_coinPosLog) lg.clear();
+            route::onAttemptStart();   // cfg routeprereq: the switches are per attempt too
             solver::g_itemCounts.clear();      // ...and so are GD's item counters
             solver::g_coinLiveSaid.assign(solver::g_coins.size(), 0);
             g_attemptStart = std::chrono::steady_clock::now();
@@ -240,6 +276,18 @@ class $modify(PlayLayer) {
                 && !solver::g_poisBuilt) {
                 solver::buildPois(this);
                 solver::g_poisBuilt = true;
+                // cfg routeprereq: what each coin needs entered first (solver/route.hpp), read off
+                // the same objects before the first solve can ask.
+                if (g_cfg.routePrereq && g_cfg.coinRoute)
+                    route::build(this, solver::g_coinObjs, [](const route::Prereq& p) {
+                        char b[224];
+                        snprintf(b, sizeof(b), "route: coin %d needs uid %d (id %d) entered at "
+                                 "(%.0f,%.0f) %.0fx%.0f -- it switches on %s uid %d", p.coin,
+                                 p.boxUid, p.boxId, (double)p.bx, (double)p.by,
+                                 (double)(2 * p.bhw), (double)(2 * p.bhh),
+                                 p.gate ? "the gate object" : "the coin itself", p.watchUid);
+                        writeResult(b);
+                    });
                 if (g_cfg.dpSelfTest) dpSelfTest(this);
                 // Stage B: solve this level in-process, then replay what comes back
                 if (g_cfg.dpSolve) dpsolve::start(this);
@@ -261,6 +309,9 @@ class $modify(PlayLayer) {
             writeResult(rb);
         }
         PlayLayer::resetLevel();
+        // The objects' on/off as the reset left them, before the first update (see
+        // grouptrace::snapshotInit for why this phase and not the recording's first row).
+        if (!ckptRestore && grouptrace::g_on) grouptrace::snapshotInit();
         // resetLevel bumps the LEVEL's attempt counter inline (no call to hook), so put the
         // record back here -- see restoreProgress.
         restoreProgress();
@@ -334,10 +385,12 @@ class $modify(PlayLayer) {
     // updated"
     void rollGroupTrace() {
         if (!grouptrace::g_on) return;
-        auto r = grouptrace::roll();
+        // g_tick, not the recording's last row: see roll's `endTick`
+        auto r = grouptrace::roll(g_tick);
         writeResult("gt_last: attempt=" + std::to_string(g_attempt)
             + " rows=" + std::to_string(r.rows)
-            + " depth=" + std::to_string(r.depth));
+            + " depth=" + std::to_string(r.depth)
+            + " end=" + std::to_string(g_tick));
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -362,8 +415,21 @@ class $modify(PlayLayer) {
         // whole diagnosis problem is "which object did GD hit that the model
         // does not know about". (hitboxtrace's per-tick hbox/dmg flood stays
         // opt-in; this is not that.)
+        //
+        // EXCEPT GD's OWN ANTI-CHEAT SPIKE. GD calls destroyPlayer with
+        // m_anticheatSpike to check that the call still kills, and repeats it
+        // every tick while that check has not passed -- which is every tick of a
+        // run with nodeath on, because the return below never lets the call reach
+        // GD. The bootstrap record of a custom level wrote 30,065 of these
+        // lines (lv22's cold, 12,520), each one an open/append/close of
+        // result.txt: 11% of the record's main thread, sampled (2026-09-25).
+        // The spike names no culprit, so it is counted (g_anticheatCalls, on the
+        // session-end `anticheat:` line) and not written. Nothing else changes:
+        // the call still goes wherever it went before.
+        const bool anticheat = object && object == m_anticheatSpike;
+        if (anticheat) ++solver::g_anticheatCalls;
         if ((g_cfg.hitboxTrace || g_cfg.dpSolve) && g_started && !g_sessionOver
-            && player) {
+            && player && !anticheat) {
             char kb[240];
             snprintf(kb, sizeof(kb),
                 "killer: t=%lld who=%s py=%.3f pvy=%.3f px=%.3f obj=%s uid=%d "
@@ -574,6 +640,12 @@ class $modify(PlayLayer) {
                     + " wallMs=" + std::to_string(ms)
                     + " speedX=" + std::to_string(speed));
                 if (g_serveMode) g_serveWait = true;  // stop at the start of the next attempt
+                // A rung's prefix that died before the head it was replaying to (session.hpp
+                // g_secRungPrefixFails). Given up after a second such attempt, and then this death
+                // is the loop's again (onDeath below).
+                if (g_secRung && secsolve::g_on && !g_ckpt && g_cfg.checkpointAt >= 0
+                    && g_tick < g_cfg.checkpointAt)
+                    dpsolve::secRungPrefixFailed(g_tick, pos.x, "died");
                 // Stage C: the in-process loop treats this death as its next question -- where
                 // is the model wrong, and what does GD say the state really was just before.
                 // It freezes the level and re-solves the tail; the repaired plan is installed
@@ -759,7 +831,7 @@ class $modify(PlayLayer) {
             // documented itself as the tolerance of a false-clear guard and was read nowhere, so
             // onCleared() accepted whatever GD raised.
             //
-            // Measured on level 140155559 (2026-08-24): levelComplete at x=2,458 of 19,570 --
+            // Measured on a custom level (2026-08-24): levelComplete at x=2,458 of 19,570 --
             // GD's own getCurrentPercent() said 4.85% in the same breath -- which was filed as the
             // solution (10 inputs, 140 bytes, for a 19,570px level), flipped the badge to REPLAY
             // and "showed" it, dying seconds in. That saved file is what Replay mode loads next
@@ -778,9 +850,22 @@ class $modify(PlayLayer) {
             // percentage is the level-independent yardstick this guard already printed but
             // never read: the measured false clear said 4.85%% in the same breath, the real
             // one says 99.18%%. A completion past 95%% is a completion.
+            // cfg dpendtrigclear (on): ...unless an End trigger (id 3600) fired in this attempt --
+            // it finishes a level wherever it fires. SubZero 4002 spawns one from a touch box at
+            // x=30,857 on the way back (83%), which is where the level ends (the user, 2026-09-24:
+            // it climbs while turning back and forth); refused, every such clear was booked as a
+            // death at the "wall" t=23,616. The fire itself is the condition, not the object's
+            // presence in the level: the false clear this gate was written for (2026-08-24) was
+            // never traced to its cause, so a level merely holding an End trigger proves nothing.
+            const bool endTrigLevel = g_cfg.dpEndTrigClear && solver::g_endTriggerFiredTick >= 0;
+            // ...and not on a slice (level_slice.hpp), whose percentage is not the level's: level
+            // 22's copy read 90.73% at the x and tick where the level itself read 96.44%. A clear
+            // of the copy is only a candidate -- its plan is flown on the level itself before
+            // anything is filed, and this gate judges it there.
             if (g_cfg.dpSolve && !g_dpShowSolution && cx >= 0.f && goal > 1.f
+                && levelslice::g_phase != levelslice::Sliced
                 && (goal - cx) > g_clearMargin
-                && this->getCurrentPercent() < 95.0f) {
+                && this->getCurrentPercent() < 95.0f && !endTrigLevel) {
                 char fb[256];
                 snprintf(fb, sizeof(fb),
                     "dpsolve: refusing a clear %.0fpx short of the goal (x=%.0f goal=%.0f "
@@ -805,7 +890,11 @@ class $modify(PlayLayer) {
                     writeResult("dpsolve: refusing a clear with " + std::to_string(got) + "/"
                                 + std::to_string(solver::g_coins.size())
                                 + " coins - not an all-coins solution");
-                    dpsolve::onDeath(g_tick, cx);
+                    // cfg coinmisspost: filed at the missed coin instead of at the finish.
+                    long long dT = g_tick;
+                    float dX = cx;
+                    dpsolve::fileCoinMissPost(dT, dX);
+                    dpsolve::onDeath(dT, dX);
                     return;
                 }
             }
@@ -815,6 +904,13 @@ class $modify(PlayLayer) {
             bool byFlight = false;
             if (g_cfg.dpSolve && g_cfg.dpCheck && !g_dpShowSolution && dpsolve::g_running.load())
                 byFlight = dpsolve::ckClearedDuringJob();
+            // A clear of a slice (level_slice.hpp) is not a solution yet: its plan goes on to be
+            // flown on the level itself. Past the two gates above, so what goes over is a real
+            // clear of the copy.
+            if (g_cfg.dpSolve && !g_dpShowSolution
+                && levelslice::onSliceCleared(g_cfg.inputs, g_tick))
+                return;
+            if (g_cfg.dpSolve && !g_dpShowSolution) levelslice::onLevelCleared(g_tick);
             // A plan that has just been SEEN to clear the level is a solution; file it under
             // the name Replay mode looks for, so the next visit does not have to solve again.
             // Only here: a plan that has not cleared is not a solution, whatever else it is.

@@ -28,7 +28,7 @@ WHY IT EXISTS -- the failure it is built to catch. Two 2026-09-06 commits:
 59ba018's work was written against a base that did not yet have 351f9de. There
 the angle it was being fed was 6.9 degrees wrong, and at that error the turned
 square cleared the board anyway -- so the shape rule changed nothing, and its
-acceptance table said so honestly (measure-padplayerrot-2026-09-06 section 4:
+acceptance table said so honestly (measured 2026-09-06:
 all 22 traces byte-identical, in every arm). Rebased onto a base that HAS
 351f9de, the same rule moves lv20's firing from 7,296 to 7,298. Neither commit
 moved this pad on its own; the pair was order-dependent, and no instrument in
@@ -270,7 +270,7 @@ SOURCE_SPANS: dict[str, tuple[str, str, str]] = {
     "pad gate angle + call": (
         "dp/src/dp/step.hpp",
         r"^\s*double pRotPad = \(double\)s\.rot;",
-        r"orientedHit\(\*pd, x, \(double\)c\.y, pHalf, pRotPad\)",
+        r"orientedHit\(\*pd, x, \(double\)c\.y, padHalf, pRotPad\)",
     ),
     "oriented box from the bound": (
         "dp/src/dp/level_loader.hpp",
@@ -295,13 +295,19 @@ SOURCE_SPANS: dict[str, tuple[str, str, str]] = {
 # { }` line (the --no-padobb raw-angle arm), and the oriented box its
 # `g_oriented &&` conjunct (always on; from_objrects_row already assumed it).
 # Each is the whole diff inside its span, so the transcription stands.
+# `pad gate angle + call` re-pinned for 109e0fe (--padsection): the call passes
+# `padHalf`, the size GD had when its collision pass reached the pad, instead of
+# `pHalf` -- the whole diff inside the span. The two differ only on a tick a size
+# portal fires before the pad; none does in this leaf's window (lv20 t=7,280..7,320,
+# player x 10,810..10,879, vsize 1 throughout; the nearest size portal is at
+# x=10,275), so the transcription stands.
 PINNED_FINGERPRINTS: dict[str, str] = {
     "obbSat/orientedHit": "dfdb012e89906db3",
-    "pad gate angle + call": "66cb72959b8534fa",
+    "pad gate angle + call": "aee5066cd7a3203e",
     "oriented box from the bound": "8a362ae519cde9e1",
     "padPlayerRotMode": "067068fc6e480d00",
 }
-PINNED_AT = "6a3c721, pad and oriented-box spans re-pinned at the flag clean-up"
+PINNED_AT = "6a3c721, pad and oriented-box spans re-pinned at the flag clean-up, the pad span again for 109e0fe"
 
 
 def _strip_cpp_comments(src: str) -> list[str]:

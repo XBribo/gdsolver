@@ -165,14 +165,27 @@ inline const Fixup* findFixup(const std::vector<Fixup>& v, const State& s,
 // y~1,738) and (8,286, y~1,072) are dyn kills, and so were GD's deaths at
 // t=2,416 and 2,842 under the ceiling of group 265, which the gate held off
 // until the ceiling's own timing was right (the autonomous lag, dynamics.hpp).
-inline bool nearDynObject(const State& s, const StepCtx& K) {
+inline const Obj* nearDynObjectPtr(const State& s, const StepCtx& K) {
     for (const Obj* o : *K.near)
         if (o->dynObj
             && std::fabs((double)s.xAbs - o->cx) < o->hw + 40.0
             && std::fabs((double)s.y - o->cy) < o->hh + 40.0)
-            return true;
-    return false;
+            return o;
+    return nullptr;
 }
+inline bool nearDynObject(const State& s, const StepCtx& K) {
+    return nearDynObjectPtr(s, K) != nullptr;
+}
+// The uid of the moving object that stopped a MATCHING record on this step, -1
+// when nothing was stopped (no record matched, or none was near moving
+// geometry, or the record fired). Written by stepBoth on every step and read by
+// the replay's trace (column `fxblk`), so the loop's recorder can tell "a record
+// covers this and fires" from "a record covers this and the gate above keeps it
+// from firing" -- the two looked identical to it ("a record already covers this
+// state"), and SubZero 4002 re-flew one plan 25+ times on the second.
+// The recorder cannot ask the gate itself: it needs the
+// moving geometry's position at this tick, which only the solver has.
+inline thread_local int g_fxBlockedUid = -1;
 // One place, so a kill hit and a delta hit cannot be counted by different
 // rules. Records the x of the first few rotated firings too: applyFixup has no
 // tick to hand and giving it one would change a signature for a census.
@@ -295,6 +308,7 @@ inline double touchPreY(const State& s, const State& c, bool set, double y) {
 inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     bool d1 = false;
     g_halfNow = 0;
+    g_fxBlockedUid = -1;
     // Out-parameter, not a global: phase 1 steps the layer in parallel.
     bool p1FlippedGravity = false;
     if (g_touchCensus) g_tcBranch = 0;
@@ -306,7 +320,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     const double preBtnY = g_preBtnY;
     if (!s.dual) {
         dead = d1;
-        markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY));
+        markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0);
         // No fixup of either kind applies near moving geometry (nearDynObject
         // above). This exact constellation is the one that breaks the lv22
         // corridor oscillation: both breakout runs (2026-08-26 01:15 and
@@ -314,8 +328,13 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
         // newest-wins variants all sat pinned for 70+ minutes. The dynamics
         // are not fully understood -- what is measured is which build climbs.
         const long long fxHits0 = g_fixupHits;
-        if (!g_fixups.empty() && !nearDynObject(s, K))
-            applyFixup(s, input, c, dead);
+        if (!g_fixups.empty()) {
+            const Obj* dyn = nearDynObjectPtr(s, K);
+            if (!dyn)
+                applyFixup(s, input, c, dead);
+            else if (findFixup(g_fixupKills, s, input) || findFixup(g_fixupDeltas, s, input))
+                g_fxBlockedUid = dyn->uid;   // matched, and the gate kept it back
+        }
         if (g_fxWatchT >= 0 && K.t == g_fxWatchT) fxDescribe(s, input, K, c, fxHits0);
         return c;
     }
@@ -390,6 +409,12 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     c.boost2 = cb.boost2;
     c.slopeUid02 = cb.slopeUid02;  c.slopeUidNow2 = cb.slopeUidNow2;
     c.snapObj2 = cb.snapObj2;   c.usedOrb2 = cb.usedOrb2;
+    c.usedOrbOld2 = cb.usedOrbOld2;
+    for (int i = 0; i < 3; ++i) c.usedOrbHist2[i] = cb.usedOrbHist2[i];
+    c.holdDead2 = cb.holdDead2;
+    for (int i = 0; i < 3; ++i) c.portSeen2[i] = cb.portSeen2[i];
+    for (int i = 0; i < 4; ++i) c.touchRing2[i] = cb.touchRing2[i];
+    c.touchRingT2 = cb.touchRingT2;
     // [2026-09-05] ...and the SPENT-GRAVITY-PORTAL mask, which 67ab13f added to
     // State and to swapHalves and then left out of this list -- exactly what the
     // SIZE note above records happening on 2026-08-28. The second body's latch
@@ -459,7 +484,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
         }
     }
     dead = d1 || d2;
-    markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY));
+    markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0);
     // The dual half used to skip this entirely, so a divergence measured in a dual section was
     // unusable even if something had managed to write it down. Applied here, after both bodies
     // are merged, for the same reason the single case applies it after stepOne: the record is

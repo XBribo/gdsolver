@@ -99,6 +99,8 @@ inline int g_coinGdUnmatched = 0;
 // too -- and without a latch the request, and its result line, repeat every tick: 45,606
 // lines on the 2026-09-20 run, 25,250 of them from one attempt.
 inline bool g_coinMissFired = false;
+// ...and which coin that was (index into g_coins; -1 = a coin gate's cut, or none).
+inline int g_coinMissIdx = -1;
 // One `coinlive:` line per coin per attempt (hooks_gamelayer.cpp): where the
 // object actually is when the player draws level with it.
 inline std::vector<uint8_t> g_coinLiveSaid;
@@ -126,6 +128,35 @@ struct CoinGate {
     double mx = 0.0, my = 0.0;
 };
 inline std::vector<CoinGate> g_coinGates;
+// The coins dp's search does not call missed when passed (Outcome::coinNoPrune): something past
+// them turns the player round, or the frame comes back behind them. Read by the coinroute attempt
+// cut under cfg coinmissrev. Per level, refreshed by every search.
+inline std::vector<int> g_coinNoMiss;
+// Per coin (g_coins order): the largest x of a Move trigger (901, not spawn-fired) whose target
+// group holds the coin, -1e9 when none. While the player is short of it the coin can still be
+// carried somewhere else, so passing its load position is not final -- read by the coinroute
+// attempt cut under cfg coinmissmove (SubZero 4002's third coin is dropped 600 px by the Move at
+// x=31,899 and taken on the way back; the cut used to end the attempt at x=31,243 on the way out).
+inline std::vector<float> g_coinMoveX;
+// How many End triggers (id 3600) the level holds (buildPois). An End trigger finishes the level
+// wherever it fires: SubZero 4002 spawns one from a touch box at x=30,857 on the way back, 6,278 px
+// short of its end portal, and that is where the only route through its third coin ends.
+inline int g_endTriggers = 0;
+// ...and the tick one fired this attempt (EndTriggerGameObject::triggerObject, hooks_player.cpp),
+// -1 while none has. Reset with the attempt.
+inline long long g_endTriggerFiredTick = -1;
+// Where each coin actually was during this attempt: a row whenever its position or its on/off
+// changes (hooks_gamelayer, every tick in coin mode), reset with the attempt. The load position
+// in g_coins is where a coin STARTS -- SubZero 4002's third drops 600 px when the player passes
+// x=31,899 and is taken on the way back, 600 px from where it loaded. g_coinObjs holds the objects
+// (buildPois); a coin not found there keeps an empty log and is measured at its load position.
+struct CoinPos {
+    long long t;
+    float x, y;
+    uint8_t on;
+};
+inline std::vector<std::vector<CoinPos>> g_coinPosLog;
+inline std::vector<GameObject*> g_coinObjs;
 // Line budget for the two observation hooks, reset per SESSION rather than left
 // as a function-local static: --one-session runs every level in one process, and
 // a static that ran out on level 1 would leave later levels silently unobserved.
@@ -308,9 +339,29 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
     // - exstat: CameraTriggerGameObject::m_exitStatic (110).
     //   The 1914 rows are already in the dump as geometry; these two are the
     //   properties that say what they do, and the band's height depends on them.
-          "editvel,vmodx,vmody,ovrvel,force,free,touch,spawn,chan,axis,exstat\n";
+    // - rev: EffectGameObject::m_isReverse (117). A ring (ringJump) or a pad
+    //   (GJBaseGameLayer::bumpPlayer) with it set calls reversePlayer before its
+    //   own impulse, which turns the player round. No official main level has
+    //   one; the SubZero levels do.
+    // - nocol: the byte at [object+0x515]. collidedWithObjectInternal returns
+    //   false for an object that has it set, whatever the geometry says -- which
+    //   is why lv22's uid 4705 (id 1910) is not a wall. The model had to stand in
+    //   for that with the ID, because the byte was not dumped, and the stand-in
+    //   held only while the corpus had exactly one such object: SubZero 4002's
+    //   uid 11433 has the same id, is NOT flagged, and the game crushes the
+    //   player against it (t=16,760). The bindings carry no name for the byte, so
+    //   it is read at a literal offset, as the field probe in hooks_player.cpp
+    //   already does.
+          "editvel,vmodx,vmody,ovrvel,force,free,touch,spawn,chan,axis,exstat,rev,"
+          "nocol\n";
+    // PlayLayer's anti-cheat spike (id 8, created last, at 0,105) sits in m_objects but never
+    // collides: GD only hands it to destroyPlayer as a check (hooks_playlayer.cpp). Written out,
+    // the model read it as a hazard on the spawn point and a ship or ball start died on tick 2
+    // (two custom levels).
+    PlayLayer* const pl = typeinfo_cast<PlayLayer*>(l);
+    GameObject* const anticheat = pl ? pl->m_anticheatSpike : nullptr;
     for (auto* obj : CCArrayExt<GameObject*>(l->m_objects)) {
-        if (!obj) continue;
+        if (!obj || obj == anticheat) continue;
         auto r = obj->getObjectRect();
         double sy0 = 0.0, sy1 = 0.0;
         int shz = 0, sdir = 0, sup = 0;
@@ -431,8 +482,9 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
         // from the typed members like every other column here, not from a raw
         // property table: an EffectGameObject parses them at load and the
         // members are what the game itself then reads.
-        int touch = 0, spawn = 0, chan = 0, axis = 0, exstat = 0, freem = 0;
+        int touch = 0, spawn = 0, chan = 0, axis = 0, exstat = 0, freem = 0, rev = 0;
         if (auto* e = geode::cast::typeinfo_cast<EffectGameObject*>(obj)) {
+            rev = e->m_isReverse ? 1 : 0;
             touch = e->m_isTouchTriggered ? 1 : 0;
             spawn = e->m_isSpawnTriggered ? 1 : 0;
             chan = e->m_channelValue;
@@ -465,7 +517,8 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
            << "," << editvel << "," << vmodx << "," << vmody << "," << ovrvel
            << "," << forceOf(obj)
            << "," << freem << "," << touch << "," << spawn << "," << chan
-           << "," << axis << "," << exstat
+           << "," << axis << "," << exstat << "," << rev
+           << "," << (int)(unsigned char)reinterpret_cast<const char*>(obj)[0x515]
            << "\n";
     }
 }
@@ -561,9 +614,53 @@ inline void buildPois(GJBaseGameLayer* l) {
     g_coinPickupTick.assign(g_coins.size(), -1);
     g_coinGdTick.assign(g_coins.size(), -1);
     g_coinGdUnmatched = 0;
+    // g_coinMoveX: the coins' groups, then every Move (901) that is not spawn-fired and targets one.
+    g_coinMoveX.assign(g_coins.size(), -1e9f);
+    g_coinObjs.assign(g_coins.size(), nullptr);
+    g_coinPosLog.assign(g_coins.size(), {});
+    if (!g_coins.empty()) {
+        std::vector<std::vector<int>> coinGroups(g_coins.size());
+        for (auto* obj : CCArrayExt<GameObject*>(l->m_objects)) {
+            if (!obj || (obj->m_objectID != 142 && obj->m_objectID != 1329)) continue;
+            for (size_t i = 0; i < g_coins.size(); ++i)
+                if (g_coins[i].uid == obj->m_uniqueID) g_coinObjs[i] = obj;
+            if (obj->m_groupCount <= 0 || !obj->m_groups) continue;
+            for (size_t i = 0; i < g_coins.size(); ++i)
+                if (g_coins[i].uid == obj->m_uniqueID) {
+                    const int ng = std::min((int)obj->m_groupCount, 10);
+                    for (int k = 0; k < ng; ++k) coinGroups[i].push_back((int)(*obj->m_groups)[k]);
+                }
+        }
+        for (auto* obj : CCArrayExt<GameObject*>(l->m_objects)) {
+            if (!obj || obj->m_objectID != 901) continue;
+            auto* e = geode::cast::typeinfo_cast<EffectGameObject*>(obj);
+            if (!e || e->m_targetGroupID <= 0 || e->m_isSpawnTriggered) continue;
+            for (size_t i = 0; i < g_coins.size(); ++i)
+                for (const int g : coinGroups[i])
+                    if (g == e->m_targetGroupID)
+                        g_coinMoveX[i] = std::max(g_coinMoveX[i], obj->getPositionX());
+        }
+        for (size_t i = 0; i < g_coins.size(); ++i)
+            if (g_coinMoveX[i] > -1e8f) {
+                char mb[128];
+                snprintf(mb, sizeof(mb), "coinmove: coin %zu uid=%d is moved by a Move up to x=%.0f",
+                         i, g_coins[i].uid, (double)g_coinMoveX[i]);
+                writeResult(mb);
+            }
+    }
     g_levelMaxX = 0;
-    for (auto* obj : CCArrayExt<GameObject*>(l->m_objects))
-        if (obj) g_levelMaxX = std::max(g_levelMaxX, obj->getPositionX());
+    g_endTriggers = 0;
+    for (auto* obj : CCArrayExt<GameObject*>(l->m_objects)) {
+        if (!obj) continue;
+        g_levelMaxX = std::max(g_levelMaxX, obj->getPositionX());
+        if (obj->m_objectID == 3600) ++g_endTriggers;
+    }
+    if (g_endTriggers > 0) {
+        char eb[128];
+        snprintf(eb, sizeof(eb), "endtrigger: %d End trigger(s) (id 3600) in the level - GD can "
+                 "finish it short of the end portal", g_endTriggers);
+        writeResult(eb);
+    }
     log::info("solver: levelMaxX={}", g_levelMaxX);
     g_goalX = (l->m_endPortal) ? l->m_endPortal->getPositionX() : 0.f;
     log::info("solver: goalX={} (endPortal), levelMaxX={}", g_goalX, g_levelMaxX);
@@ -1060,6 +1157,10 @@ inline void buildPois(GJBaseGameLayer* l) {
 
 // Measures which player a death in a dual section came from (destroyPlayer counts)
 inline long long g_deathsP1 = 0, g_deathsP2 = 0, g_deathsOther = 0;
+// destroyPlayer calls whose object is GD's own anti-cheat spike (GJBaseGameLayer::
+// m_anticheatSpike). They kill nobody and are counted instead of logged -- see the destroyPlayer
+// hook. Per session: printed and zeroed at the session's end.
+inline long long g_anticheatCalls = 0;
 
 // Diagnostics (emitted by cmd `diag`). serve/replay have no onDeath path, so
 // lastDeath/groundGap/injAtDeath stay 0

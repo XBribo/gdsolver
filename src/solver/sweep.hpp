@@ -61,3 +61,25 @@ inline std::unordered_map<int, int> g_first2;   // ...and p2
 inline int g_calls = 0;   // a denominator for a zero -- see touchseed::g_calls
 inline void reset() { g_first.clear(); g_first2.clear(); g_calls = 0; }
 }
+// ...and PADS (object types 8/9/10/34, dp's L.pads), for dp's --spentpad (cfg dpspentpad).
+// GD's activatedByPlayer latch holds for the attempt and collisionCheckObjects drops a latched
+// object before any shape test, so a pad fired before an anchor is dead after it -- while the
+// model's State::usedPad starts empty there. Recorded here, where GD sets the latch, rather than
+// rebuilt from the recording (py/gdtas/padhistory.py): the blue pad's polarity gate keeps a pad
+// met with the wrong gravity live, and only the latch itself says which were fired. p1's only:
+// dp seeds the first body's usedPad.
+namespace padseed {
+inline std::unordered_map<int, int> g_first;    // pad uid -> first tick, p1
+inline int g_calls = 0;   // a denominator for a zero -- see touchseed::g_calls
+inline void reset() { g_first.clear(); g_calls = 0; }
+}
+// ...and RINGS, for dp's --spentorb (dp --spentorb). A ring fires once per attempt, and an
+// anchored model starts with no memory of which ones went. Recorded in the ringJump hook on the
+// fire itself: a successful ringJump sets one of the per-tick fire latches 0x98b / 0x98c / 0x98d
+// (0x398e08..0x398e26), and a call that returns early leaves them as they were. p1's only, in fire
+// order.
+namespace ringseed {
+inline std::vector<std::pair<int, int>> g_fired;   // (ring uid, tick), p1, oldest first
+inline int g_calls = 0;   // ringJump calls on p1 -- a denominator for a zero
+inline void reset() { g_fired.clear(); g_calls = 0; }
+}

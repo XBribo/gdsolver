@@ -2,7 +2,7 @@
 // Reference watch (--refwatch): follow ONE known-good trajectory through the
 // search and name the gate that drops it.
 //
-// Why it exists. brief-017's reach sweep found windows where the model REPLAYS
+// Why it exists. A reach sweep found windows where the model REPLAYS
 // the verified solution with zero divergence for thousands of ticks and its own
 // reachability still dies inside the window (lv22 windows at t=6,970 and 7,190:
 // replay survives to 11,596, frontier dies at 7,338 / 7,355). The physics is

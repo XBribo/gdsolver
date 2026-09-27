@@ -7,8 +7,8 @@ one assembles the first machine out of the frozen GD build (gdtas.gdbase, not th
 Steam install, which moves on with every update) + the Geode SDK binaries + a built
 MOD. After that, multiply with `provision --from-worker-id 96`.
 
-Written on 2026-08-21, when D: (a USB SSD) died, ``D:\\GD-workers`` became entirely
-unreadable, and not a single clone source was left.
+Written on 2026-08-21, when the disk holding the workers died, the workers root
+became entirely unreadable, and not a single clone source was left.
 """
 
 from __future__ import annotations

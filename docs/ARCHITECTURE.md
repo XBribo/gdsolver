@@ -109,8 +109,9 @@ plan and the model trace the next divergence is measured against.
   control, the fast loop, tracing), player (state dump) and play layer (attempt
   boundaries, checkpoints, death and completion).
 * `src/solver/*.hpp` — level-data export, moving-geometry recording
-  (grouptrace), the clearance table, the raw player snapshot and the section
-  solver (§3.1).
+  (grouptrace), the clearance table, the raw player snapshot, the section
+  solver (§3.1), the coin prerequisites census (`route.hpp`) and the level
+  slice (`slice.hpp`, with the session side in `src/mod/level_slice.hpp`).
 * `src/mod/itermap.hpp` — what the repair loop's rounds cost, and where. Each
   round's death, each fixup and each veto is recorded as the loop makes it,
   filed as `itermap_lv<N>.txt` when the solve ends either way, and drawn back
@@ -144,12 +145,17 @@ plan and the model trace the next divergence is measured against.
 Nothing here solves. The loop lives in the mod; `py/` starts it and measures it.
 
 * `cold_regress.py` — the cold regression: every level solved from nothing by
-  the game's own loop, on a pool of isolated GD workers.
+  the game's own loop, on a pool of isolated GD workers. Each run writes a
+  manifest beside its logs (the commit, the package, every cfg value the mod
+  held and the core's built-in defaults); `cold_manifest.py compare` refuses two
+  runs that differ in anything but what was named, and `check` confirms a run
+  against an expected set before it is blessed.
 * `verify.py` / `verify_solutions.py` — replay every solution in the game;
   `quick_regress.py` — a fidelity regression that needs no worker at all;
   `fixcensus.py` / `fixfam.py` / `fidelity_diff.py` — where and why the model
   and the game disagree; `mklevel.py` + `calib_units.py` — calibration levels
-  that measure one physics rule across all modes; `gdtas/` — worker
+  that measure one physics rule across all modes, and `test_*_rig.py` pinning
+  particular rules against the game's own rows; `gdtas/` — worker
   provisioning, control and the shared readers; `mcp/` — an MCP server exposing
   the same protocol for interactive probing.
 
@@ -170,16 +176,17 @@ flowchart TD
 The first pass runs from tick 0; every later one starts at an anchor and splices
 onto the prefix the game has already verified. What the diagram leaves out are the
 mechanisms for the cases where the model is *blind* rather than merely inaccurate:
-dead bands, touch triggers that must be entered, a ladder of anchor depths and
-phantom-death detection. All of those the loop drives itself. The section solver
-in §3.1 is not one of them — it is started by hand and ends the run.
+dead bands, touch triggers that must be entered, a ladder of anchor depths,
+phantom-death detection, and — where none of that gets the plan across a wall —
+the section solver of §3.1, which searches the game itself there. All of those
+the loop drives itself.
 
 Two things decide how much each repair costs. **The plan length** (cfg
-`dpstephorizon`, `dpadaptivehorizon`): a replay the game ends within one step
+`dpstephorizon`): a replay the game ends within one step
 (3,000 ticks) of its anchor says the model is wrong there, so the next solve plans
 one step and lets the game check it; a replay that outlives its step, or a wall the
-run stops at twice, gets a plan to the end of the level. **The rejoin** (cfg
-`dprejoinwatch`, `dprejoinuse`, dp's `--rejoinwatch` / `--rejoinuse`): the model's
+run stops at twice, gets a plan to the end of the level. **The rejoin** (always on;
+dp's `--rejoinwatch` / `--rejoinuse`): the model's
 trace of the plan that died is handed to the next search, and when a state that did
 not pass through the death comes back onto that trace (same y, velocity, mode,
 gravity and frame), the search stops there and the plan carries on with the old
@@ -193,73 +200,34 @@ fixups of a run live only in that run.
 
 ### 3.1 The section solver
 
-**Read this section knowing what it is not.** The section solver
-(`src/solver/secsolve.hpp`) is not a rung of the loop in §3. Nothing starts it
-automatically; it is asked for by hand, through cfg keys at session open or the
-runtime command `secsolve <startTick> <targetX>`. It does not splice its answer
-back into the plan, and it does not hand control back — the search drives the
-world arbitrarily and ends the session itself. **No official level has needed
-it**; the automatic mechanisms above have covered all 22.
-
-What it is, then, is the instrument for interrogating one wall: a way to ask the
-game directly whether a stuck section is passable at all, when the model says it
-is not and there is no telling whether the model is right.
-
 A fixup is local: it applies where the model meets that exact state again, and
-nowhere else. Generalising a divergence into a *rule* takes measurement and
-judgement, so on a section the model is simply wrong about, the loop can grind —
-and the question worth answering first is whether anything gets through there.
+nowhere else. On a stretch the model is simply wrong about, the loop can grind —
+every death teaches one fixup and the next plan dies a few ticks further on. When
+the work spent at a wall reaches what a section solve would cost, or the ladder
+runs out of anchors, the loop drops the model for that stretch: it replays its
+deepest verified plan to a practice-mode checkpoint before the wall and searches
+**the game itself** from there, breadth-first over the two inputs, the same shape
+as the DP. A leaf that reaches the goal is replayed plainly from the checkpoint,
+and only one the replay reproduces is spliced into the plan, which the game then
+flies from the start of the level like any other. That is affordable because a
+section makes the question narrow: the entry is fixed, the exit is binary and the
+horizon is a few hundred ticks, so there is no fitness function to choose.
 
-For one stuck section, the section solver drops the model and lets **the game be
-the transition function**. That is affordable only because the section makes the
-question a narrow one:
+[SECTION_SOLVE.md](SECTION_SOLVE.md) has when a rung starts and where its window
+goes, the handoff, the search, the splice and its pin, what it costs and the kind
+of death it cannot see.
 
-* the **entry** is fixed — the section starts at a practice-mode checkpoint, not
-  at a state the search has to reach;
-* the **exit** is binary — the target was crossed alive, or it was not;
-* the **horizon** is short — a few hundred ticks.
+### 3.2 Coins and heavy levels
 
-So there is no fitness function to choose, which is what makes searching against
-the real game tractable here and not in general.
+With coins on, the collected set is part of the search state, and the loop can
+also work out what a coin needs to have happened first — a key, a touch box, a
+switch — and route through it (cfg `routeprereq`, off by default):
+[COINS.md](COINS.md).
 
-**A node is a plan, not a snapshot.** One checkpoint is kept, for the section
-entry. A node is the input sequence from that entry, and every expansion rebuilds
-it: restore, replay the prefix, branch. A checkpoint per node would mean holding
-all object state for every live state in the layer, which does not fit; a restore
-costs about 2 ms and replaying a prefix is far cheaper than that, so rebuilding is
-the affordable half of the trade. A few hundred layers at a hundred states each is
-minutes — practical exactly as long as it stays section-limited.
-
-The search is per-layer breadth-first with a quantised dedupe and cap truncation,
-deliberately the same shape as the DP so that truncation behaves the way it does
-there. The dedupe grid is fine on purpose and must not be coarsened: a bucket
-keeps its first arrival and insertion order puts the lower branches first, so a
-coarse grid silently discards the top of the reachable band.
-
-The exit does not have to be x. In a rotated section travel is along -y and
-pressing moves x, so the goal can also be written in y (with a direction) or in
-survived depth; the enabled tests are OR-ed.
-
-Two ways in: cfg keys at session open, or the runtime command
-`secsolve <startTick> <targetX> [horizon] [cap]` during an in-process solve. The
-second retires the repair loop, replays its deepest *verified* plan to the section
-head, drops the checkpoint there and hands over — one-way, because the search
-drives the world arbitrarily and ends the session itself.
-
-**What it cannot see.** A branch is one restore plus one step, so a death the game
-only reaches by accumulating state across consecutive ticks — an out-of-bounds
-latch that wants two of them, a one-shot trigger the restore puts back — is reset
-before it can fire. The search then believes a lethal corridor is passable, and
-its own cross-check of the leaf refuses the answer. An `UNVERIFIED` leaf is that
-guard working rather than a bug to chase: where every death in the section is
-decided within one tick, the same machinery verifies clean.
-
-That is not hypothetical. The first time the handoff was pointed at a real wall on
-a custom level, it came back `UNVERIFIED`: the checkpoint restore was faithful to
-three decimals, but the two-tap sequence the search had found died well short of
-the target on independent replay, at every input phase, with `killer: obj=NULL` —
-an object-less kill, which is exactly the accumulating kind. The guard held; no
-false plan was spliced. The level was cleared later by fixing the model instead.
+A level with at least 10,000 objects its run cannot depend on is solved on a copy
+without them, and every plan that clears the copy is verified on the level itself
+before anything is filed; a wrong cut costs rounds, never a wrong answer:
+[LEVEL_SLICE.md](LEVEL_SLICE.md).
 
 ## 4. Running inside the game
 
@@ -270,14 +238,15 @@ A user needs only Geometry Dash, Geode and `gdsolver.solver.geode`:
   in the game produces a plan byte-identical to the CLI's.
 * **`src/mod/repair.hpp` holds the loop** — solve → replay → learn → re-anchor →
   splice → replay — in the game, with no external process. All 22 official levels
-  solve cold this way (`py/cold_regress.py`).
+  and the 17 spin-off levels solve cold this way (`py/cold_regress.py`).
 
 Acceptance for a change is behavioural identity where identity is claimed: the
 CLI must produce byte-identical plans and traces on a fixed suite
 (`py/quick_regress.py`), and the loop must reproduce the cold-run fingerprint —
 iteration, plan hash, death tick and x, fixup hash. The loop prints those itself
-(cfg `dpfingerprint`), and `py/cold_regress.py --bless` records the per-level
-iteration counts they belong to. The iteration count is the number to compare;
+(cfg `dpfingerprint`), and `py/cold_regress.py` compares those `[fp]` lines per
+level against the baseline, which is adopted from a reviewed one-session run
+(`--adopt`). The iteration count is reported with them but does not fail a run;
 the wall clock is not deterministic and is never the criterion.
 
 The two halves of that measure different things, and the section suite does not
@@ -300,29 +269,36 @@ measuring is also the boundary of what is supported.
   as they are. Nothing keeps them honest, though. An object, a trigger or a mode
   the model has never met is a disagreement the loop can only discover by dying
   in a replay, and it repairs one disagreement per iteration — so an unmodelled
-  level does not fail, it crawls. The corpus the boundary was measured on is
+  level does not fail, it crawls, or clears where the section solver finds a way
+  through the game itself. The corpus the boundary was measured on is
   almost entirely 1.x, so a level built from early-era parts has the better
   chance — but the predictor is the mechanics a level uses, not its date, and
   the two only correlate because mechanics arrived with versions. A supported
   subset has to be defined in objects and modes; a version is a first guess at
-  which of them a level contains.
+  which of them a level contains. What the surveys found, gimmick by gimmick:
+  [CUSTOM_LEVELS.md](CUSTOM_LEVELS.md).
 * **The objective is survival, or survival and every coin**: alive at the end of
-  the level, and with the panel's Coins switch (cfg `coinroute`, dp `--coins`)
+  the level, and with the play menu's Coins switch (cfg `coinroute`, dp `--coins`)
   also every coin in it. With coins on, the collected set is part of the search
   state, a coin is collected when the player's own rect overlaps it where its
   group has put it, and a state that leaves an uncollected coin behind is dead;
   the search is not steered towards a coin, the goal is simply not reached
   without it. The loop ends a replay that passes a coin GD did not credit and
-  repairs it from there. All 22 official levels clear with 3/3 that way; without
-  coins, a plan that collects one did so by accident — 24 of the 66, as it turns
-  out. Where the coins are is always exported, and `coinMode` turns on two witnesses
+  repairs it from there. All 22 official levels clear with 3/3 that way, and so
+  do the six spin-off levels that have coins; without coins, a plan that collects
+  one of the official 66 did so by accident — 23 of them with the v0.3.0
+  solutions, by the game's own count. Where the coins are is always exported, and `coinMode` turns on two witnesses
   that both work while every award is blocked: the mod's own pickup test (a
   distance from the coin's loaded position) and GD's own, hooked at
   `GJBaseGameLayer::pickupItem`, which is where `collisionCheckObjects` credits a
   coin. They are reported side by side (`coin:` / `coingd:` / `coincmp:`) because
   the first is a claim about the second, and comparing them is what says whether
   a route that plans to collect a coin would actually be paid for it. The
-  measurement so far: the same verdict on 20 of 24, never a pickup GD did not
-  credit, and 4 real ones missed — see COIN_RADIUS in `src/solver/solver.hpp`.
+  measurement on the v0.3.0 solutions: the same verdict on 18 of the 23 coins
+  GD credited on the coins-off ones and on 50 of 66 on the coin ones, never a
+  pickup GD did not credit, and the rest real ones missed — see COIN_RADIUS in
+  `src/solver/solver.hpp`.
   `itemcnt:` reports GD's item counters, which is what actually gates the coins
-  that have to be made to appear (lv21's third and lv22's third).
+  that have to be made to appear (lv21's third and lv22's third). How each layer
+  treats coins, and how the loop finds what a coin needs first:
+  [COINS.md](COINS.md).

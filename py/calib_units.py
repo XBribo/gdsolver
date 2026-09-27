@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gdtas.paths import LAB_RIGS, LEVELDP_EXE, RIGS, WORKERS_ROOT  # noqa: E402
+from gdtas.paths import LAB_RIGS, LEVELDP_EXE, REPO, RIGS, WORKERS_ROOT  # noqa: E402
 
 PY = sys.executable
 SCRATCH = Path(__file__).resolve().parent.parent / "data" / "tmp_calib"
@@ -142,7 +142,7 @@ def main() -> int:
         trace.unlink()
     r = subprocess.run([a.exe, str(objr), "--replay", str(plan),
                         "--out", str(base)],
-                       cwd=r"C:\GD", capture_output=True, text=True)
+                       cwd=str(REPO), capture_output=True, text=True)
     if not trace.exists():
         print("the model produced no trace:")
         print((r.stdout or "")[-800:])

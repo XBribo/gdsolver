@@ -13,6 +13,19 @@ project(gdsolver VERSION 0.1.0 LANGUAGES CXX)
 option(GDSOLVER_BUILD_DP "Build the DP core library and the leveldp CLI" ON)
 option(GDSOLVER_BUILD_MOD "Build the Geode mod (requires GEODE_SDK)" ON)
 
+# The search is throughput-bound, and RelWithDebInfo differed from Release here only in how it
+# links: incrementally, which routes calls through jump thunks and keeps /OPT:REF and /OPT:ICF off.
+# Link it the Release way (debug info kept). The code generation is unchanged, so the output is
+# too; measured on leveldp, the same objects linked both ways used 7% less CPU over three
+# official levels (421 -> 391 s, single thread) with byte-identical plans and traces.
+if (MSVC)
+    foreach (kind EXE SHARED)
+        string(REGEX REPLACE "/INCREMENTAL[^ ]*" "" CMAKE_${kind}_LINKER_FLAGS_RELWITHDEBINFO
+               "${CMAKE_${kind}_LINKER_FLAGS_RELWITHDEBINFO}")
+        string(APPEND CMAKE_${kind}_LINKER_FLAGS_RELWITHDEBINFO " /INCREMENTAL:NO /OPT:REF /OPT:ICF")
+    endforeach()
+endif()
+
 # The solver core is an INTERFACE target (header-only), so it is always added: the mod links
 # it too. Only the leveldp CLI is gated on GDSOLVER_BUILD_DP.
 add_subdirectory(dp)

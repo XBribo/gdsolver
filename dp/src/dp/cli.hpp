@@ -16,7 +16,7 @@
 //   - cube: solids can only be stood on from above; inner-box side contact
 //     kills; ceilings kill
 //
-// Measured constants (docs/findings.md 2026-07-30):
+// Measured constants (2026-07-30):
 //   cube: gravity -0.216/tick, jump vy=11.18 (jump tick: vy set, y frozen),
 //         terminal -15, rest at surface top + 15, floor clamp y=105
 //   ship: ShipModel::stepVy (bit-exact), box 30x30
@@ -31,6 +31,7 @@
 #include "dp/reset.hpp"
 #include "dp/clearance.hpp"
 #include "dp/refwatch.hpp"
+#include "dp/search_census.hpp"
 #include <xmmintrin.h>   // _mm_getcsr: see the fpenv line at the top of cliMain
 
 namespace dp {
@@ -81,7 +82,156 @@ inline std::vector<PlanEdge> planEdges(const std::vector<uint8_t>& lvl,
     return out;
 }
 
-inline int cliMain(int argc, char** argv) {
+// Seconds from cliMain's entry to the end of each part of the preparation a call pays before it
+// searches or replays anything: 0 arguments, 1 group recordings, 2 touch/auto triggers, 3 the
+// level, 4 the rest of the tables (to the --replay branch or the first layer), 5 the object
+// position table inside 2. -1 = not reached. Written on every call, read by the mod after it (cfg
+// dpphaseprof); nothing prints it here.
+inline double g_prepMark[6] = {-1, -1, -1, -1, -1, -1};
+
+// ---- parse caches for the in-process loop ----
+// The mod calls cliMain hundreds of times a level -- the ladder's rungs, the fixup recorder's
+// replays -- and every call parsed the same level text twice more (the object type and position
+// tables) and every group recording again: on SubZero 4003 about 0.13-0.2 s of a 0.25-0.3 s call,
+// most of a call that then searches nothing. A table is reused only when the bytes it came from are
+// the same bytes, so a hit hands back exactly what parsing them would have. The CLI makes one call
+// per process and never hits.
+struct LevelTextCache {
+    std::string text;
+    bool haveTypes = false, havePos = false;
+    std::unordered_map<int, int> types;
+    std::unordered_map<int, std::pair<double, double>> pos;
+};
+inline LevelTextCache& levelTextFor(const std::string& text) {
+    static LevelTextCache c;
+    if (c.text.size() != text.size() || c.text != text) {
+        c = LevelTextCache{};
+        c.text = text;
+    }
+    return c;
+}
+// The moving-geometry timeline a call's --groups files make: each loaded, the later ones laid over
+// the first (overlayGroupTimeline), and g_groupInit set -- kept as a whole, not per file. A call
+// used to take its first layer as a COPY out of a per-file cache so the overlay could write into
+// it, and that copy of a 1.5M-sample recording, with the character-at-a-time read before it, was
+// ~1 s of every call on a custom level (lv20: ~0.6 s). The whole result depends on the files'
+// bytes and the two hold settings and nothing else, so a hit on all of them hands back the
+// timeline itself, and what the loads and overlays printed is printed again.
+struct GroupLayersCache {
+    bool valid = false;
+    std::vector<std::string> paths, bytes;
+    bool holdDeath = false;
+    int holdEnd = 0;
+    GroupTimeline merged;
+    std::unordered_map<int, uint8_t> init;
+    std::string report;   // the lines the loads and overlays printed, in order
+};
+// Bumped every time groupLayersFor builds the timeline instead of handing back the one it has,
+// so a table made from the timeline can tell that it is still the same one.
+inline unsigned long long g_groupLayersGen = 0;
+inline const GroupTimeline& groupLayersFor(const std::vector<std::string>& paths) {
+    static GroupLayersCache c;
+    static const GroupTimeline kNone;
+    g_groupInit.clear();
+    if (paths.empty()) return kNone;
+    std::vector<std::string> bytes(paths.size());
+    bool readable = true;
+    for (size_t i = 0; i < paths.size() && readable; ++i)
+        readable = readFileBytes(paths[i], bytes[i]);
+    if (readable && c.valid && c.paths == paths && c.holdDeath == g_groupHoldDeath
+        && c.holdEnd == g_groupHoldEnd && c.bytes == bytes) {
+        std::fputs(c.report.c_str(), stdout);
+        g_groupInit = c.init;
+        return c.merged;
+    }
+    // A miss: the loop this replaces, printing as it goes.
+    ++g_groupLayersGen;
+    GroupTimeline gt;
+    std::string report;
+    for (size_t gi = 0; gi < paths.size(); ++gi) {
+        long long oneEnd = -1;
+        std::unordered_map<int, uint8_t> oneInit;
+        GroupTimeline one = loadGroupTimeline(paths[gi], &oneEnd, &oneInit);
+        {   // the line loadGroupTimeline just printed (an unreadable file says so on stderr)
+            long long rows = 0;
+            for (const auto& kv : one) rows += (long long)kv.second.size();
+            char b[768];
+            std::snprintf(b, sizeof b, "groups: %lld samples for %zu objects (%s)\n", rows,
+                          one.size(), paths[gi].c_str());
+            report += b;
+        }
+        if (g_groupInit.empty()) g_groupInit = std::move(oneInit);
+        if (gi == 0) {
+            gt = std::move(one);
+        } else {
+            std::string ov;
+            overlayGroupTimeline(gt, one, g_groupHoldDeath && gi + 1 == paths.size(), oneEnd,
+                                 &ov);
+            std::fputs(ov.c_str(), stdout);
+            report += ov;
+        }
+    }
+    c = GroupLayersCache{};
+    c.merged = std::move(gt);
+    if (readable) {   // an unreadable file is not a state worth remembering
+        c.valid = true;
+        c.paths = paths;
+        c.bytes = std::move(bytes);
+        c.holdDeath = g_groupHoldDeath;
+        c.holdEnd = g_groupHoldEnd;
+        c.init = g_groupInit;
+        c.report = std::move(report);
+    }
+    return c.merged;
+}
+
+// The level, shared by the attempts of one --capladder. The ladder (cliMain) runs cliMainOnce
+// again for every attempt with the same arguments but for --capmap and --gridmap, which only the
+// layer loop reads (capAtX, gridAtX), so every attempt rebuilt the same level. In the panel on
+// a custom level (2026-09-25, 32 minutes) that was 257 attempts for 74 searches, each preparing
+// for ~1.3 s, the level ~1 s of it. An attempt after the first takes the level the first one
+// built: the Level as loadLevel returned it, the globals loadLevelFrom writes (LoadLevelWrites)
+// and what it printed.
+//
+// Only inside one ladder, where the arguments, the input files and the level text are the same
+// by construction, and resetInvocationState has put every other global back where the first
+// attempt found it. The argument list and the moving-geometry timeline are still compared, as a
+// guard rather than as the key. cliMain empties it when the ladder ends: it holds a copy of the
+// level, recordings included, and has no use after that.
+struct LadderLevelCache {
+    unsigned long long ladder = 0;   // the ladder it was built in; 0 = empty
+    std::vector<std::string> args;   // that attempt's arguments without --capmap / --gridmap
+    unsigned long long groupsGen = 0;
+    Level level;
+    LoadLevelWrites writes;
+    std::string printed;
+};
+inline unsigned long long g_ladder = 0;   // the ladder in progress (cliMain); 0 = none
+inline LadderLevelCache g_ladderLevel;
+inline std::vector<std::string> ladderArgs(int argc, char** argv) {
+    std::vector<std::string> a;
+    for (int i = 0; i < argc; ++i) {
+        if (i + 1 < argc
+            && (!std::strcmp(argv[i], "--capmap") || !std::strcmp(argv[i], "--gridmap"))) {
+            ++i;
+            continue;
+        }
+        a.push_back(argv[i]);
+    }
+    return a;
+}
+
+// One solve: everything a command line asks for. cliMain below is this, unless --capladder
+// asks for a sequence of them.
+inline int cliMainOnce(int argc, char** argv) {
+    // --phaseprof's `prep=`: from here to the first layer -- reading the level and every input
+    // file and building the tables -- which a call pays whether or not it then searches at all.
+    const auto cliT0 = std::chrono::steady_clock::now();
+    for (double& m : g_prepMark) m = -1;
+    auto prepMark = [&](int k) {
+        g_prepMark[k] = std::chrono::duration<double>(std::chrono::steady_clock::now() - cliT0)
+                            .count();
+    };
     // Whatever the last call concluded must not be readable as this one's answer. Cleared here
     // rather than at the search, so an early return (bad arguments, unreadable level) also
     // leaves "FAILED, nothing measured" behind instead of the previous run's verdict
@@ -364,6 +514,62 @@ inline int cliMain(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--hazaabb")) g_hazAabb = true;
         // --ceilrideslope: no flight ceiling ride while a ceiling ramp presses.
         if (!std::strcmp(argv[i], "--ceilrideslope")) g_ceilRideSlope = true;
+        // --goalspare: keep a body above the level that reaches the goal first (speed.hpp)
+        if (!std::strcmp(argv[i], "--goalspare")) g_goalSpare = 1;
+        if (!std::strcmp(argv[i], "--no-goalspare")) g_goalSpare = 0;   // on by default
+        // --upsidecoyote: an upside-down cube jumps from the og GD leaves set (speed.hpp). On by
+        // default since 2026-09-26; the plain name still parses, --no-upsidecoyote is the off arm.
+        if (!std::strcmp(argv[i], "--upsidecoyote")) g_upsideCoyote = 1;
+        if (!std::strcmp(argv[i], "--no-upsidecoyote")) g_upsideCoyote = 0;
+        // --rawvalues: the cube branch's gravity step before the 0.001 grid (speed.hpp). On by
+        // default with --padtable; the positive spellings still parse and --no- turns them off.
+        if (!std::strcmp(argv[i], "--rawvalues")) g_rawValues = 1;
+        if (!std::strcmp(argv[i], "--no-rawvalues")) g_rawValues = 0;
+        // --portalunpin: a gravity portal off a block keeps the tick's step in y (speed.hpp)
+        if (!std::strcmp(argv[i], "--portalunpin")) g_portalUnpin = 1;   // on by default
+        if (!std::strcmp(argv[i], "--no-portalunpin")) g_portalUnpin = 0;
+        // --hazendpoint: the cube's and flying body's hazard test at the tick's end only (speed.hpp)
+        if (!std::strcmp(argv[i], "--hazendpoint")) g_hazEndpoint = 1;   // on by default
+        if (!std::strcmp(argv[i], "--no-hazendpoint")) g_hazEndpoint = 0;
+        // --portalpress: a press on a mode portal's tick belongs to the new mode (speed.hpp)
+        if (!std::strcmp(argv[i], "--portalpress")) g_portalPress = 1;   // on by default
+        if (!std::strcmp(argv[i], "--no-portalpress")) g_portalPress = 0;
+        // --padtable: pad launches from GD's per-mode table (speed.hpp)
+        if (!std::strcmp(argv[i], "--padtable")) g_padTable = 1;
+        if (!std::strcmp(argv[i], "--no-padtable")) g_padTable = 0;
+        // --ringonce, --portalonce, --ringorder, --holdlatch, --ringfirst, --padfirst,
+        // --portalflap, --ringpresspin, --ballbuffer, --ringbuffer, --groundcubejump,
+        // --gravlandtap, --gravpadchain, --onewayceil, --padsection, --solidorder, --ballceil,
+        // --ballceilflip, --snaponeway, --flyreland, --padthenland, --faceclass, --portalceil,
+        // --flipgrace, --padflipland, --flyrings, --sawexact, --snaptable, --sawexactship,
+        // --groundgrow, --ringeither, --growaway, --sizepress, --ballgrowlag:
+        // always on since 2026-09-26 (speed.hpp). The spellings are still accepted, doing
+        // nothing, so a config written before keeps working.
+        if (!std::strcmp(argv[i], "--ringonce") || !std::strcmp(argv[i], "--portalonce")
+            || !std::strcmp(argv[i], "--ringorder") || !std::strcmp(argv[i], "--holdlatch")
+            || !std::strcmp(argv[i], "--ringfirst") || !std::strcmp(argv[i], "--padfirst")
+            || !std::strcmp(argv[i], "--portalflap") || !std::strcmp(argv[i], "--ringpresspin")
+            || !std::strcmp(argv[i], "--ballbuffer") || !std::strcmp(argv[i], "--ringbuffer")
+            || !std::strcmp(argv[i], "--groundcubejump")
+            || !std::strcmp(argv[i], "--gravlandtap") || !std::strcmp(argv[i], "--gravpadchain")
+            || !std::strcmp(argv[i], "--onewayceil") || !std::strcmp(argv[i], "--padsection")
+            || !std::strcmp(argv[i], "--solidorder") || !std::strcmp(argv[i], "--ballceil")
+            || !std::strcmp(argv[i], "--ballceilflip") || !std::strcmp(argv[i], "--snaponeway")
+            || !std::strcmp(argv[i], "--flyreland") || !std::strcmp(argv[i], "--padthenland")
+            || !std::strcmp(argv[i], "--faceclass") || !std::strcmp(argv[i], "--portalceil")
+            || !std::strcmp(argv[i], "--flipgrace") || !std::strcmp(argv[i], "--padflipland")
+            || !std::strcmp(argv[i], "--flyrings") || !std::strcmp(argv[i], "--sawexact")
+            || !std::strcmp(argv[i], "--snaptable") || !std::strcmp(argv[i], "--sawexactship")
+            || !std::strcmp(argv[i], "--groundgrow") || !std::strcmp(argv[i], "--ringeither")
+            || !std::strcmp(argv[i], "--growaway") || !std::strcmp(argv[i], "--sizepress")
+            || !std::strcmp(argv[i], "--ballgrowlag")) continue;
+        // --heldall: State::held tracks the button in every mode (speed.hpp)
+        if (!std::strcmp(argv[i], "--heldall")) g_heldAll = 1;
+        // --heldcellcap: under --heldall the alive cap counts cells, not button twins (speed.hpp)
+        if (!std::strcmp(argv[i], "--heldcellcap")) g_heldCellCap = 1;
+        // --heldcelltwins N: ...and keeps at most N states of a sampled cell (speed.hpp)
+        if (i + 1 < argc && !std::strcmp(argv[i], "--heldcelltwins"))
+            g_heldCellTwins = std::atoi(argv[++i]);
         if (!std::strcmp(argv[i], "--fgarmlive")) g_fgArmLive = true;
         if (!std::strcmp(argv[i], "--trigdump")) g_trigDump = true;
         if (!std::strcmp(argv[i], "--stopdump")) g_stopDump = true;   // print only
@@ -492,6 +698,14 @@ inline int cliMain(int argc, char** argv) {
         // --keycensus: count, per touch box, how often it divided the dedupe
         // key. Print-only; the tally goes out at the end of the run.
         if (!std::strcmp(argv[i], "--keycensus")) g_keyCensus = true;
+        // --searchcensus: what the frontier is made of (search_census.hpp), every 16th layer.
+        // Print only.
+        if (!std::strcmp(argv[i], "--searchcensus")) g_searchCensus = 16;
+        // --twinskip / --twinaudit (search_census.hpp): value-less.
+        if (!std::strcmp(argv[i], "--twinskip")) g_twinSkip = true;
+        if (!std::strcmp(argv[i], "--no-twinskip")) g_twinSkip = false;
+        if (!std::strcmp(argv[i], "--twinaudit")) g_twinAudit = true;
+        if (!std::strcmp(argv[i], "--heldkeyread")) g_heldKeyRead = true;   // value-less
         if (!std::strcmp(argv[i], "--ceilpin")) g_ceilPin = true;
         // --trigraw: autonomous triggers behind the anchor trust the
         // recording's tick (history at g_trigRaw's declaration). These three sat
@@ -504,7 +718,8 @@ inline int cliMain(int argc, char** argv) {
         // recording, i.e. last. Value-less, so it lives in this loop.
         if (!std::strcmp(argv[i], "--groupholddeath")) g_groupHoldDeath = true;
         if (!std::strcmp(argv[i], "--ceilpush")) g_ceilPush = true;   // value-less, same reason
-        if (!std::strcmp(argv[i], "--bonkarm")) g_bonkArm = true;   // value-less, same reason
+        // --bonkarm: always on since 2026-09-26 (constants.hpp); accepted, doing nothing
+        if (!std::strcmp(argv[i], "--bonkarm")) {}
         if (!std::strcmp(argv[i], "--vetophys")) g_vetoPhys = true;   // value-less, same reason
         if (!std::strcmp(argv[i], "--verdictinfo")) g_verdictInfo = true;   // value-less, same reason
         // Value-less too, and the mod's addWorldArgs can emit it LAST (nothing
@@ -513,6 +728,31 @@ inline int cliMain(int argc, char** argv) {
         // never reads it. Parsed here as well so argv order cannot drop it;
         // the second parse at its old site is a harmless re-set.
         if (!std::strcmp(argv[i], "--needtrig-unseen")) g_needUnseen = true;
+        // --activators: pickups that switch a group on become boxes (g_activators).
+        if (!std::strcmp(argv[i], "--activators")) g_activators = true;
+        if (!std::strcmp(argv[i], "--coinpick")) g_coinPick = true;   // value-less (g_coinPick)
+        if (!std::strcmp(argv[i], "--airpress")) g_airPress = true;   // value-less (g_airPress)
+        if (!std::strcmp(argv[i], "--refadopt")) g_refAdopt = true;   // value-less (g_refAdopt)
+        if (!std::strcmp(argv[i], "--spawnroots")) g_spawnRoots = true;   // value-less (g_spawnRoots)
+        // ...all four on by default (triggers.hpp kDef*); these turn them off.
+        if (!std::strcmp(argv[i], "--no-activators")) g_activators = false;
+        if (!std::strcmp(argv[i], "--no-coinpick")) g_coinPick = false;
+        if (!std::strcmp(argv[i], "--no-airpress")) g_airPress = false;
+        if (!std::strcmp(argv[i], "--no-spawnroots")) g_spawnRoots = false;
+        if (!std::strcmp(argv[i], "--no-offmoves")) g_offMoves = false;   // g_offMoves
+        // --touchretimebox: re-time a box's objects against the box's entry (g_touchRetimeBox).
+        // All three are on by default; the positive spellings are kept so
+        // an argv written for the experiment still parses, and the --no- ones turn them off.
+        if (!std::strcmp(argv[i], "--touchretimebox")) g_touchRetimeBox = true;
+        if (!std::strcmp(argv[i], "--no-touchretimebox")) g_touchRetimeBox = false;
+        // --itemsnoblock: a Collision Block's block ID is not an item (g_itemsNoBlock).
+        if (!std::strcmp(argv[i], "--itemsnoblock")) g_itemsNoBlock = true;
+        if (!std::strcmp(argv[i], "--no-itemsnoblock")) g_itemsNoBlock = false;
+        // --walkgates: the walks fire the item gates too (g_walkGates).
+        if (!std::strcmp(argv[i], "--walkgates")) g_walkGates = true;
+        // --replayon (diagnostic): the replay walks past its first death (g_replayOn).
+        if (!std::strcmp(argv[i], "--replayon")) g_replayOn = true;
+        if (!std::strcmp(argv[i], "--no-walkgates")) g_walkGates = false;
         // [2026-09-01] The three debug switches used to sit in the argc-1 loop
         // below, i.e. in the loop this very comment says value-less flags must
         // not be in: passed LAST they did nothing, silently. Measured the hard
@@ -533,6 +773,7 @@ inline int cliMain(int argc, char** argv) {
                 && std::sscanf(argv[++i], "%lld,%lld", &g_qfoldLo, &g_qfoldHi) != 2)
                 g_qfoldLo = g_qfoldHi = -1;
         if (!std::strcmp(argv[i], "--dcydbg")) g_dcyDbg = true;
+        if (!std::strcmp(argv[i], "--supdbg")) g_supDbg = true;
         // --no-slopeseat: the pre-2026-09-06 slope seat (surface sampled at an
         // x clamped into the ramp's span, plus/minus a flat player half)
         // instead of GD's extrapolated `line -/+ h/(2 cos t)` with the bounds on
@@ -569,6 +810,35 @@ inline int cliMain(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--out")) outPath = argv[i + 1];
         if (!std::strcmp(argv[i], "--dbg")) dbgLayers = std::atoi(argv[i + 1]);
         if (!std::strcmp(argv[i], "--cap")) g_aliveCap = (size_t)std::atoll(argv[i + 1]);
+        // --capmap x0:c0,x1:c1,... (thread_pool.hpp). Entries must be in x order.
+        if (!std::strcmp(argv[i], "--capmap")) {
+            g_capMap.clear();
+            for (const char* p = argv[i + 1]; *p;) {
+                char* e = nullptr;
+                const double x = std::strtod(p, &e);
+                if (e == p || *e != ':') break;
+                p = e + 1;
+                const long long c = std::strtoll(p, &e, 10);
+                if (e == p || c <= 0) break;
+                g_capMap.emplace_back(x, (size_t)c);
+                p = (*e == ',') ? e + 1 : e;
+            }
+        }
+        // --gridmap x0:k0,x1:k1,... (search_census.hpp gridAtX). Entries must be in x order;
+        // k = 0 means "--inputgrid's value", 1 means no grid.
+        if (!std::strcmp(argv[i], "--gridmap")) {
+            g_gridMap.clear();
+            for (const char* p = argv[i + 1]; *p;) {
+                char* e = nullptr;
+                const double x = std::strtod(p, &e);
+                if (e == p || *e != ':') break;
+                p = e + 1;
+                const long k = std::strtol(p, &e, 10);
+                if (e == p || k < 0) break;
+                g_gridMap.emplace_back(x, (int)k);
+                p = (*e == ',') ? e + 1 : e;
+            }
+        }
         // --coinmask <bits>: with --coins, the coins already collected at the
         // --start anchor (bit i = L.coins[i], x order). See the seed below.
         if (!std::strcmp(argv[i], "--coinmask")) g_coinMaskSeed = std::atoi(argv[i + 1]);
@@ -584,12 +854,23 @@ inline int cliMain(int argc, char** argv) {
         // group applied. Reads --hazdbg for WHICH object to locate, so the two
         // flags are given together.
         if (!std::strcmp(argv[i], "--trigdbg")) g_trigDbgT = std::atoll(argv[i + 1]);
+        // --fbforce <box>:<tick>: see g_fbForceBox (triggers.hpp).
+        if (!std::strcmp(argv[i], "--fbforce")) {
+            const char* v = argv[i + 1];
+            g_fbForceBox = std::atoi(v);
+            const char* c = std::strchr(v, ':');
+            g_fbForceTick = c ? std::atoi(c + 1) : 0;
+        }
         // Where the model put each coin at that tick, against the mod's own
         // `coinlive:` line for the same tick (see the declaration).
         if (!std::strcmp(argv[i], "--coindbg")) g_coinDbgT = std::atoll(argv[i + 1]);
         if (!std::strcmp(argv[i], "--gcnodes")) g_gcNodes = (size_t)std::atoll(argv[i + 1]);
         if (!std::strcmp(argv[i], "--memlimit")) g_memLimitMiB = (size_t)std::atoll(argv[i + 1]);
         if (!std::strcmp(argv[i], "--shipyq")) g_shipYq = std::atof(argv[i + 1]);
+        if (!std::strcmp(argv[i], "--keyxq")) g_keyXq = std::atof(argv[i + 1]);
+        if (!std::strcmp(argv[i], "--keyxqfly")) g_keyXqFly = std::atof(argv[i + 1]);
+        if (!std::strcmp(argv[i], "--minpulse")) g_minPulse = std::atoi(argv[i + 1]);
+        if (!std::strcmp(argv[i], "--inputgrid")) g_inputGrid = std::atoi(argv[i + 1]);
         if (!std::strcmp(argv[i], "--shipvq")) g_shipVq = std::atof(argv[i + 1]);
         if (!std::strcmp(argv[i], "--snaplog")) snapLogPath = argv[i + 1];
         // [2026-08-31] --shipceil / --ceil / --flyfloor / --ufoceil ARE GONE.
@@ -668,6 +949,21 @@ inline int cliMain(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--spentpad")) {
             for (const char* p = argv[i + 1]; *p; ) {
                 g_spentPad.push_back(std::atoi(p));
+                const char* c = std::strchr(p, ',');
+                if (!c) break;
+                p = c + 1;
+            }
+        }
+        // --solidorddbg t0:t1: print the solids the collision loops visit, in order (speed.hpp)
+        if (!std::strcmp(argv[i], "--solidorddbg")) {
+            g_solidOrdDbgT0 = std::atoll(argv[i + 1]);
+            const char* c = std::strchr(argv[i + 1], ':');
+            g_solidOrdDbgT1 = c ? std::atoll(c + 1) : g_solidOrdDbgT0;
+        }
+        // --spentorb uid,uid,...: rings already fired before the anchor, oldest first (speed.hpp)
+        if (!std::strcmp(argv[i], "--spentorb")) {
+            for (const char* p = argv[i + 1]; *p; ) {
+                g_spentOrb.push_back(std::atoi(p));
                 const char* c = std::strchr(p, ',');
                 if (!c) break;
                 p = c + 1;
@@ -812,6 +1108,9 @@ inline int cliMain(int argc, char** argv) {
         // --needtrig <n>: repeatable. See g_needTrig.
         if (!std::strcmp(argv[i], "--needtrig"))
             g_needTrig |= touchBit(std::atoi(argv[i + 1]));
+        // --needtrig-uid <uid>: repeatable. See g_needTrigUids.
+        if (!std::strcmp(argv[i], "--needtrig-uid"))
+            g_needTrigUids.push_back(std::atoi(argv[i + 1]));
         if (!std::strcmp(argv[i], "--needtrig-unseen")) g_needUnseen = true;
         // --needtrig-skip <n>: repeatable. See g_needSkip.
         if (!std::strcmp(argv[i], "--needtrig-skip"))
@@ -921,6 +1220,11 @@ inline int cliMain(int argc, char** argv) {
                             g_fixups.size());
         }
         if (!std::strcmp(argv[i], "--dynhazpad")) g_dynHazPad = std::atof(argv[i + 1]);
+        // --histstat <file>: the fixed-length histories' fill after a replay (speed.hpp)
+        if (!std::strcmp(argv[i], "--histstat")) {
+            g_histStatOn = true;
+            g_histStatPath = argv[i + 1];
+        }
         if (!std::strcmp(argv[i], "--maxplayy")) g_maxPlayY = std::atof(argv[i + 1]);
         if (!std::strcmp(argv[i], "--offboard") && i + 1 < argc)
             g_offBoardMargin = std::atof(argv[i + 1]);
@@ -1277,13 +1581,10 @@ inline int cliMain(int argc, char** argv) {
     for (int i = 2; i + 1 < argc; ++i)
         if (!std::strcmp(argv[i], "--horizon")) horizon = std::atoll(argv[i + 1]);
 
-    GroupTimeline gt;
-    for (size_t gi = 0; gi < groupsPaths.size(); ++gi) {
-        GroupTimeline one = loadGroupTimeline(groupsPaths[gi]);
-        if (gi == 0) gt = std::move(one);
-        else overlayGroupTimeline(gt, one,
-                                  g_groupHoldDeath && gi + 1 == groupsPaths.size());
-    }
+    prepMark(0);
+    // Read only from here on: the level loader takes it by const pointer, and the rest look up.
+    const GroupTimeline& gt = groupLayersFor(groupsPaths);   // ...and sets g_groupInit
+    prepMark(1);
     if (!trigPath.empty() && !grpPath.empty()) {
         // The window (--touch-from-anchor) stays opt-in in general -- the note at
         // the cap records a measured failure with it ON at an early anchor -- but
@@ -1322,13 +1623,22 @@ inline int cliMain(int argc, char** argv) {
         // g_trigWinSel.
         // In-process, argv[1] is a placeholder and the level is g_levelCsv (see
         // loadObjTypesFrom). --csvtypes reads it from there.
-        std::unordered_map<int, int> objTypes;
+        // The cached tables are read in place rather than copied (117k entries each on a custom
+        // level): nothing below writes to either.
+        std::unordered_map<int, int> objTypesOwn;
+        const std::unordered_map<int, int>* objTypesP = &objTypesOwn;
         if (!g_levelCsv.empty()) {
-            std::istringstream cs(g_levelCsv);
-            objTypes = loadObjTypesFrom(cs);
+            LevelTextCache& lc = levelTextFor(g_levelCsv);
+            if (!lc.haveTypes) {
+                std::istringstream cs(g_levelCsv);
+                lc.types = loadObjTypesFrom(cs);
+                lc.haveTypes = true;
+            }
+            objTypesP = &lc.types;
         } else {
-            objTypes = loadObjTypes(argv[1]);
+            objTypesOwn = loadObjTypes(argv[1]);
         }
+        const std::unordered_map<int, int>& objTypes = *objTypesP;
         bool winTouch = g_touchFromAnchor;
         // A rotated-frame anchor is placed by its WORLD x (the boxes' cx are
         // world), and windows around it (triggers.hpp, g_trigWinNear).
@@ -1369,14 +1679,22 @@ inline int cliMain(int argc, char** argv) {
         }
         // --movetarget: object positions, for a target-mode Move's destination.
         // In-process the level is g_levelCsv, not argv[1] (a placeholder there).
-        std::unordered_map<int, std::pair<double, double>> objPos;
+        std::unordered_map<int, std::pair<double, double>> objPosOwn;
+        const std::unordered_map<int, std::pair<double, double>>* objPosP = &objPosOwn;
         if (!g_levelCsv.empty()) {
-            std::istringstream cs(g_levelCsv);
-            objPos = loadObjPos(cs);
+            LevelTextCache& lc = levelTextFor(g_levelCsv);
+            if (!lc.havePos) {
+                std::istringstream cs(g_levelCsv);
+                lc.pos = loadObjPos(cs);
+                lc.havePos = true;
+            }
+            objPosP = &lc.pos;
         } else {
             std::ifstream fs(argv[1]);
-            if (fs) objPos = loadObjPos(fs);
+            if (fs) objPosOwn = loadObjPos(fs);
         }
+        const std::unordered_map<int, std::pair<double, double>>& objPos = *objPosP;
+        prepMark(5);
         std::printf("movetarget: %zu object positions from %s\n", objPos.size(),
                     g_levelCsv.empty() ? "the dump" : "the in-process level table");
         if (rotWin && winTouch) g_trigWinNear = x0World;
@@ -1409,8 +1727,20 @@ inline int cliMain(int argc, char** argv) {
             g_outcome.trigMapSig = g_touch.empty() ? 0ull : h;
         }
         buildTouchMoveTicks();   // the dedupe key's "is this box still moving"
+        // ...and "is the button down near a toggle block" (g_pressWin). 15 is the largest
+        // half any mode has, 20 more covers a tick's travel at the fastest speed, since the
+        // box reads the PARENT's button and so the held parent has to survive the tick before.
+        g_pressWin.clear();
+        g_actMask = TouchMask{};
+        for (size_t b = 0; b < g_touch.size() && b < (size_t)kTouchBits; ++b) {
+            if (g_touch[b].press)
+                g_pressWin.push_back({g_touch[b].cx - g_touch[b].hw - 35.0,
+                                      g_touch[b].cx + g_touch[b].hw + 15.0, (int)b});
+            if (g_touch[b].activator) g_actMask |= touchBit((int)b);
+        }
         g_autoTrig = loadAutoTriggers(trigPath, grpPath);
     }
+    prepMark(2);
     if (!obbPath.empty()) g_obb = loadObb(obbPath);   // before loadLevel reads it
     // The flags decide the SHAPE of a circular hazard's test, so they have to
     // be in before anything asks hazardHit anything.
@@ -1418,10 +1748,143 @@ inline int cliMain(int argc, char** argv) {
     if (!setPath.empty() && loadLevelSettings(setPath) && g_fixRadiusCollision)
         std::printf("levelsettings: fixRadiusCollision=1 - circular hazards "
                     "use centre distance (branch A) in this level\n");
-    Level L = loadLevel(argv[1], groupsPaths.empty() ? nullptr : &gt,
-                        g_touch.empty() ? nullptr : &g_touch,
-                        g_autoTrig.empty() ? nullptr : &g_autoTrig);
+    // An attempt after a ladder's first takes the level that one built (LadderLevelCache).
+    Level L;
+    {
+        std::vector<std::string> la;
+        if (g_ladder) la = ladderArgs(argc, argv);
+        if (g_ladder && g_ladderLevel.ladder == g_ladder
+            && g_ladderLevel.groupsGen == g_groupLayersGen && g_ladderLevel.args == la) {
+            L = g_ladderLevel.level;
+            g_ladderLevel.writes.put();
+            std::fputs(g_ladderLevel.printed.c_str(), stdout);
+        } else {
+            std::string printed;
+            if (g_ladder) g_loadPrinted = &printed;
+            L = loadLevel(argv[1], groupsPaths.empty() ? nullptr : &gt,
+                          g_touch.empty() ? nullptr : &g_touch,
+                          g_autoTrig.empty() ? nullptr : &g_autoTrig);
+            g_loadPrinted = nullptr;
+            if (g_ladder) {
+                g_ladderLevel.ladder = g_ladder;
+                g_ladderLevel.args = std::move(la);
+                g_ladderLevel.groupsGen = g_groupLayersGen;
+                g_ladderLevel.level = L;
+                g_ladderLevel.writes.take();
+                g_ladderLevel.printed = std::move(printed);
+            }
+        }
+    }
+    prepMark(3);
+    // A level this build cannot represent: say so and return 2 -- the exit code the
+    // loader's old std::exit(2) gave the CLI, without ending the host process when
+    // this runs inside the game (see Level::unsupported).
+    if (!L.unsupported.empty()) {
+        std::printf("unsupported: %s\n", L.unsupported.c_str());
+        std::fprintf(stderr, "level unsupported: %s\n", L.unsupported.c_str());
+        g_outcome.unsupported = L.unsupported;
+        return 2;
+    }
     g_baseLv = &L;   // see levelOfFrame / applyRotation's re-tap
+    g_gpHandoff = L.gpHandoff;   // shared gravity-portal bits (prelude.hpp); empty on most levels
+    if (!g_gpHandoff.empty())
+        std::printf("gravity portals: %zu bits shared past %d, handed on at x=%.1f..%.1f\n",
+                    g_gpHandoff.size(), kGravPortalBits, g_gpHandoff.front().x,
+                    g_gpHandoff.back().x);
+    // TouchTrig::followIdx: a box whose own group a Move displaces follows a recorded object
+    // moved by exactly the same Moves -- the same set of Move-targeted groups, so neither can
+    // travel without the other -- the nearest one to the box. The trigger itself has no row in
+    // any recording. Printed per box, so a run says which boxes move and after what.
+    // markTouched adds the object's WHOLE displacement, which is the box's own only when
+    // everything that moves either of them is a translation of whole groups (Move in any
+    // mode, Follow, Follow Player Y) and both carry the same set of such groups. A Rotate,
+    // a Scale, an Area effect or an Advanced Follow moves each object by an amount that
+    // depends on where it is, so a box under one is left unfollowed and says so -- lv22's
+    // pulse boxes 197/277/334 turn with the arms of groups 38-40, at another radius than any
+    // recorded object. (An Edit Area's target may be an effect id rather than a group; the
+    // test then refuses more than it needs to, never less.)
+    if (!g_touch.empty() && !trigPath.empty() && !grpPath.empty() && !L.dyn.objs.empty()) {
+        std::unordered_map<int, TrigRow> rows;
+        if (loadTrigRows(trigPath, rows)) {
+            std::unordered_set<int> moved;   // groups some Move displaces
+            std::unordered_set<int> rigid;   // groups a whole-group translation acts on
+            std::unordered_set<int> bent;    // groups a position-dependent transform acts on
+            for (const auto& kv : rows) {
+                const TrigRow& r = kv.second;
+                if (r.target <= 0) continue;
+                if (r.id == 901 && (r.ox != 0.0 || r.oy != 0.0)) moved.insert(r.target);
+                if (r.id == 901 || r.id == 1347 || r.id == 1814) rigid.insert(r.target);
+                if (r.id == 1346 || r.id == 2067 || (r.id >= 3006 && r.id <= 3008)
+                    || (r.id >= 3011 && r.id <= 3013) || r.id == 3016)
+                    bent.insert(r.target);
+            }
+            std::unordered_map<int, std::vector<int>> movedOf;   // uid -> its moved groups
+            std::unordered_map<int, std::vector<int>> rigidOf;   // uid -> its translated groups
+            std::unordered_set<int> bentUid;
+            {
+                std::ifstream in(grpPath);
+                std::string line;
+                std::getline(in, line);   // header
+                while (std::getline(in, line)) {
+                    std::stringstream ss(line);
+                    int uid = 0, g = 0;
+                    if (!(ss >> uid)) continue;
+                    while (ss >> g) {
+                        if (moved.count(g)) movedOf[uid].push_back(g);
+                        if (rigid.count(g)) rigidOf[uid].push_back(g);
+                        if (bent.count(g)) bentUid.insert(uid);
+                    }
+                }
+                for (auto& kv : movedOf) std::sort(kv.second.begin(), kv.second.end());
+                for (auto& kv : rigidOf) std::sort(kv.second.begin(), kv.second.end());
+            }
+            const auto rigidSig = [&](int uid) {
+                const auto it = rigidOf.find(uid);
+                return it == rigidOf.end() ? std::vector<int>{} : it->second;
+            };
+            int nFollow = 0, nRefused = 0;
+            for (TouchTrig& T : g_touch) {
+                const auto want = movedOf.find(T.uid);
+                if (want == movedOf.end() || want->second.empty()) continue;
+                const std::vector<int> wantRigid = rigidSig(T.uid);
+                int best = -1, nSameMoves = 0;
+                double bestD = 1e18;
+                for (size_t i = 0; i < L.dyn.objs.size(); ++i) {
+                    const int u = L.dyn.objs[i].uid;
+                    const auto have = movedOf.find(u);
+                    if (have == movedOf.end() || have->second != want->second) continue;
+                    ++nSameMoves;
+                    if (bentUid.count(T.uid) || bentUid.count(u) || rigidSig(u) != wantRigid)
+                        continue;
+                    const double d = std::fabs(L.dyn.objs[i].cx - T.cx)
+                                     + std::fabs(L.dyn.objs[i].cy - T.cy);
+                    if (d < bestD) { bestD = d; best = (int)i; }
+                }
+                if (best < 0) {
+                    if (nSameMoves) {
+                        ++nRefused;
+                        std::printf("touchfollow: box uid %d NOT followed: %s\n", T.uid,
+                                    bentUid.count(T.uid)
+                                        ? "a Rotate/Scale/Area/Advanced Follow moves its "
+                                          "group, by an amount that depends on position"
+                                        : "no recorded object shares all its transforms");
+                    }
+                    continue;
+                }
+                // load-time position: seek() has not run yet
+                T.followIdx = best;
+                T.followX0 = L.dyn.objs[(size_t)best].cx;
+                T.followY0 = L.dyn.objs[(size_t)best].cy;
+                ++nFollow;
+                std::printf("touchfollow: box uid %d follows dynamic uid %d (%zu moved "
+                            "group(s), %.0f px away)\n", T.uid,
+                            L.dyn.objs[(size_t)best].uid, want->second.size(), bestD);
+            }
+            if (nFollow || nRefused)
+                std::printf("touchfollow: %d box(es) follow, %d refused\n", nFollow, nRefused);
+            if (nFollow) g_touchFollowObjs = &L.dyn.objs;
+        }
+    }
     // Beside the dump when nobody said, the way levelsettings and rotgameplay are
     // (forceIdsPathBeside; it returns empty unless the file is really there).
     if (g_forceIdsPath.empty()) g_forceIdsPath = forceIdsPathBeside(argv[1]);
@@ -1570,6 +2033,22 @@ inline int cliMain(int argc, char** argv) {
                 std::printf("spentpad: %d DROPPED - all four usedPad slots are "
                             "taken at t0\n", overflow);
         }
+        // --spentorb (speed.hpp): the rings the attempt fired before t0, replayed through
+        // noteRingFired oldest first, so usedOrb / usedOrbOld (and the --ringonce history) hold
+        // the most recent ones as they would have had the run started at the head.
+        if (!g_spentOrb.empty()) {
+            int seeded = 0, unknown = 0;
+            for (int su : g_spentOrb) {
+                const Obj* ring = nullptr;
+                for (const Obj& o : L.orbs)
+                    if (o.uid == su) { ring = &o; break; }
+                if (!ring) { ++unknown; continue; }
+                noteRingFired(init, ring);
+                ++seeded;
+            }
+            std::printf("spentorb: %d/%zu rings pre-fired (%d not a ring in this level)\n",
+                        seeded, g_spentOrb.size(), unknown);
+        }
     }
     // A re-anchored solve starts mid-level, where the doors the earlier part of
     // the run already opened ARE open. That is not an assumption to make -- it
@@ -1587,6 +2066,7 @@ inline int cliMain(int argc, char** argv) {
     std::vector<std::pair<int, int>> payloadTouch;
     std::vector<int> payloadPortal, payloadPortal2;
     std::vector<std::pair<std::string, int>> payloadHist;
+    int histVersion = 1;
     bool havePayload = false;
     if (!g_anchorState.empty()) {
         std::vector<std::pair<std::string, std::string>> kv;
@@ -1615,11 +2095,13 @@ inline int cliMain(int argc, char** argv) {
                 const size_t b1 = v.find('|');
                 const size_t b2 = (b1 == std::string::npos) ? b1
                                                             : v.find('|', b1 + 1);
-                if (b2 == std::string::npos || v.substr(0, b1) != "1") {
+                if (b2 == std::string::npos
+                    || (v.substr(0, b1) != "1" && v.substr(0, b1) != "2")) {
                     std::printf("seed payload rejected: hist '%s' is not version "
-                                "1 (version|count|name:value,...)\n", v.c_str());
+                                "1 or 2 (version|count|name:value,...)\n", v.c_str());
                     return 2;
                 }
+                histVersion = std::atoi(v.substr(0, b1).c_str());
                 const int want = std::atoi(v.substr(b1 + 1, b2 - b1 - 1).c_str());
                 int got = 0;
                 size_t i = b2 + 1;
@@ -1632,11 +2114,14 @@ inline int cliMain(int argc, char** argv) {
                     const size_t colon = nv.find(':');
                     const std::string name = nv.substr(0, colon);
                     bool known = false;
-                    for (const char* hn : kHistNames) if (name == hn) known = true;
+                    for (const char* hn : histNamesFor(histVersion))
+                        if (hn && name == hn) known = true;
                     if (colon == std::string::npos || !known) {
                         std::printf("seed payload rejected: hist name '%s' is "
-                                    "not one this exe knows:", name.c_str());
-                        for (const char* hn : kHistNames) std::printf(" %s", hn);
+                                    "not one version %d knows:", name.c_str(),
+                                    histVersion);
+                        for (const char* hn : histNamesFor(histVersion))
+                            if (hn) std::printf(" %s", hn);
                         std::printf("\n");
                         return 2;
                     }
@@ -1686,7 +2171,8 @@ inline int cliMain(int argc, char** argv) {
         if (g_ownsHist) {
             if (!sawHistKey)
                 missing += (missing.empty() ? "" : " ") + std::string("hist");
-            for (const char* hn : kHistNames) {
+            for (const char* hn : histNamesFor(histVersion)) {
+                if (!hn) continue;
                 bool have = false;
                 for (const auto& h : payloadHist) if (h.first == hn) have = true;
                 if (sawHistKey && !have)
@@ -1773,19 +2259,28 @@ inline int cliMain(int argc, char** argv) {
         int set = 0, unmapped = 0;
         for (int half = 0; half < 2; ++half) {
             const std::vector<int>& ids = half ? payloadPortal2 : payloadPortal;
-            uint32_t& mask = half ? init.portalLatch2 : init.portalLatch;
+            GravLatch& mask = half ? init.portalLatch2 : init.portalLatch;
             for (int uid : ids) {
                 int bit = -1;
+                double px = 0.0;
                 for (const Obj& p : L.portals)
-                    if (p.uid == uid && p.gpBit >= 0) { bit = p.gpBit; break; }
+                    if (p.uid == uid && p.gpBit >= 0) { bit = p.gpBit; px = p.cx; break; }
                 if (bit < 0) { ++unmapped; continue; }
-                mask |= touchBit(bit);
+                // a shared bit already handed on past this portal belongs to the later one
+                bool handedOn = false;
+                for (const GpHandoff& h : g_gpHandoff)
+                    handedOn = handedOn || (h.bit == bit && px < h.x && (double)init.xAbs >= h.x);
+                if (handedOn) continue;
+                // (this said `mask |= touchBit(bit)` -- the touch mask's helper on
+                // the portal latch, which only agreed while both were 32 wide)
+                mask.set(bit);
                 ++set;
             }
         }
-        std::printf("seed payload: %d gravity portals spent (0x%x/0x%x), %d "
+        std::printf("seed payload: %d gravity portals spent (%s/%s), %d "
                     "named but not a gravity portal in this level\n",
-                    set, init.portalLatch, init.portalLatch2, unmapped);
+                    set, gravLatchHex(init.portalLatch).c_str(),
+                    gravLatchHex(init.portalLatch2).c_str(), unmapped);
         std::printf("seed: portal=payload\n");
     }
     // owns=hist: the per-body history values --start does not carry.
@@ -1794,10 +2289,23 @@ inline int cliMain(int argc, char** argv) {
             if (h.first == "pressSpent") init.pressSpent = (uint8_t)(h.second != 0);
             else if (h.first == "pressSpent2")
                 init.pressSpent2 = (uint8_t)(h.second != 0);
+            else if (h.first == "freeMode" && g_freeModeCol)
+                init.bandBranch = (uint8_t)((init.bandBranch & ~kBandFree)
+                                            | kBandFreeKnown
+                                            | (h.second != 0 ? kBandFree : 0));
         }
-        std::printf("seed: hist=payload pressSpent=%d pressSpent2=%d\n",
-                    (int)init.pressSpent, (int)init.pressSpent2);
+        std::printf("seed: hist=payload v%d pressSpent=%d pressSpent2=%d "
+                    "freeMode=%s\n", histVersion, (int)init.pressSpent,
+                    (int)init.pressSpent2,
+                    !(init.bandBranch & kBandFreeKnown) ? "unknown"
+                    : (init.bandBranch & kBandFree) ? "1" : "0");
     }
+    // ...and at the level's own start the byte is known: resetLevel leaves
+    // [layer+0x311] clear and only a mode portal writes it. Known only when the
+    // objrects dump says which portals are Free Mode -- without that column no
+    // portal could keep it up to date, so it stays unknown and the band keeps
+    // the old grid test (bandIsWall).
+    if (t0 <= 0 && g_freeModeCol) init.bandBranch |= kBandFreeKnown;
     // The recording-derived seeding still runs even when a payload owns
     // `touch`, because it also seeds the LOCK -- a subsystem no payload claims
     // today. What ownership changes is only whether the trig/fireB branches
@@ -2102,11 +2610,11 @@ inline int cliMain(int argc, char** argv) {
         if (init.trig)
             std::printf("triggers: anchor starts with mask 0x%llx (already open "
                         "in the recording)\n",
-                        (unsigned long long)init.trig);
+                        (unsigned long long)init.trig.word(0));
         if (g_recPhase)
             std::printf("triggers: mask 0x%llx was still MOVING at the anchor -- "
                         "replayed from the recording's own phase\n",
-                        (unsigned long long)g_recPhase);
+                        (unsigned long long)g_recPhase.word(0));
     }
     // Autonomous triggers behind the anchor fired before the sim begins; their
     // first-motion tick is already in the recording (recFire of the objects
@@ -2125,7 +2633,23 @@ inline int cliMain(int argc, char** argv) {
                 ++si;
             }
         }
-        int behind = 0, fromX = 0;
+        // A level that can turn the player round (property 117 on a ring or a
+        // pad, Obj::rev) breaks what est below assumes -- that x advanced
+        // monotonically from the crossing to the anchor -- so est cannot vet
+        // the recording there. What stays true is that a recorded tick at or
+        // before the anchor lies in the prefix this anchor shares with the
+        // recorded run, whichever side of x0 the trigger sits on: 4002 anchored
+        // at t=20,861 with the player running back through x=31,874 had
+        // uid17712 (cx=30,975) recorded at 19,999 and estimated at 20,304, and
+        // the 305-tick shift held the drop of group 87 back until the model's
+        // platform crushed the player.
+        bool canReverse = false;
+        for (const std::vector<Obj>* v : {&L.orbs, &L.pads, &L.dyn.objs})
+            for (const Obj& o : *v) canReverse = canReverse || o.rev != 0;
+        const auto sharedPast = [&](int rf) {
+            return canReverse && rf >= 0 && (long long)rf <= (long long)t0;
+        };
+        int behind = 0, fromX = 0, fromRec = 0;
         for (size_t b = 0; b < g_autoTrig.size(); ++b) {
             AutoTrig& A = g_autoTrig[b];
             // recFire is the first ROW, which is 1-2 ticks after the move really
@@ -2150,12 +2674,64 @@ inline int cliMain(int argc, char** argv) {
             // a 2900 (quick_regress.rot_anchor_args), so lv1-21 are
             // bit-identical.
             if (A.cx > x0) {
-                if (g_trigRaw && rf >= 0) {
+                if ((g_trigRaw || sharedPast(rf)) && rf >= 0) {
                     A.fireT = rf;
                     A.fireX = A.lockLastX = A.cx;
                     if (g_dynDbg >= 0)
                         std::printf("anchortrig(ahead) uid=%d cx=%.1f rf=%d "
                                     "-> fireT=%d\n", A.uid, A.cx, rf, A.fireT);
+                    continue;
+                }
+                // ...and `rf` only looks at the objects ANCHORED on this
+                // trigger. An object driven by several controllers is anchored
+                // on one of them, so a trigger that is only ever a PART of such
+                // a superposition has no recorded tick at all and stays
+                // unresolved -- and the superposition adds an unresolved part as
+                // zero. SubZero 4002: the drop of group 87 (uid18255 at
+                // x=31,899, (0,-600), duration 0) is a part of the saw uid16730,
+                // whose anchor is another trigger; anchored past it in the
+                // reversed section, the model kept that saw 600 px up and walked
+                // through the kill GD makes at t=22,893.
+                // The recording settles it: when an object's own rows show THIS
+                // part's displacement already applied before the anchor, the row
+                // that first shows it is the tick. Only for a single-part object
+                // -- with two parts the rows are a sum and cannot be attributed.
+                // ...and only for a move of DURATION 0. The row this looks for
+                // is the one where the recording has reached the part's FULL
+                // offset, which for a move that takes time is the tick it
+                // ENDS: handing that tick to the closed form would replay the
+                // whole ease from there and run the move late by its own
+                // duration. An instant move begins and ends
+                // on the same tick, so there the row is the answer.
+                if (canReverse && A.fireT < 0) {
+                    for (size_t i = 0; i < L.dyn.objs.size(); ++i) {
+                        if (L.dyn.autoParts[i].size() != 1
+                            || L.dyn.autoParts[i][0].trig != (int)b
+                            || L.dyn.autoParts[i][0].dur > 0.0
+                            || L.dyn.samples[i].size() < 2)
+                            continue;
+                        const Dynamics::AutoPart& p = L.dyn.autoParts[i][0];
+                        const std::vector<DynSample>& sm = L.dyn.samples[i];
+                        const double bx = sm[0].cx, by = sm[0].cy;
+                        for (const DynSample& s : sm) {
+                            if ((long long)s.t > t0) break;
+                            if (std::fabs((s.cx - bx) - p.dx) > 1.0
+                                || std::fabs((s.cy - by) - p.dy) > 1.0)
+                                continue;
+                            A.fireT = s.t;
+                            A.fireX = A.lockLastX = A.cx;
+                            ++fromRec;
+                            // one line per resolution, always: the count alone
+                            // cannot say which trigger took which object's word
+                            std::printf("anchortrig: ahead trigger uid=%d cx=%.1f "
+                                        "was unresolved -> fireT=%d from uid%d's "
+                                        "recording (dur=%.2f d=(%.1f,%.1f))\n",
+                                        A.uid, A.cx, A.fireT, L.dyn.objs[i].uid,
+                                        p.dur, (double)p.dx, (double)p.dy);
+                            break;
+                        }
+                        if (A.fireT >= 0) break;
+                    }
                 }
                 continue;
             }
@@ -2198,7 +2774,7 @@ inline int cliMain(int argc, char** argv) {
             // --trigraw removes this gate and always trusts the recording
             // (history at g_trigRaw's declaration: est assumes x advances
             // monotonically and lies behind a rotation maze).
-            if (rf >= 0 && (g_trigRaw
+            if (rf >= 0 && (g_trigRaw || sharedPast(rf)
                             || std::llabs((long long)rf - (long long)estT) <= 60)) {
                 A.fireT = rf;
             } else {
@@ -2241,9 +2817,10 @@ inline int cliMain(int argc, char** argv) {
                             A.uid, A.cx, rf, estT, A.fireT, x0, dxA, (long long)t0);
             ++behind;
         }
-        if (behind)
+        if (behind || fromRec)
             std::printf("autotrig: %d behind the anchor (%d re-dated from x, "
-                        "the recording disagreed by >60 ticks)\n", behind, fromX);
+                        "the recording disagreed by >60 ticks); %d ahead of it "
+                        "resolved from a recording\n", behind, fromX, fromRec);
     }
     // --dyndbg <uid>: everything that decides where one moving object is placed.
     // Added 2026-08-09 chasing lv20's x=28,867 wall, where the model killed on
@@ -2264,7 +2841,7 @@ inline int cliMain(int argc, char** argv) {
                         "true %d; autoLag %d)  autoAnchor=%d autoD=(%.1f,%.1f) "
                         "autoDur=%.2f ease=%d/%.2f\n",
                         (int)L.dyn.autoClosed[i],
-                        (unsigned long long)L.dyn.trigMask[i],
+                        (unsigned long long)L.dyn.trigMask[i].word(0),
                         L.dyn.trigRecFire[i], L.dyn.recLag[i],
                         L.dyn.trigRecFire[i] >= 0
                             ? L.dyn.trigRecFire[i] - L.dyn.recLag[i] : -1,
@@ -2296,7 +2873,7 @@ inline int cliMain(int argc, char** argv) {
                 // Reported either way so the driver can tell a blocked anchor
                 // from a physics wall; only --needtrig-skip drops it.
                 const bool passed = g_touch[b].cx + g_touch[b].hw + 40.0 < x0;
-                const bool skip = (g_needSkip & touchBit(b)) != 0;
+                const bool skip = (g_needSkip & touchBit(b)).any();
                 std::printf("needtrig: box=%zu cx=%.0f cy=%.0f hw=%.0f "
                             "passed=%d skipped=%d\n",
                             b, g_touch[b].cx, g_touch[b].cy, g_touch[b].hw,
@@ -2308,6 +2885,31 @@ inline int cliMain(int argc, char** argv) {
                 if (passed) g_outcome.needTrigPassed |= touchBit(b);
             }
         }
+    }
+    // --needtrig-uid: the same requirement, the box named by its trigger's uid (this call's bit
+    // numbering is its own window's). A box the anchor has already passed, or one outside the
+    // window, is not required -- said so, never silently.
+    for (const int u : g_needTrigUids) {
+        int bit = -1;
+        for (size_t b = 0; b < g_touch.size() && b < (size_t)kTouchBits; ++b)
+            if (g_touch[b].uid == u) { bit = (int)b; break; }
+        if (bit < 0) {
+            std::printf("needtrig-uid: uid %d is not a box of this call's window - not required\n", u);
+            continue;
+        }
+        const TouchTrig& T = g_touch[(size_t)bit];
+        if (init.trig & touchBit(bit)) {
+            std::printf("needtrig-uid: uid %d (box %d) is already entered at the anchor\n", u, bit);
+            continue;
+        }
+        if (T.cx + T.hw + 40.0 < x0) {
+            std::printf("needtrig-uid: uid %d (box %d, cx=%.0f) is behind the anchor x=%.0f - not "
+                        "required\n", u, bit, T.cx, x0);
+            continue;
+        }
+        g_needTrig |= touchBit(bit);
+        std::printf("needtrig-uid: uid %d = box %d cx=%.0f cy=%.0f hw=%.0f - required\n", u, bit,
+                    T.cx, T.cy, T.hw);
     }
     // After the level, because the queue joins to g_rotTrig by uid. Defaulted
     // from the objrects path the same way levelsettings is, so the harnesses do
@@ -2364,7 +2966,7 @@ inline int cliMain(int argc, char** argv) {
             for (size_t b = 0; b < g_touch.size() && b < (size_t)kTouchBits; ++b) {
                 if (g_touch[b].togOn != want) continue;
                 for (const TrigCtl& ct : g_touch[b].ctl)
-                    if (ct.uid == uid) { m |= touchBit(b); break; }
+                    if (ct.uid == uid) { m |= (uint32_t)touchBit((int)b).word(0); break; }
             }
             return m;
         };
@@ -2588,6 +3190,7 @@ inline int cliMain(int argc, char** argv) {
     if (init.onSlope) init.rideLanded = 1;
     if (init.dual && init.onSlope2) init.rideLanded2 = 1;
     const double goalX = L.maxX + 60.0;
+    g_goalX = goalX;   // --goalspare (speed.hpp)
     // ---- --coins: route through the level's coins as well as to its end -----
     //
     // Two things and no more. A coin is COLLECTED when the player's own rect
@@ -2618,6 +3221,19 @@ inline int cliMain(int argc, char** argv) {
         }
     }
     const bool coinOn = coinAll != 0 && L.coins.size() <= 8;
+    // --coinpick (g_coinPick): the state a cut or a PARTIAL emits -- the first one holding the most
+    // coins. Without the flag, or without --coins, it is front() exactly as before.
+    auto pickOf = [coinOn](const std::vector<State>& v) -> const State& {
+        size_t best = 0;
+        if (g_coinPick && coinOn) {
+            int most = -1;
+            for (size_t i = 0; i < v.size(); ++i) {
+                const int c = popCount32((uint32_t)v[i].coins);
+                if (c > most) { most = c; best = i; }
+            }
+        }
+        return v[best];
+    };
     // ---- WHAT A COIN NEEDS COUNTED BEFORE IT CAN BE HAD --------------------
     // Four of the corpus' coins sit behind a counter, and the search had no
     // reason to feed one: the only signal was the miss prune, which fires at
@@ -2711,7 +3327,10 @@ inline int cliMain(int argc, char** argv) {
     //
     // The line below prints what the model derives, so any level can be put
     // beside its `itemcnt:` the same way. On lv22 nine boxes feed item 2, 13 in
-    // total, against a gate of 5.
+    // total, against a gate of 5. Under --itemsnoblock five boxes, 5 in total: the
+    // other eight were the Collision Block uid 18154 on the ceiling every one of
+    // those chains moves (g_itemsNoBlock) -- and GD's counter, taken on a pass
+    // rather than a drop, agrees with the five.
     std::unordered_map<int, TouchMask> itemBits;   // item -> bits that give it
     std::vector<std::vector<std::pair<int, int>>> bitItemGive(g_touch.size());
     // ---- A TAP THAT COUNTS PRESSES -----------------------------------------
@@ -2730,6 +3349,9 @@ inline int cliMain(int argc, char** argv) {
         // sits on and its world point.
         int armChan = 0, closeChan = 0;
         double armY = 0.0, closeY = 0.0;
+        // --spawnroots: a Tap a box spawns opens when that box fires (not at armX), and one
+        // with no Stop past it stays open (closeX stays at 1e18).
+        TouchMask armBy{};
     };
     TapGive tapGive;   // bit 0 = none
     if (coinOn && !g_itemGiver.empty()) {
@@ -2754,9 +3376,11 @@ inline int cliMain(int argc, char** argv) {
                     if (p.first == gi->second) { ++p.second; seen = true; break; }
                 if (!seen) v.push_back({gi->second, 1});
             }
-            if (g_touch[b].tap && g_touch[b].tapCloseX < 1e17 && v.size() == 1) {
+            if (g_touch[b].tap && v.size() == 1
+                && (g_touch[b].tapCloseX < 1e17 || (g_spawnRoots && g_touch[b].armBy))) {
                 if (!tapGive.bit) {
                     tapGive.bit = touchBit((int)b);
+                    tapGive.armBy = g_touch[b].armBy;
                     tapGive.item = v[0].first;
                     tapGive.per = v[0].second;
                     tapGive.armX = g_touch[b].cx;
@@ -2809,8 +3433,8 @@ inline int cliMain(int argc, char** argv) {
     // six times, so they hold the third coin off for every state. The chain
     // is read as switching the coin ON; lv22's reaches it through Toggle
     // uid17968 (activate 1), and no corpus gate reaches a coin any other way.
-    TouchMask tapGateBits = 0;
-    std::vector<TouchMask> coinEnable(L.coins.size(), 0);
+    TouchMask tapGateBits{};
+    std::vector<TouchMask> coinEnable(L.coins.size(), TouchMask{});
     if (coinOn)
         for (size_t b = 0; b < g_touch.size() && b < (size_t)kTouchBits; ++b) {
             const TouchTrig& T = g_touch[b];
@@ -2823,6 +3447,38 @@ inline int cliMain(int argc, char** argv) {
                         std::printf("coins: coin %zu is switched on by Item Compare uid %d"
                                     " (item %d at least %d)\n",
                                     ci, T.uid, T.item, T.count);
+                    }
+        }
+    // ...and a coin a Toggle inside a touch box's chain switches on
+    // (TouchTrig::togOnUids). The same shape and the same reason as the gate
+    // above: without it the coin's on/off is whatever the RECORDING holds, and a
+    // recording of a run that never entered the box holds it off for every
+    // state -- so the model could not collect it from any branch. SubZero 4002's
+    // first coin: the Spawn uid 500 at (1661,263) is touched, spawns group 679,
+    // and its Toggle uid 505 switches the coin's group 678 on. Measured in the
+    // game by teleporting onto each coin: the first (group off) awards nothing,
+    // the second (group on) awards on contact.
+    //
+    // NOT for a Tap or a Count root: there the COUNTER decides, and the box's
+    // own bit is set by the first press. lv22's third coin is reached by a
+    // Toggle in the tap box uid 17958's chain and needs six presses, so reading
+    // the Toggle there would switch it on five presses early -- the same trap
+    // the walk already avoids by treating an Item Compare as a root of its own.
+    // ...EXCEPT a Count a box spawns (--spawnroots, TouchTrig::armBy): its bit is set only
+    // when its counter condition holds (itemGates), so the Toggle in its chain is exactly
+    // when the coin comes on. SubZero 4003's third coin: box 6102 spawns the Count
+    // `item 1 == 4`, whose Toggle switches the coin on.
+    if (coinOn)
+        for (size_t b = 0; b < g_touch.size() && b < (size_t)kTouchBits; ++b) {
+            if (g_touch[b].tap) continue;
+            if (g_touch[b].count >= 0 && !(g_spawnRoots && g_touch[b].armBy)) continue;
+            for (const int u : g_touch[b].togOnUids)
+                for (size_t ci = 0; ci < L.coins.size(); ++ci)
+                    if (L.coins[ci].uid == u
+                        && !(coinEnable[ci] & touchBit((int)b))) {
+                        coinEnable[ci] |= touchBit((int)b);
+                        std::printf("coins: coin %zu is switched on by the Toggle in"
+                                    " touch box uid %d's chain\n", ci, g_touch[b].uid);
                     }
         }
     // ...and which of those coins can be collected in a TURNED frame too. The
@@ -2854,7 +3510,7 @@ inline int cliMain(int argc, char** argv) {
     bool haveCmpGate = false;
     for (const TouchTrig& T : g_touch)
         if (T.count >= 0 && T.cmode == 3) haveCmpGate = true;
-    bool tapSole = tapGive.bit != 0 && !itemBits.count(tapGive.item);
+    bool tapSole = tapGive.bit.any() && !itemBits.count(tapGive.item);
     for (const auto& col : g_collect)
         if (col.item == tapGive.item) tapSole = false;
     // ---- WHEN THE COUNTING TAP'S WINDOW IS OPEN, IN GD'S TERMS -------------
@@ -2943,6 +3599,202 @@ inline int cliMain(int argc, char** argv) {
                 return true;
         return false;
     };
+    // ---- THE ITEM GATES: one function for the search AND the walks ---------
+    // The pickups, the Count triggers they and the fired chains feed, the Tap
+    // triggers and the counting tap: every bit that the item counter or a press
+    // sets, rather than the player's box entering one. markTouched (step.hpp)
+    // skips all of them, and until this was a function only the search's step ran
+    // this code, so a walk of the same plan (--replay, the witness resim) never
+    // fired a Count gate. On lv22 the search planned under a ceiling `item 2 == 5`
+    // had lifted while its own resim walked under the unlifted one (ledger
+    // 2026-09-24 02:51). The search calls it where the code used to be; the walks
+    // call it under --walkgates (g_walkGates).
+    // `ks`: the state after the step and any rotation. `prevAction`: the input
+    // the tick started with (a Tap fires on the press EDGE). `gframe`: the frame
+    // the step started in; px/py/ph: the travel coordinates and hazard half in
+    // it; `t`: the step's tick.
+    auto itemGates = [&](State& ks, uint8_t prevAction, int input, const StepCtx& K,
+                         int gframe, double px, double py, double ph, long long t) {
+        // Frame 0 only, as everything here was before the coin collect learnt
+        // the turned frames: the pickups are world rows, and the counters are
+        // asked where they always were. The exception is an Item Compare gate
+        // (cmode 3): it reads a count and nothing else, and lv22's third coin is
+        // collected in frame 3, where an anchored call has to open it from GD's
+        // own counter (--itembase) or never see the coin at all.
+        if ((gframe == 0
+             && (!g_collect.empty() || !itemBits.empty() || tapGive.bit))
+            || (gframe != 0 && haveCmpGate)) {
+            for (size_t ii = 0; gframe == 0 && ii < g_collect.size() && ii < 16; ++ii) {
+                const uint16_t ibit = (uint16_t)(1u << ii);
+                if (ks.items & ibit) continue;
+                const Collectible& C = g_collect[ii];
+                if (std::fabs(px - C.cx) <= C.hw + ph - kCoinMargin
+                    && std::fabs(py - C.cy) <= C.hh + ph - kCoinMargin) {
+                    // --coindbg: and the same line for the pickups. GD prints
+                    // `itemcnt:` per increment, so a replay of one plan through
+                    // both sides says whether the two take the SAME ones --
+                    // which is what an --itembase of 1 against a model that
+                    // needs ten turns on.
+                    if (g_coinDbgT >= 0 && !g_itemSaid[ii]) {
+                        g_itemSaid[ii] = 1;
+                        std::printf("itemcollect: t=%lld item=%d uid=%d"
+                                    " player=(%.3f,%.3f) obj=(%.3f,%.3f)"
+                                    " |dx|=%.3f |dy|=%.3f bound=(%.3f,%.3f)"
+                                    " mode=%d mini=%d\n",
+                                    (long long)t, C.item, C.uid, px, py,
+                                    C.cx, C.cy, std::fabs(px - C.cx),
+                                    std::fabs(py - C.cy),
+                                    C.hw + ph - kCoinMargin,
+                                    C.hh + ph - kCoinMargin,
+                                    (int)ks.mode, (int)ks.mini);
+                    }
+                    ks.items |= ibit;
+                }
+            }
+            if (K.trigs)
+                for (const auto& tb : *K.trigs) {
+                    const TouchTrig* T = tb.first;
+                    if (T->count < 0 || (ks.trig & tb.second)) continue;
+                    if (T->tap) continue;   // fired below, by the press
+                    // --spawnroots: a Count a box spawns listens only once that box fired.
+                    if (T->armBy && !(ks.trig & T->armBy)) continue;
+                    if (gframe != 0 && T->cmode != 3) continue;
+                    int n = 0;
+                    for (const auto& ib : g_itemBase)
+                        if (ib.first == T->item) n += ib.second;
+                    const int nBase = n;   // before anything this run gave
+                    for (size_t ii = 0; ii < g_collect.size() && ii < 16; ++ii)
+                        if ((ks.items & (uint16_t)(1u << ii))
+                            && g_collect[ii].item == T->item)
+                            ++n;
+                    // ...and what the boxes this state has already fired gave.
+                    // Without this lv22's `item 2 == 5` is unreachable: none of
+                    // its givers is a pickup.
+                    n += chainItems(ks.trig, T->item);
+                    // ...and the counting tap's presses (tapGive).
+                    if (tapGive.bit && T->item == tapGive.item)
+                        n += (int)(ks.taps & 0x3f) * tapGive.per;
+                    // GD's own order: 0 equals, 1 larger, 2 smaller. Measured on
+                    // lv21, where the third coin's gate is a pair -- uid21783
+                    // "item 1 SMALLER than 10" drops the coin out of reach,
+                    // uid21781 "EQUALS 10" keeps it -- which is what "collect
+                    // ten and it appears" is made of.
+                    // EQUALS IS "THE COUNTER PASSED THROUGH C", not "it is C on
+                    // this tick". Every increment the model counts is a single +1
+                    // in the game -- a pickup, or one Pickup trigger firing -- so
+                    // the game's counter visits every integer on the way up, and
+                    // an equals gate fires on the visit. The model sums a box's
+                    // whole weight on the tick the box fires, so it can skip:
+                    // lv22's four yellow blocks weighed 2 each and the count went
+                    // 2,4,6,8,9 where the game's goes 1,2,3,4,5. (The second of
+                    // those two was a Collision Block's block ID -- --itemsnoblock,
+                    // g_itemsNoBlock -- and the "second increment 25 ticks later"
+                    // it was taken for is the next box (measured 2026-09-24).)
+                    // With the old `n == C` the gate `item 2 == 5` could never
+                    // fire even with every feeder forced.
+                    //
+                    // So with unit steps from nBase, `n == C` happens at some tick
+                    // iff nBase <= C <= n. Where increments really do land one per
+                    // tick (lv21's eleven pickups, collected one at a time) this
+                    // fires on the same tick as before; it only differs where the
+                    // old test stepped over C.
+                    // cmode 3 is an Item Compare's "at least", asked on every
+                    // press, so it simply reads the count.
+                    const bool hit = T->cmode == 3 ? (n >= T->count)
+                                   : T->cmode == 1 ? (n > T->count)
+                                   : T->cmode == 2 ? (n < T->count)
+                                   : (nBase <= T->count && T->count <= n);
+                    // --coindbg: the gate itself, once per distinct n, so "the
+                    // coin never moved" can be split into "the gate was never
+                    // asked" and "it was asked and said no". Without this the
+                    // only witness is the coin's live row, which cannot tell the
+                    // two apart.
+                    if (g_coinDbgT >= 0 && T->count >= 0 && !T->tap) {
+                        const int bi = touchBitIndex(tb.second);
+                        const int key = std::min(n, 60) + 1;
+                        if (bi >= 0 && bi < kTouchBits
+                            && g_countSaid[bi].load() < key) {
+                            g_countSaid[bi].store(key);
+                            std::printf("countgate: t=%lld bit=%d uid=%d id=%d "
+                                        "item=%d cmode=%d need=%d n=%d base=%d "
+                                        "px=%.1f hit=%d\n",
+                                        (long long)t, bi, T->uid, T->id,
+                                        T->item, T->cmode, T->count, n, nBase,
+                                        px, hit ? 1 : 0);
+                        }
+                    }
+                    if (!hit) continue;
+                    // An INSTANT Count (1811) asks the question once, as the
+                    // player crosses it; a Count (1611) is a standing listener.
+                    // Without the crossing test the smaller-than ones fire at t=0
+                    // for every state (0 < 10 is true from the start) and lv21's
+                    // coin drops before the level has begun.
+                    if (T->id == 1811 && px < T->cx) continue;
+                    ks.trig |= tb.second;
+                    ks.trigT = (int32_t)t;
+                    const int b = touchBitIndex(tb.second);
+                    if (g_touchFireT[b] < 0) g_touchFireT[b] = (int)t;
+                    ks.fireB[b] = (uint16_t)t;
+                }
+        }
+        // ---- the TAP triggers (1595) ----------------------------------------
+        // Armed by crossing, fired by a press -- measured on the rig
+        // calib_coingate5: a tap before the trigger's x does nothing, a tap past
+        // it switches its target group. The press EDGE is what GD sees, so a
+        // state already holding the button does not fire one by continuing to
+        // hold.
+        if (K.trigs && input && !prevAction && gframe == 0)
+            for (const auto& tb : *K.trigs) {
+                const TouchTrig* T = tb.first;
+                if (!T->tap || (ks.trig & tb.second)) continue;
+                // --spawnroots: a Tap a box spawns is armed by that box, not by its x.
+                if (T->armBy ? !(ks.trig & T->armBy) : (px <= T->cx)) continue;
+                ks.trig |= tb.second;
+                ks.trigT = (int32_t)t;
+                const int b = touchBitIndex(tb.second);
+                if (g_touchFireT[b] < 0) g_touchFireT[b] = (int)t;
+                ks.fireB[b] = (uint16_t)t;
+            }
+        // ...and the COUNTING tap (tapGive): every press edge while its window is
+        // open adds one. State::taps holds the count in its low six bits, 0x80
+        // once the window has opened and 0x40 once it has shut (see passedOn for
+        // both ends). Read from tapGive rather than K.trigs, which drops a box
+        // 40 px behind the player. The count is dropped once it cannot matter
+        // (window shut, or a gate on its item already fired), so it splits the
+        // key only inside the window. Any frame: lv22's window opens travelling
+        // -x.
+        if (tapGive.bit) {
+            if (ks.trig & tapGateBits) {
+                ks.taps = 0;
+            } else {
+                double wx = 0.0, wy = 0.0;
+                fromFrame(gframe, (double)ks.xAbs, (double)ks.y, wx, wy);
+                uint8_t tp = ks.taps;
+                const bool armed =
+                    (tp & 0x80) != 0
+                    || (tapGive.armBy ? (bool)(ks.trig & tapGive.armBy)
+                                      : passedOn(ks, gframe, tapGive.armChan, wx, wy,
+                                                 tapGive.armX, tapGive.armY));
+                // A tap a box arms (--spawnroots) closes where the player passes the Stop
+                // in the frame it is travelling -- not through passedOn's rotation queue,
+                // which reads a queue entry spent EARLIER in the run past the Stop's x as
+                // "passed" and shut SubZero 4003's window the tick it opened.
+                const bool shut =
+                    (tp & 0x40) != 0
+                    || (armed && tapGive.closeX < 1e17
+                        && (tapGive.armBy ? (gframe == 0 && wx > tapGive.closeX)
+                                          : passedOn(ks, gframe, tapGive.closeChan, wx, wy,
+                                                     tapGive.closeX, tapGive.closeY)));
+                if (shut) {
+                    tp = 0x40;
+                } else if (armed) {
+                    tp |= 0x80;
+                    if (input && !prevAction && (tp & 0x3f) < 0x3f) ++tp;
+                }
+                ks.taps = tp;
+            }
+        }
+    };
     // ---- CAN "THE PLAYER IS PAST IT" BE FINAL FOR THIS COIN? ---------------
     // Both prunes below -- the switch-on gate and the miss test -- say "behind
     // the player, so gone". That rests on the player never coming back, which
@@ -2973,10 +3825,32 @@ inline int cliMain(int argc, char** argv) {
     //   c1 (3,919)   smallest later return 6,875    prunable
     //   c2 (10,513)  smallest later return 15,015   prunable
     //   c3 (16,097)  smallest later return 15,015   NOT prunable
+    // ...and a ROTATION is not the only way back. A ring or a pad carrying
+    // property 117 (Obj::rev) turns the player round, so a coin with one of
+    // those anywhere past it can still be taken on the way back, and "passing
+    // it is final" is simply false. SubZero 4002: the first coin sits at
+    // x=1,787 with reversing rings later in the level, and with the prune on
+    // every branch that ran past it died -- the coin run gave up at x=1,911
+    // (5%) while the same level clears without coins.
+    const auto revPast = [&](double cx) {
+        for (const std::vector<Obj>* v : {&L.orbs, &L.pads, &L.dyn.objs})
+            for (const Obj& o : *v)
+                if (o.rev != 0 && o.cx > cx) return true;
+        return false;
+    };
     std::vector<uint8_t> coinPruneOk(L.coins.size(), 0);
     if (coinOn) {
         for (size_t ci = 0; ci < L.coins.size(); ++ci) {
             const double past = L.coins[ci].cx + L.coins[ci].hw + 40.0;
+            if (revPast(L.coins[ci].cx)) {
+                std::printf("coins: coin %zu at x=%.0f -- something past it turns "
+                            "the player round, so passing it says nothing (no "
+                            "miss prune)\n", ci, L.coins[ci].cx);
+                // ...and the mod is told, so its own attempt cut agrees (Outcome).
+                g_outcome.coinNoPrune += (g_outcome.coinNoPrune.empty() ? "" : ";")
+                                         + std::to_string(L.coins[ci].uid);
+                continue;
+            }
             if (g_rotTrig.empty()) { coinPruneOk[ci] = 1; continue; }
             size_t idx = g_rotTrig.size();
             for (size_t j = 0; j < g_rotTrig.size(); ++j)
@@ -2986,6 +3860,9 @@ inline int cliMain(int argc, char** argv) {
                 if (g_rotTrig[j].frame == 0)
                     minRe = std::min(minRe, g_rotTrig[j].cx);
             coinPruneOk[ci] = (minRe > past) ? (uint8_t)1 : (uint8_t)0;
+            if (!coinPruneOk[ci])
+                g_outcome.coinNoPrune += (g_outcome.coinNoPrune.empty() ? "" : ";")
+                                         + std::to_string(L.coins[ci].uid);
             if (!g_rotTrig.empty())
                 std::printf("coins: coin %zu at x=%.0f -- the frame returns to 0"
                             " next at x=%.0f, %s\n", ci, L.coins[ci].cx,
@@ -3308,11 +4185,22 @@ inline int cliMain(int argc, char** argv) {
     std::vector<Child> kids;      // reused every layer
     std::vector<ClearSample> clearKids;   // --clearprobe only, reused too
     std::vector<size_t> gidx;     // this speed group's indices into `cur`
+    SlopeVetoIndex vetoIdx;       // rebuilt per group, storage reused
     // Below this many children the pool's wakeup costs more than the work.
     // A thin frontier is cheap anyway; the layers that matter run at the cap.
     const size_t kParallelMin = 256;
     std::unique_ptr<ThreadPool> pool;
     if (g_threads > 1) pool.reset(new ThreadPool(g_threads - 1));  // + this one
+    // ...lent to the moving geometry's per-object loops (g_dynParTasks) for as
+    // long as it exists. The guard is declared after the pool, so it takes the
+    // loan back before the pool goes away -- including on every early return.
+    struct DynParLoan {
+        ~DynParLoan() { g_dynParTasks = nullptr; }
+    } dynParLoan;
+    if (pool)
+        g_dynParTasks = [&pool](size_t n, const std::function<void(size_t)>& task) {
+            pool->parallelTasks(n, task);
+        };
     long long bestT = 0;
     double bestX = 0;
     State goalState{};
@@ -3323,6 +4211,12 @@ inline int cliMain(int argc, char** argv) {
     // these to skip that.
     size_t maxAlive = 0;
     long long capHits = 0, capDropped = 0;
+    // --heldcellcap: layers over the cap in states whose cells fit (kept whole), layers cut by
+    // cells, and the button twins those cuts kept beyond the cap (printed only under the flag).
+    long long cellSpared = 0, cellCuts = 0, cellTwinsKept = 0;
+    SearchCensus census;   // --searchcensus only
+    TwinStats twin;        // --twinskip / --twinaudit
+    std::vector<uint8_t> kidMoot;   // --twinaudit: per parent of the group, predicted twin
     // Seed the anchor's band by replaying every mode portal already behind x0.
     // This is the one place the x-only approximation survives -- a re-anchored
     // run does not know which lane the player took, so it takes the last portal
@@ -3450,6 +4344,7 @@ inline int cliMain(int argc, char** argv) {
     // walk, and STOPS on death instead of ignoring it (the witness resim's
     // documented flaw: it writes trace rows past rdead, and the band clamp is
     // an absorbing fixed point, so a dead lineage can look alive).
+    prepMark(4);
     if (!replayPath.empty()) {
         struct Edge { long long press; int v; };
         std::vector<Edge> edges;
@@ -3524,6 +4419,9 @@ inline int cliMain(int argc, char** argv) {
                              [](const Edge& a, const Edge& b) { return a.press < b.press; });
         }
         std::printf("REPLAY: %zu edges from %s\n", edges.size(), replayPath.c_str());
+        g_hist = HistStat{};   // --histstat: this replay's counts only
+        g_histFired.clear();
+        g_histPads.clear();
         // The plan stores PRESS ticks (effect - latency, see the emitter at the
         // bottom of main). Latency depends on the mode at the END of the press
         // tick, which a forward sim knows by the time it needs it: after
@@ -3614,7 +4512,11 @@ inline int cliMain(int argc, char** argv) {
               // that lives in p2's ride ("only p2 is off, by exactly the slope
               // exit bonus") had nothing to read. Appended at the end; existing
               // readers index the columns before this by position.
-              ",grounded2,onslope2,slopem2,slopet2,mode2,ceilt,ceilt2,mini2\n";
+              ",grounded2,onslope2,slopem2,slopet2,mode2,ceilt,ceilt2,mini2"
+              // `fxblk`: the moving object that kept a MATCHING fixup from
+              // firing on the step into this row, -1 if none (fixup.hpp,
+              // g_fxBlockedUid). The recorder's third answer.
+              ",fxblk\n";
         // Make --snaplog usable in replay too (it used to exist only on the
         // SOLVE side, so a known plan's stair snaps could never be checked
         // against GD's snaptrace).
@@ -3753,14 +4655,32 @@ inline int cliMain(int argc, char** argv) {
             seekOtherFrames(Lf, (int)t);   // --rotpretap only
             // + this tick's advance (xPrevR is tick t-1's x): see the group
             // call's note on why a lock needs the CURRENT tick.
-            Lf->dyn.applyTriggers(s.trig, (int)s.trigT, s.fireB,
+            // --fbforce <box>:<tick> (diagnostic): place this tick's geometry as if
+            // that box had fired at <tick>, when this walk has entered it. Asks
+            // whether a box's fire tick still moves an object after the box's key
+            // window (g_touchMoveTicks) has run out -- the window assumes it does
+            // not.
+            uint16_t fbForced[kTouchBits];
+            const uint16_t* fbUse = s.fireB;
+            if (g_fbForceBox >= 0 && g_fbForceBox < kTouchBits && s.trig.test(g_fbForceBox)) {
+                std::copy(s.fireB, s.fireB + kTouchBits, fbForced);
+                fbForced[g_fbForceBox] = (uint16_t)g_fbForceTick;
+                fbUse = fbForced;
+            }
+            Lf->dyn.applyTriggers(s.trig, (int)s.trigT, fbUse,
                                   s.lockOff + (float)(x - xPrevR), (int)t, x);
             std::vector<std::pair<const TouchTrig*, TouchMask>> rt;
             const std::vector<TouchTrig>& tfr = touchFor((int)s.frame);
             for (size_t b = 0; b < tfr.size(); ++b) {
                 if (s.trig & touchBit(b)) continue;
                 const TouchTrig& T = tfr[b];
-                if (T.cx + T.hw < x - 40 || T.cx - T.hw > x + 40) continue;
+                // --walkgates: a standing Count and an Item Compare stay in the list
+                // the way the search's window keeps them (its note at `standing`).
+                const bool standing = g_walkGates && (T.id == 1611 || T.id == 3620)
+                                      && T.count >= 0 && !T.tap;
+                const bool anywhere = g_walkGates && T.id == 3620 && T.count >= 0;
+                if (!anywhere && !standing && T.cx + T.hw < x - 40) continue;
+                if (!anywhere && T.cx - T.hw > x + 40) continue;
                 rt.push_back({&T, touchBit(b)});
             }
             if (g_slopeDbg && s.frame != 0) {
@@ -3789,8 +4709,11 @@ inline int cliMain(int argc, char** argv) {
             std::vector<const Obj*> rv;
             vl->forRange(x - 80, x + 80, [&](const Obj& o) { rv.push_back(&o); });
             Lf->dyn.collect(Dynamics::SPEED, x - 80, x + 80, rv);
+            std::vector<const Obj*> rnSolid;   // --solidorder: rn in GD's solid order, once per tick
+            solidOrderInto(rn, rnSolid);
             const StepCtx K{x, xPrevR, rDxUsed, t, &rn, &rp, &rd, &ro, &rs, &rv,
-                            &SP, &SPmini, &UP, &UPmini, &rt};
+                            &SP, &SPmini, &UP, &UPmini, &rt, nullptr, nullptr,
+                            &rnSolid};
             bool rdead = false;
             g_nearOrb = 0;
             g_dashVySet = 0;
@@ -3815,6 +4738,8 @@ inline int cliMain(int argc, char** argv) {
             g_deadCx = g_deadCy = 0.f;
             const bool sPrevGrounded = (s.grounded != 0);   // applyRotation's re-tap
             const double sPrevY = (double)s.y;              // ...and its pre-tap y
+            const int wgFrame = (int)s.frame;               // --walkgates (below)
+            const uint8_t wgPrev = s.action;
             State c = stepBoth(s, (uint8_t)curIn, K, rdead);
             c.action = (uint8_t)curIn;
             s = c;
@@ -3839,18 +4764,27 @@ inline int cliMain(int argc, char** argv) {
                 // and it needs the button held ACROSS the anchor tick to bite.
                 // groundUid (--stickseam) is the same kind of hole: printed, not
                 // seeded; an anchor mid-ride re-ties to the lowest-uid support.
+                // usedOrbOld too (the ring fired before usedOrb): an orb is spent by
+                // a press, and the recording cannot say which were taken -- the
+                // hole usedOrb itself has (the list at the top of this file).
                 std::printf("seed: t=%lld sizeof=%zu trig=0x%llx trigT=%d "
                             "lockOff=%.4f rotSpent=0x%x rotChan=%d "
                             "rotRev=0x%x rotStep=%.6f rotNeg=%d "
-                            "ringHold=%d pressSpent=%d portalLatch=0x%x/0x%x "
-                            "groundUid=%d taps=%d fireB=",
-                            t, sizeof(State), (unsigned long long)s.trig,
+                            "ringHold=%d pressSpent=%d portalLatch=%s/%s "
+                            "groundUid=%d usedOrbOld=%d usedOrbHist=%d|%d|%d portSeen=%d|%d|%d "
+                            "touchRing=%d|%d|%d|%d/%x taps=%d fireB=",
+                            t, sizeof(State), (unsigned long long)s.trig.word(0),
                             (int)s.trigT,
                             (double)s.lockOff, s.rotSpent, (int)s.rotChan,
                             (unsigned)s.rotRev, (double)s.rotStep,
                             (int)s.rotNeg, (int)s.ringHold,
-                            (int)s.pressSpent, s.portalLatch, s.portalLatch2,
-                            (int)s.groundUid, (int)s.taps);
+                            (int)s.pressSpent, gravLatchHex(s.portalLatch).c_str(),
+                            gravLatchHex(s.portalLatch2).c_str(),
+                            (int)s.groundUid, (int)s.usedOrbOld, (int)s.usedOrbHist[0],
+                            (int)s.usedOrbHist[1], (int)s.usedOrbHist[2], (int)s.portSeen[0],
+                            (int)s.portSeen[1], (int)s.portSeen[2], (int)s.touchRing[0],
+                            (int)s.touchRing[1], (int)s.touchRing[2], (int)s.touchRing[3],
+                            (unsigned)s.touchRingT, (int)s.taps);
                 for (int b = 0; b < kTouchBits; ++b)
                     if (s.fireB[b]) std::printf("%d:%u,", b, s.fireB[b]);
                 std::printf("\n");
@@ -3928,6 +4862,12 @@ inline int cliMain(int argc, char** argv) {
                 }
                 pendingFrame = -1;
             }
+            // --walkgates: the item gates the search's own step fires (itemGates),
+            // after the turn and only on a tick that did not turn -- the search's
+            // gate. Without it this walk never fires a Count or a Tap trigger.
+            if (g_walkGates && coinOn && !rdead && (int)s.frame == wgFrame)
+                itemGates(s, wgPrev, curIn, K, wgFrame, (double)s.xAbs, (double)s.y,
+                          hazardHalfFor(s.mode, s.mini != 0), t);
             // The trace is always WORLD coordinates -- that is what GD's dump
             // is, and a turned frame would otherwise read as a huge divergence.
             double wX, wY;
@@ -3946,7 +4886,33 @@ inline int cliMain(int argc, char** argv) {
             // Only on ticks where a dash ring engaged, emit the same vy as
             // GD's dump (history and measurements at g_dashVy's declaration).
             // The state stays 0, so the trajectory is unchanged.
-            const double vyGd = (g_dashVySet ? g_dashVy : (double)s.vy)
+            // Fly-rings (speed.hpp): GD's row already carries the ring a ship's or UFO's press fires from this
+            // state (the flag's note in speed.hpp); the step applies it on the next tick, so only
+            // the display moves. The same gate as stepOne's, with the next tick's input.
+            double rowVy = (double)s.vy;
+            int rowFlip = (int)s.flip;
+            if ((s.mode == 1 || s.mode == 3) && !s.dual && !s.jumpBuf
+                && !s.pressSpent) {
+                int nextIn = curIn;
+                for (size_t j = fxIdx; j < fx.size() && fx[j].first <= t + 1; ++j)
+                    nextIn = fx[j].second;
+                if (!g_ctrlWin.empty() && ctrlOffAt(t + 1)) nextIn = 0;
+                const float ringDx = (s.dx > 0.f) ? s.dx : K.dxF;
+                const Obj* ring = nextIn
+                    ? flyEarlyRing(s, K, (double)ringDx * timeWarpAt((double)s.xAbs)
+                                             * (s.rev ? -1.0 : 1.0))
+                    : nullptr;
+                if (ring) {
+                    State d = s;
+                    const bool hs = g_histStatOn;   // a look ahead for the row, not a fire
+                    g_histStatOn = false;
+                    applyFlyEarlyRing(d, ring, ringDx);
+                    g_histStatOn = hs;
+                    rowVy = (double)d.vy;
+                    rowFlip = (int)d.flip;
+                }
+            }
+            const double vyGd = (g_dashVySet ? g_dashVy : rowVy)
                                 * (s.frame == 3 ? -1.0 : 1.0);
             // ...and which line of step.hpp wrote this tick's vy, when asked.
             // Reported HERE rather than inside stepOne: this is the replay's own
@@ -3992,7 +4958,7 @@ inline int cliMain(int argc, char** argv) {
                << ',' << (int)g_nearOrb
                << ',' << (*g_clampWhy ? g_clampWhy : "-")
                << ',' << g_clampUid << ',' << g_clampCx << ',' << g_clampCy
-               << ',' << (int)s.flip << ',' << (int)s.frame
+               << ',' << rowFlip << ',' << (int)s.frame
                // The player's sprite rotation. THE HITBOX TEST OF A TURNED
                // OBJECT IS DECIDED BY THIS, yet until now it was not in the
                // trace, so there was no way to measure "how far is the
@@ -4004,11 +4970,18 @@ inline int cliMain(int argc, char** argv) {
                << ',' << s.slopeM2 << ',' << (int)s.slopeT2
                << ',' << (int)s.mode2 << ',' << (int)s.ceilT
                << ',' << (int)s.ceilT2 << ',' << (int)s.mini2
+               << ',' << g_fxBlockedUid
                << "\n";
             if (rdead) {
-                diedT = t;
-                diedX = (double)s.xAbs;
-                break;
+                // --replayon (diagnostic): note the first death and walk on, the
+                // way the witness resim does, so geometry after it can be read.
+                if (g_replayOn) {
+                    if (diedT < 0) { diedT = t; diedX = (double)s.xAbs; }
+                } else {
+                    diedT = t;
+                    diedX = (double)s.xAbs;
+                    break;
+                }
             }
             if ((double)s.xAbs >= goalX) break;
             while (eIdx < edges.size() && edges[eIdx].press == t) {
@@ -4017,6 +4990,19 @@ inline int cliMain(int argc, char** argv) {
             }
         }
         g_outcome.replayDiedT = diedT;
+        if (g_histStatOn) {
+            if (FILE* hf = std::fopen(g_histStatPath.c_str(), "a")) {
+                std::fprintf(hf,
+                             "histstat out=%s x=%.1f died=%lld touchMax=%d touchDrop=%d "
+                             "portMax=%d portFull=%d padMax=%d padFull=%d orbFired=%d "
+                             "orbDrop=%d orbRefire=%d padRefire=%d\n",
+                             outPath.c_str(), (double)s.xAbs, diedT, g_hist.touchMax,
+                             g_hist.touchDrop, g_hist.portMax, g_hist.portFull, g_hist.padMax,
+                             g_hist.padFull, g_hist.orbFired, g_hist.orbDrop, g_hist.orbRefire,
+                             g_hist.padRefire);
+                std::fclose(hf);
+            }
+        }
         if (diedT >= 0) {
             std::printf("REPLAY: model DIED at t=%lld x=%.1f (y=%.2f vy=%.3f "
                         "mode=%d grounded=%d dual=%d y2=%.2f vy2=%.3f held=%d)\n",
@@ -4197,7 +5183,7 @@ inline int cliMain(int argc, char** argv) {
         // a couple of px), so the windows stay as tight as the shared one was.
         // The previous scheme -- one shared accumulator, switched when ANY
         // state's y overlapped the portal -- is what put the search on
-        // displaced geometry (docs/findings.md).
+        // displaced geometry.
         // A separate `seen` per group also keeps two speeds from ever merging
         // into one cell, without putting dx in keyOf (which would repartition
         // every single-speed layer in the suite for nothing).
@@ -4436,12 +5422,18 @@ inline int cliMain(int argc, char** argv) {
             if (g_hazDbgUid >= 0)
                 for (const Obj* o : near)
                     if (o->uid == g_hazDbgUid) { seen = o; break; }
-            std::printf("trigdbg t=%lld gtrig=0x%08x gFireB=0x%08x lockOff=%.3f "
-                        "win=[%.1f,%.1f] n=%zu uid=%d %s\n",
-                        (long long)t, (unsigned)gtrig, (unsigned)gFireB,
+            // gFireB is an ARRAY: this line used to print `(unsigned)gFireB`, the low
+            // bits of its address. It prints the group's per-box ticks now (the
+            // latest over the members, which is what applyTriggers is handed).
+            std::printf("trigdbg t=%lld gtrig=0x%08x gFire=%d lockOff=%.3f "
+                        "win=[%.1f,%.1f] n=%zu uid=%d %s gFireB=",
+                        (long long)t, (unsigned)gtrig.word(0), gFire,
                         (double)(gLockOff + (float)sdx), wLo, wHi, near.size(),
                         g_hazDbgUid,
                         seen ? "" : "NOT-IN-WINDOW");
+            for (int b = 0; b < kTouchBits; ++b)
+                if (gtrig.test(b)) std::printf("%d:%u,", b, (unsigned)gFireB[b]);
+            std::printf("\n");
             if (seen)
                 std::printf("trigdbg t=%lld uid=%d at (%.3f,%.3f) hw=%.3f hh=%.3f\n",
                             (long long)t, seen->uid, seen->cx, seen->cy,
@@ -4542,9 +5534,10 @@ inline int cliMain(int argc, char** argv) {
             // where the coin is" rather than "they could".
             if (g_coinDbgT >= 0 && (long long)t == g_coinDbgT) {
                 for (const CoinLive& C : coinLive)
-                    std::printf("coindbg: t=%lld gtrig=0x%08x coin=%d live=(%.3f,%.3f)"
+                    std::printf("coindbg: t=%lld gtrig=0x%08llx coin=%d live=(%.3f,%.3f)"
                                 " box %.1fx%.1f load=(%.3f,%.3f)\n",
-                                (long long)t, gtrig, C.bit, C.cx, C.cy,
+                                (long long)t, (unsigned long long)gtrig.word(0),
+                                C.bit, C.cx, C.cy,
                                 C.hw * 2, C.hh * 2,
                                 L.coins[(size_t)C.bit].cx, L.coins[(size_t)C.bit].cy);
                 for (size_t ci = 0; ci < L.coins.size(); ++ci) {
@@ -4552,13 +5545,19 @@ inline int cliMain(int argc, char** argv) {
                     for (const CoinLive& C : coinLive)
                         if ((size_t)C.bit == ci) live = true;
                     if (!live)
-                        std::printf("coindbg: t=%lld gtrig=0x%08x coin=%zu OFF"
+                        std::printf("coindbg: t=%lld gtrig=0x%08llx coin=%zu OFF"
                                     " (its group is switched off)\n",
-                                    (long long)t, gtrig, ci);
+                                    (long long)t, (unsigned long long)gtrig.word(0), ci);
                 }
             }
         }
-        const StepCtx K{x, xPrev, dxUsed, t, &near, &ports, &pads, &orbs, &slps, &spds, &SP, &SPmini, &UP, &UPmini, &trigs, &coinLive};
+        // Which ramps can veto which solid (SlopeVetoIndex): the same for every
+        // state of the group, so worked out here once.
+        vetoIdx.build(near, slps);
+        std::vector<const Obj*> nearSolid;   // --solidorder: near in GD's solid order, once per group
+        solidOrderInto(near, nearSolid);
+        const StepCtx K{x, xPrev, dxUsed, t, &near, &ports, &pads, &orbs, &slps, &spds, &SP, &SPmini, &UP, &UPmini, &trigs, &coinLive, &vetoIdx,
+                        &nearSolid};
         ppMark(0);
         // ---- phase 1: STEP every state of this group (parallel) -------------
         // Stepping is pure -- it reads the shared windows and writes only its
@@ -4592,15 +5591,111 @@ inline int cliMain(int argc, char** argv) {
         kidFlag.assign(gidx.size() * 2, 0);
         const bool dbgHere = (dbgLayers > 0 && t - t0 <= dbgLayers);
         const bool orbsEmpty = orbs.empty();
-        auto stepKid = [&](size_t i) {
+        // --twinskip / --twinaudit (search_census.hpp): is this parent's pressed child a twin
+        // of its released one? Only the airborne ground modes, whose button does nothing in
+        // the air except through the things excluded here: something the press fires (a
+        // ring or portal close enough to matter this tick, a toggle block, a tap or
+        // the counting tap), a hold the release would change (ringHold / pressSpent /
+        // holdDead, the robot's hover, a dash), and GD's mid-air coyote jump (ogLinger).
+        // Off wherever an instrument reads the pressed child itself.
+        bool groupPressTrig = false;
+        for (const auto& tb : trigs)
+            if (tb.first->tap || tb.first->press) { groupPressTrig = true; break; }
+        // --heldall writes the button into `held` in every mode, and keyOf keys `held` in every
+        // mode, so under it the two children part in the key and the pressed one is no longer
+        // deduped away behind its released twin: it is kept, and it has to be the child stepping
+        // would have made. The fill below sets what the button wrote (held, the jump buffer) and
+        // takes the key again; --twinaudit checks that against the stepped child.
+        const bool twinOn = (g_twinSkip || g_twinAudit) && !dbgHere && !g_refWatch
+                            && !g_clearProbe && !qfHere && g_coinDbgT < 0 && !g_airPress
+                            && !g_latGap && !groupPressTrig
+                            && !(g_rotWatchLo >= 0 && t >= g_rotWatchLo && t <= g_rotWatchHi);
+        kidMoot.assign(twinOn ? gidx.size() : 0, 0);
+        auto pressMoot = [&](const State& s) -> bool {
+            if (s.dual || s.grounded || s.onSlope) return false;
+            if (s.mode != 0 && s.mode != 2 && s.mode != 5 && s.mode != 6) return false;
+            if ((int)s.frame != gframe || (int)s.rev != grev) return false;
+            if (s.ringHold || s.pressSpent || s.rHover || s.dashing || s.ogLinger || s.holdDead)
+                return false;
+            // Inside the flip grace a head-side contact seats the body (step.hpp, flipGraceSeat),
+            // and whether it does reads the press: a ball's tap after the collision pass keeps the
+            // window open, so the pair can part there. No corpus state has shown it on this path;
+            // the gravity pad below is the same window opened on the tick itself, and it has.
+            if ((int)s.flipT + 1 < kFlipGraceTicks) return false;
+            if (nearPressBox(s)) return false;
+            if (tapGive.bit && !(s.trig & tapGateBits) && !(s.taps & 0x40)) return false;
+            // A fixup record is matched per INPUT (fixup.hpp fixupMatches), so one landing on
+            // either child splits the pair -- measured in a loop call of a custom level at
+            // t=4,325, an upside-down ball whose released child took a +2.83 vy record.
+            // Any record within a few px of the parent's x rules the pair out.
+            for (const std::vector<Fixup>* fv : {&g_fixupKills, &g_fixupDeltas}) {
+                const float lo = s.xAbs - 8.f;
+                const auto it = std::lower_bound(
+                    fv->begin(), fv->end(), lo,
+                    [](const Fixup& f, float xx) { return f.x < xx; });
+                if (it != fv->end() && it->x <= s.xAbs + 8.f) return false;
+            }
+            const double px = (double)s.xAbs, py = (double)s.y;
+            const double rx = 60.0 + 2.0 * std::fabs((double)K.dxF);
+            const double ry = 60.0 + std::fabs((double)s.vy);
+            auto within = [&](const std::vector<const Obj*>& v) {
+                for (const Obj* o : v)
+                    if (std::fabs(o->cx - px) <= o->hw + rx && std::fabs(o->cy - py) <= o->hh + ry)
+                        return true;
+                return false;
+            };
+            // Rings: the contact test reads this tick's and the previous tick's position, and a
+            // rotated ring reaches 18 + 15*sqrt(2) = 39.2 px along its axis; the margin covers
+            // both. Portals: a mode portal can hand the press to the new mode on its tick
+            // (--portalpress). Pads read no input in the air, so they are not a reason.
+            // Ramps: a contact made on this tick goes through slopeNudge, which reads the
+            // input (a custom level t=15,834, an airborne cube at vy 0: released -2.000, pressed
+            // -0.216).
+            // A gravity pad (type 10) flips the body in the collision pass, which opens the flip
+            // grace above from any flipT (flipGraceSeat's age 0), so one in reach rules the pair out
+            // too. Gravity portals are among `ports` already. The twinaudit witnesses are this
+            // path: lv11 t=8,968 and lv12 t=18,838, a ball whose pressed child is seated at vy 0
+            // while the released one leaves at -3.072.
+            for (const Obj* o : pads)
+                if (o->type == 10 && std::fabs(o->cx - px) <= o->hw + rx
+                    && std::fabs(o->cy - py) <= o->hh + ry)
+                    return false;
+            return !within(orbs) && !within(ports) && !within(slps);
+        };
+        // --inputgrid / --gridmap: this layer's grid, from the leader x of the layer before it
+        // (the x --capmap reads, so a ladder window lifts both over the same stretch).
+        const int gridNow = gridAtX(bestX);
+        auto stepKidAt = [&](size_t i, bool mayTwin) {
             const State& s = cur[gidx[i >> 1]];
             const int input = (int)(i & 1);
+            // --minpulse / --inputgrid (search_census.hpp): may the button change on this tick?
+            const bool edgeLocked =
+                (g_minPulse > 1 && (int)s.edgeAge + 1 < g_minPulse)
+                || (gridNow > 1 && (K.t % gridNow) != 0);
+            if (edgeLocked && input != (int)s.action) return;
+            // ...and NOT next to a toggle block it has not fired (nearPressBox), which the
+            // button fires: SubZero 4003's uid 4001 is passed by an airborne cube, so with
+            // the pressed child pruned no state ever entered it (2026-09-24).
+            // ...and NOT under --airpress (g_airPress): a press held from the air into a
+            // landing is a different jump from one pressed on the landing tick.
+            // ...and not when the input rule has just forbidden the release: then the held child
+            // is the only one left.
             if (input == 1 && s.mode == 0 && !s.grounded && orbsEmpty
-                && !s.dashing)
+                && !s.dashing && !nearPressBox(s) && !g_airPress
+                && !(edgeLocked && s.action == 1))
                 return;
             // --latgap: no edge on a tick GD cannot put one (frames.hpp g_latGap)
             if (g_latGap && s.latLock && input != (int)s.action)
                 return;
+            // --twinskip: decided after the step pass, from the released sibling (slot i-1):
+            // copied in when that one stayed in the air, stepped for real otherwise.
+            if (input == 1 && mayTwin && twinOn && pressMoot(s)) {
+                if (!g_twinAudit) {
+                    kidFlag[i] = 3;
+                    return;
+                }
+                kidMoot[i >> 1] = 1;
+            }
             Child& kid = kids[i];
             bool dead = false;
             kid.s = stepBoth(s, input, K, dead);
@@ -4627,6 +5722,9 @@ inline int cliMain(int argc, char** argv) {
             // hashed to the same cell -- which is the whole bug the rHover
             // note in keyOf describes.
             kid.s.action = (uint8_t)input;
+            if (g_minPulse > 1)
+                kid.s.edgeAge = (input != (int)s.action)
+                                    ? 0 : (uint8_t)std::min(254, (int)s.edgeAge + 1);
             if (g_latGap) {
                 const auto lat2 = [](uint8_t m) { return m == 1 || m == 3; };
                 kid.s.latLock = (lat2(kid.s.mode) && !lat2(s.mode) && !kid.s.dual) ? 1 : 0;
@@ -4752,175 +5850,7 @@ inline int cliMain(int argc, char** argv) {
                 // count and nothing else, and lv22's third coin is collected in
                 // frame 3, where an anchored call has to open it from GD's own
                 // counter (--itembase) or never see the coin at all.
-                if ((gframe == 0
-                     && (!g_collect.empty() || !itemBits.empty() || tapGive.bit))
-                    || (gframe != 0 && haveCmpGate)) {
-                    for (size_t ii = 0; gframe == 0 && ii < g_collect.size() && ii < 16;
-                         ++ii) {
-                        const uint16_t ibit = (uint16_t)(1u << ii);
-                        if (kid.s.items & ibit) continue;
-                        const Collectible& C = g_collect[ii];
-                        if (std::fabs(px - C.cx) <= C.hw + ph - kCoinMargin
-                            && std::fabs(py - C.cy) <= C.hh + ph - kCoinMargin) {
-                            // --coindbg: and the same line for the pickups. GD
-                            // prints `itemcnt:` per increment, so a replay of
-                            // one plan through both sides says whether the two
-                            // take the SAME ones -- which is what an --itembase
-                            // of 1 against a model that needs ten turns on.
-                            if (g_coinDbgT >= 0 && !g_itemSaid[ii]) {
-                                g_itemSaid[ii] = 1;
-                                std::printf("itemcollect: t=%lld item=%d uid=%d"
-                                            " player=(%.3f,%.3f) obj=(%.3f,%.3f)"
-                                            " |dx|=%.3f |dy|=%.3f bound=(%.3f,%.3f)"
-                                            " mode=%d mini=%d\n",
-                                            (long long)t, C.item, C.uid, px, py,
-                                            C.cx, C.cy, std::fabs(px - C.cx),
-                                            std::fabs(py - C.cy),
-                                            C.hw + ph - kCoinMargin,
-                                            C.hh + ph - kCoinMargin,
-                                            (int)kid.s.mode, (int)kid.s.mini);
-                            }
-                            kid.s.items |= ibit;
-                        }
-                    }
-                    if (K.trigs)
-                        for (const auto& tb : *K.trigs) {
-                            const TouchTrig* T = tb.first;
-                            if (T->count < 0 || (kid.s.trig & tb.second)) continue;
-                            if (T->tap) continue;   // fired below, by the press
-                            if (gframe != 0 && T->cmode != 3) continue;
-                            int n = 0;
-                            for (const auto& ib : g_itemBase)
-                                if (ib.first == T->item) n += ib.second;
-                            const int nBase = n;   // before anything this run gave
-                            for (size_t ii = 0; ii < g_collect.size() && ii < 16; ++ii)
-                                if ((kid.s.items & (uint16_t)(1u << ii))
-                                    && g_collect[ii].item == T->item)
-                                    ++n;
-                            // ...and what the boxes this state has already
-                            // fired gave. Without this lv22's `item 2 == 5` is
-                            // unreachable: none of its givers is a pickup.
-                            n += chainItems(kid.s.trig, T->item);
-                            // ...and the counting tap's presses (tapGive).
-                            if (tapGive.bit && T->item == tapGive.item)
-                                n += (int)(kid.s.taps & 0x3f) * tapGive.per;
-                            // GD's own order: 0 equals, 1 larger, 2 smaller.
-                            // Measured on lv21, where the third coin's gate is
-                            // a pair -- uid21783 "item 1 SMALLER than 10" drops
-                            // the coin out of reach, uid21781 "EQUALS 10" keeps
-                            // it -- which is what "collect ten and it appears"
-                            // is made of.
-                            // EQUALS IS "THE COUNTER PASSED THROUGH C", not "it
-                            // is C on this tick". Every increment the model
-                            // counts is a single +1 in the game -- a pickup, or
-                            // one Pickup trigger firing -- so the game's counter
-                            // visits every integer on the way up, and an equals
-                            // gate fires on the visit. The model sums a box's
-                            // whole weight on the tick the box fires, so it
-                            // skips: lv22's four yellow blocks weigh 2 each, and
-                            // the count goes 2,4,6,8,9 where the game's goes
-                            // 1,2,3,4,5 -- measured, the second increment of a
-                            // box arriving 25 ticks after the first. With the
-                            // old `n == C` the gate `item 2 == 5` could never
-                            // fire even with every feeder forced: at the collect
-                            // tick the count was 9 and the gate's bit was clear
-                            // in every group.
-                            //
-                            // So with unit steps from nBase, `n == C` happens at
-                            // some tick iff nBase <= C <= n. Where increments
-                            // really do land one per tick (lv21's eleven pickups,
-                            // collected one at a time) this fires on the same
-                            // tick as before; it only differs where the old test
-                            // stepped over C.
-                            // cmode 3 is an Item Compare's "at least", asked
-                            // on every press, so it simply reads the count.
-                            const bool hit = T->cmode == 3 ? (n >= T->count)
-                                           : T->cmode == 1 ? (n > T->count)
-                                           : T->cmode == 2 ? (n < T->count)
-                                           : (nBase <= T->count && T->count <= n);
-                            // --coindbg: the gate itself, once per distinct n,
-                            // so "the coin never moved" can be split into
-                            // "the gate was never asked" and "it was asked and
-                            // said no". Without this the only witness is the
-                            // coin's live row, which cannot tell the two apart.
-                            if (g_coinDbgT >= 0 && T->count >= 0 && !T->tap) {
-                                const int bi = touchBitIndex(tb.second);
-                                const int key = std::min(n, 60) + 1;
-                                if (bi >= 0 && bi < kTouchBits
-                                    && g_countSaid[bi].load() < key) {
-                                    g_countSaid[bi].store(key);
-                                    std::printf("countgate: t=%lld bit=%d uid=%d id=%d "
-                                                "item=%d cmode=%d need=%d n=%d base=%d "
-                                                "px=%.1f hit=%d\n",
-                                                (long long)t, bi, T->uid, T->id,
-                                                T->item, T->cmode, T->count, n, nBase,
-                                                px, hit ? 1 : 0);
-                                }
-                            }
-                            if (!hit) continue;
-                            // An INSTANT Count (1811) asks the question once, as
-                            // the player crosses it; a Count (1611) is a standing
-                            // listener. Without the crossing test the smaller-than
-                            // ones fire at t=0 for every state (0 < 10 is true
-                            // from the start) and lv21's coin drops before the
-                            // level has begun.
-                            if (T->id == 1811 && px < T->cx) continue;
-                            kid.s.trig |= tb.second;
-                            kid.s.trigT = (int32_t)t;
-                            const int b = touchBitIndex(tb.second);
-                            if (g_touchFireT[b] < 0) g_touchFireT[b] = (int)t;
-                            kid.s.fireB[b] = (uint16_t)t;
-                        }
-                }
-                // ---- the TAP triggers (1595) --------------------------------
-                // Armed by crossing, fired by a press -- measured on the rig
-                // calib_coingate5: a tap before the trigger's x does nothing, a
-                // tap past it switches its target group. The press EDGE is what
-                // GD sees, so a state already holding the button does not fire
-                // one by continuing to hold.
-                if (K.trigs && input && !s.action && gframe == 0)
-                    for (const auto& tb : *K.trigs) {
-                        const TouchTrig* T = tb.first;
-                        if (!T->tap || (kid.s.trig & tb.second)) continue;
-                        if (px <= T->cx) continue;
-                        kid.s.trig |= tb.second;
-                        kid.s.trigT = (int32_t)t;
-                        const int b = touchBitIndex(tb.second);
-                        if (g_touchFireT[b] < 0) g_touchFireT[b] = (int)t;
-                        kid.s.fireB[b] = (uint16_t)t;
-                    }
-                // ...and the COUNTING tap (tapGive): every press edge while its
-                // window is open adds one. State::taps holds the count in its low
-                // six bits, 0x80 once the window has opened and 0x40 once it has
-                // shut (see passedOn for both ends). Read from tapGive rather
-                // than K.trigs, which drops a box 40 px behind the player. The
-                // count is dropped once it cannot matter (window shut, or a gate
-                // on its item already fired), so it splits the key only inside
-                // the window. Any frame: lv22's window opens travelling -x.
-                if (tapGive.bit) {
-                    if (kid.s.trig & tapGateBits) {
-                        kid.s.taps = 0;
-                    } else {
-                        double wx = 0.0, wy = 0.0;
-                        fromFrame(gframe, (double)kid.s.xAbs, (double)kid.s.y, wx, wy);
-                        uint8_t tp = kid.s.taps;
-                        const bool armed =
-                            (tp & 0x80) != 0
-                            || passedOn(kid.s, gframe, tapGive.armChan, wx, wy,
-                                        tapGive.armX, tapGive.armY);
-                        const bool shut =
-                            (tp & 0x40) != 0
-                            || (armed && passedOn(kid.s, gframe, tapGive.closeChan, wx, wy,
-                                                  tapGive.closeX, tapGive.closeY));
-                        if (shut) {
-                            tp = 0x40;
-                        } else if (armed) {
-                            tp |= 0x80;
-                            if (input && !s.action && (tp & 0x3f) < 0x3f) ++tp;
-                        }
-                        kid.s.taps = tp;
-                    }
-                }
+                itemGates(kid.s, s.action, input, K, gframe, px, py, ph, t);
                 // ...and a gated coin passed for good (gatedMask, tapMissX/Y):
                 // once its window has resolved, past the coin's far edge on the
                 // shut channel without it. Same reading of "passed" as the
@@ -5034,7 +5964,7 @@ inline int cliMain(int argc, char** argv) {
             // catch it.
             if (!dead && g_fireBCheck) {
                 for (int b = 0; b < kTouchBits; ++b) {
-                    const bool bit = ((kid.s.trig >> b) & 1u) != 0;
+                    const bool bit = kid.s.trig.test(b);
                     const bool has = kid.s.fireB[b] != 0;
                     if (bit && !has) ++g_fireBNoTick;
                     if (!bit && has) ++g_fireBNoBit;
@@ -5047,7 +5977,7 @@ inline int cliMain(int argc, char** argv) {
                     // those may legitimately predate it and are skipped.
                     if (bit && has && g_touchFireT[b] >= 0
                         && (int)kid.s.fireB[b] < g_touchFireT[b]
-                        && !((init.trig >> b) & 1u))
+                        && !init.trig.test(b))
                         ++g_fireBTooEarly;
                 }
             }
@@ -5057,13 +5987,95 @@ inline int cliMain(int argc, char** argv) {
             kidFlag[i] = dead ? 1 : 2;
             if (dbgHere || g_refWatch) { kid.why = g_deadWhy; kid.obj = g_deadObj; }
         };
+        auto stepKid = [&](size_t i) { stepKidAt(i, true); };
         // --dbg stays serial: it prints per child, in order, and the reason
         // globals are per thread.
         if (pool && !dbgHere && kids.size() >= kParallelMin)
             pool->parallelFor(kids.size(), stepKid);
         else
             for (size_t i = 0; i < kids.size(); ++i) stepKid(i);
+        // --twinskip: fill each skipped pressed slot with its released sibling, which is what
+        // stepping it would have produced in everything the dedupe and the counts read.
+        // --twinaudit: both were stepped; check that claim instead.
+        // The claim needs the released sibling to have STAYED in the air, alive: a body that
+        // lands on this tick jumps on this tick if the button is down (measured on lv22 t=372:
+        // released vy 0.000, pressed 11.180, same y), and a death is not worth reasoning about.
+        if (twinOn) {
+            auto airborne = [&](size_t a) {
+                const Child& k = kids[a];
+                return kidFlag[a] == 2 && !k.s.grounded && !k.s.onSlope;
+            };
+            std::vector<size_t> redo;   // pending pressed slots whose sibling did not qualify
+            for (size_t j = 0; j < gidx.size(); ++j) {
+                const size_t a = 2 * j, b = a + 1;
+                const State& p = cur[gidx[j]];
+                const int m = p.mode < 8 ? p.mode : 0;
+                // The pressed child as the fill makes it from the released one. Without --heldall
+                // the two share a key and the pressed one never survives the dedupe, so only the
+                // key is carried; under it the button's own writes are set too and the key taken
+                // again (the note above twinOn).
+                auto pressedFrom = [&](const Child& rel) {
+                    Child k = rel;
+                    k.s.action = 1;
+                    if (g_minPulse > 1)
+                        k.s.edgeAge = (p.action != 1)
+                                          ? 0 : (uint8_t)std::min(254, (int)p.edgeAge + 1);
+                    if (g_heldAll) {
+                        k.s.held = 1;
+                        k.s.jumpBuf = 1;
+                        k.key = keyOf(k.s, (long long)t);
+                    }
+                    return k;
+                };
+                if (g_twinAudit) {
+                    if (!kidMoot[j] || !airborne(a)) continue;
+                    ++twin.predicted;
+                    ++twin.byMode[m];
+                    const int fa = kidFlag[a], fb = kidFlag[b];
+                    bool ok = fa == fb;
+                    if (ok && fa == 2) {
+                        if (g_heldAll) {
+                            const Child pk = pressedFrom(kids[a]);
+                            ok = pk.key == kidKeys[b] && pk.s.vy == kids[b].s.vy
+                                 && pk.s.y == kids[b].s.y && pk.s.trig == kids[b].s.trig
+                                 && pk.s.held == kids[b].s.held
+                                 && pk.s.jumpBuf == kids[b].s.jumpBuf;
+                        } else {
+                            ok = kidKeys[a] == kidKeys[b] && kids[a].s.vy == kids[b].s.vy
+                                 && kids[a].s.trig == kids[b].s.trig;
+                        }
+                    }
+                    if (!ok)
+                        twin.violation(t, p, fa, fb, kids[a].s, kids[b].s, kidKeys[a],
+                                       kidKeys[b]);
+                } else if (kidFlag[b] == 3) {
+                    if (!airborne(a)) {
+                        kidFlag[b] = 0;
+                        redo.push_back(b);
+                        continue;
+                    }
+                    kids[b] = pressedFrom(kids[a]);
+                    kidKeys[b] = g_heldAll ? kids[b].key : kidKeys[a];
+                    kidFlag[b] = kidFlag[a];
+                    ++twin.skipped;
+                    ++twin.byMode[m];
+                }
+            }
+            if (!redo.empty()) {
+                auto stepRedo = [&](size_t k) { stepKidAt(redo[k], false); };
+                if (pool && redo.size() >= kParallelMin)
+                    pool->parallelFor(redo.size(), stepRedo);
+                else
+                    for (size_t k = 0; k < redo.size(); ++k) stepRedo(k);
+            }
+        }
         ppMark(1);
+        // --searchcensus: did the two inputs of each parent lead anywhere different? Print only.
+        if (g_searchCensus > 0)
+            for (size_t j = 0; j < gidx.size(); ++j)
+                census.siblings(cur[gidx[j]], kidFlag[2 * j], kidFlag[2 * j + 1], kids[2 * j].s,
+                                kids[2 * j + 1].s, kidKeys[2 * j], kidKeys[2 * j + 1],
+                                (long long)t);
         // --rotwatch: the rotations this group's children actually took, counted
         // serially after the parallel step. Print only.
         if (g_rotWatchLo >= 0 && t >= g_rotWatchLo && t <= g_rotWatchHi) {
@@ -5390,7 +6402,7 @@ inline int cliMain(int argc, char** argv) {
         // that the wall does not move, which is exactly the symptom of a dozen
         // other things (see the three sessions spent on x=28,075).
         if (!g_touch.empty()) {
-            uint32_t m = 0;
+            TouchMask m{};
             for (const State& s : nxt) m |= s.trig;
             if (m & ~g_trigReported) {
                 for (size_t b = 0; b < g_touch.size(); ++b)
@@ -5466,8 +6478,7 @@ inline int cliMain(int argc, char** argv) {
                        && !refMatches(g_refKidState[want], it->second)) {
                 // The reference says this input stepped the tick, and the search
                 // stepping the same state with the same input produced something
-                // else. That is a transition difference, not a pruning decision
-                // (brief-019).
+                // else. That is a transition difference, not a pruning decision.
                 gate = "cannot-reproduce";
                 snprintf(detail, sizeof(detail),
                          " act=%d ref y=%.4f vy=%.4f flip=%d fr=%d | kid y=%.4f "
@@ -5508,7 +6519,72 @@ inline int cliMain(int argc, char** argv) {
                     int n = 0;
                     for (const State& s : nxt)
                         if (keyOf(s, (long long)t) == g_refKidKey[want]) ++n;
-                    if (alt < 0) {
+                    // A merge whose survivor differs from the reference only in WHEN
+                    // boxes fired (fireB / trigT) -- a box whose chain moves nothing,
+                    // entered a tick apart -- is followed on the survivor instead of
+                    // ending the watch. Printed, so the reader knows the carrier is no
+                    // longer the reference to the bit (SubZero 4003's toggle block:
+                    // the held and the released entry merge, and the watch stopped
+                    // 400 ticks before the question it was asked).
+                    bool adopted = false;
+                    // Every survivor in the cell, not just the nearest: the nearest in (y, vy)
+                    // can be one from another group (a different trigger mask), which is never
+                    // the reference's merge partner.
+                    for (size_t si = 0; si < nxt.size() && !adopted; ++si) {
+                        if (keyOf(nxt[si], (long long)t) != g_refKidKey[want]) continue;
+                        State a = nxt[si], b = g_refKidState[want];
+                        // Which of the overlooked fields actually differ, by name.
+                        std::string diff;
+                        if (a.action != b.action) diff += " action";
+                        if (std::memcmp(a.fireB, b.fireB, sizeof(a.fireB)) != 0) diff += " fireB";
+                        if (a.trigT != b.trigT) diff += " trigT";
+                        if (a.tight != b.tight) diff += " tight";
+                        if (a.rot != b.rot || a.rotNeg != b.rotNeg || a.rotStep != b.rotStep)
+                            diff += " rot";
+                        if (a.groundUid != b.groundUid) diff += " groundUid";
+                        a.parent = b.parent = 0;
+                        a.action = b.action = 0;
+                        std::memcpy(a.fireB, b.fireB, sizeof(a.fireB));
+                        a.trigT = b.trigT;
+                        a.tight = b.tight;
+                        // ...and the sprite angle (rot / rotNeg / rotStep), which the key
+                        // leaves out too; named when it is the difference.
+                        const bool rotDiff = a.rot != b.rot || a.rotNeg != b.rotNeg
+                                             || a.rotStep != b.rotStep;
+                        a.rot = b.rot; a.rotNeg = b.rotNeg; a.rotStep = b.rotStep;
+                        // ...and --stickseam's tie (groundUid), which the key leaves out.
+                        const bool tieDiff = a.groundUid != b.groundUid;
+                        a.groundUid = b.groundUid;
+                        (void)rotDiff; (void)tieDiff;
+                        if (std::memcmp(&a, &b, sizeof(State)) == 0 && !g_refAdopt) {
+                            std::printf("refwatch: merge t=%lld the survivor differs only in:%s "
+                                        "(--refadopt would carry on with it)\n", t, diff.c_str());
+                        } else if (std::memcmp(&a, &b, sizeof(State)) == 0) {
+                            std::printf("refwatch: ADOPT t=%lld a SUBSTITUTE from here, differing in:%s\n",
+                                        t, diff.c_str());
+                            if (g_refAdoptT < 0) g_refAdoptT = t;
+                            for (const char* fld : {"action", "fireB", "trigT", "tight", "rot", "groundUid"})
+                                if (diff.find(std::string(" ") + fld) != std::string::npos
+                                    && g_refAdoptFields.find(fld) == std::string::npos)
+                                    g_refAdoptFields += std::string(" ") + fld;
+                            g_refParent = (int)si;
+                            refPreCap = true;
+                            gate = nullptr;
+                            adopted = true;
+                        } else {
+                            const unsigned char* pa = reinterpret_cast<const unsigned char*>(&a);
+                            const unsigned char* pb = reinterpret_cast<const unsigned char*>(&b);
+                            std::printf("refwatch: cell-mate %zu trig 0x%llx/0x%llx differs at:", si,
+                                        (unsigned long long)nxt[si].trig.word(0),
+                                        (unsigned long long)g_refKidState[want].trig.word(0));
+                            int nd = 0;
+                            for (size_t o = 0; o < sizeof(State) && nd < 16; ++o)
+                                if (pa[o] != pb[o]) { std::printf(" %zu", o); ++nd; }
+                            std::printf("\n");
+                        }
+                    }
+                    if (adopted) {
+                    } else if (alt < 0) {
                         snprintf(detail, sizeof(detail), " cell-gone");
                     } else {
                         g_refDriftY = std::fabs((double)nxt[(size_t)alt].y
@@ -5535,12 +6611,51 @@ inline int cliMain(int argc, char** argv) {
             }
         }
         maxAlive = std::max(maxAlive, nxt.size());
+        const bool censusHere = g_searchCensus > 0 && ((t - t0) % g_searchCensus) == 0;
+        if (g_searchCensus > 0) census.layer(nxt, (long long)t, curDxF, nBorn, nDied, censusHere);
+        // --capmap: this layer's cap, from the leader x of the layer before it.
+        const size_t capNow = capAtX(bestX);
+        g_outcome.workStates += (long long)std::min(nxt.size(), capNow);
         const size_t qfPre = nxt.size();   // --qfoldwatch: the frontier before the alive cap
-        if (nxt.size() > g_aliveCap) {
+        // --heldcellcap: the layer's cells, keyed without the button (held, jumpBuf), each named by
+        // its first state in layer order -- the population the water-fill samples -- and the cell
+        // of every state. Built only for a layer over the cap; a layer whose CELLS fit is kept whole.
+        std::vector<uint32_t> cellPool;
+        std::vector<uint32_t> cellOf;
+        bool overCap = nxt.size() > capNow;
+        if (overCap && g_heldCellCap && g_heldAll) {
+            // The keys on the pool's threads (the layer is thousands of states on every capped
+            // layer, and keyOf is the costly part), then (key, index) sorted: a cell's first
+            // state is its lowest index.
+            const size_t n = nxt.size();
+            std::vector<std::pair<uint64_t, uint32_t>> ck(n);
+            auto keyAt = [&](size_t i) {
+                State s = nxt[i];
+                s.held = 0;
+                s.jumpBuf = 0;
+                ck[i] = {keyOf(s, (long long)t), (uint32_t)i};
+            };
+            if (pool && n >= 512) pool->parallelFor(n, keyAt);
+            else for (size_t i = 0; i < n; ++i) keyAt(i);
+            std::sort(ck.begin(), ck.end());
+            cellOf.resize(n);
+            for (size_t j = 0; j < n; ++j) {
+                const uint32_t rep = (j > 0 && ck[j].first == ck[j - 1].first)
+                                         ? cellOf[ck[j - 1].second] : ck[j].second;
+                cellOf[ck[j].second] = rep;
+                if (rep == ck[j].second) cellPool.push_back(rep);
+            }
+            std::sort(cellPool.begin(), cellPool.end());
+            overCap = cellPool.size() > capNow;
+            if (overCap) ++cellCuts;
+            else ++cellSpared;
+        }
+        const bool cellCap = !cellOf.empty();
+        if (overCap) {
             ++capHits;
-            capDropped += (long long)(nxt.size() - g_aliveCap);
+            if (!cellCap) capDropped += (long long)(nxt.size() - capNow);
             if (!g_bandPath.empty() && !g_bands.empty() && g_bands.back().t == t)
-                g_bands.back().capdrop = (int)(nxt.size() - g_aliveCap);
+                g_bands.back().capdrop = (int)((cellCap ? cellPool.size() : nxt.size()) - capNow);
             // --coins only. Measured 2026-08-31: with the band class on for
             // every run, 20 of the 21 levels the cold suite reached kept their
             // baseline iteration count exactly -- and lv20 went 37 -> 50. That
@@ -5581,13 +6696,23 @@ inline int cliMain(int argc, char** argv) {
                        // capHits on levels that have no branch at all (lv19
                        // +30%, lv14 +13%, lv18 +10%), while the band left
                        // lv14/17/18/19 identical to the digit.
-                       ^ (bandClass ? ((uint64_t)(uint32_t)(int32_t)
+                       // (Only where the band clamps -- search_key.hpp bandClamps.)
+                       ^ ((bandClass && bandClamps(s)) ? ((uint64_t)(uint32_t)(int32_t)
                               std::lround((double)s.bandCeil) << 48) : 0)
+                       // ...and which ACTIVATORS have fired (g_actMask, empty
+                       // without --activators). SubZero 4003: the one lineage that
+                       // pressed the toggle block, and so has the ring that leads
+                       // to the second coin, was evicted by this cap at t=8,288
+                       // (refwatch on a human route the model replays to 0 px).
+                       ^ (bandClass ? (s.trig & g_actMask).word(0) * 0x94D049BB133111EBull
+                                    : 0)
                        ^ (uint64_t)(uint32_t)std::lround(s.dx * 1000.0);
             };
             std::vector<uint64_t> cls;
             std::vector<std::vector<uint32_t>> byCls;
-            for (uint32_t i = 0; i < (uint32_t)nxt.size(); ++i) {
+            const size_t popN = cellCap ? cellPool.size() : nxt.size();
+            for (size_t p = 0; p < popN; ++p) {
+                const uint32_t i = cellCap ? cellPool[p] : (uint32_t)p;
                 const uint64_t k = classOf(nxt[i]);
                 size_t j = 0;
                 for (; j < cls.size(); ++j) if (cls[j] == k) break;
@@ -5602,8 +6727,8 @@ inline int cliMain(int argc, char** argv) {
                 return byCls[a].size() < byCls[b].size();
             });
             std::vector<uint32_t> keepIdx;
-            keepIdx.reserve(g_aliveCap);
-            size_t left = g_aliveCap;
+            keepIdx.reserve(capNow);
+            size_t left = capNow;
             for (size_t n = 0; n < ord.size(); ++n) {
                 const std::vector<uint32_t>& v = byCls[ord[n]];
                 const size_t fair = left / (ord.size() - n);
@@ -5617,7 +6742,73 @@ inline int cliMain(int argc, char** argv) {
                 }
                 left -= std::min(left, take);
             }
+            // --heldcellcap: every state of a sampled cell comes back with it, in layer order.
+            auto withTwins = [&](std::vector<uint32_t>& idx) {
+                if (!cellCap) return;
+                std::vector<uint8_t> pick(nxt.size(), 0);
+                for (uint32_t i : idx) pick[i] = 1;
+                idx.clear();
+                if (g_heldCellTwins <= 0) {
+                    for (uint32_t i = 0; i < (uint32_t)nxt.size(); ++i)
+                        if (pick[cellOf[i]]) idx.push_back(i);
+                    return;
+                }
+                // --heldcelltwins N: the cell's first state, then the states whose held differs
+                // from it, then the rest, until the cell has N.
+                // TRIED AND REMOVED (2026-09-26): a bound on the layer's total as well
+                // (--heldcelltotal P, at most (100 + P)% of the cap, the twins taken at an even
+                // stride). With N = 3 it did not bring lv16's seconds under 2x (P=50 2.63x, P=25
+                // 2.48x, against 2.6x without it) and it broke the ladder on lv14 (kids 4.2x at
+                // P=50, 39x at P=25) and lv11 (13x, not solved, against 0.55x and SOLVED at N = 3
+                // alone): official 22 from t=0, the loop's base argv.
+                std::vector<uint8_t> kept(nxt.size(), 0);
+                std::vector<int> nOf(nxt.size(), 0);
+                for (int pass = 0; pass < 3; ++pass)
+                    for (uint32_t i = 0; i < (uint32_t)nxt.size(); ++i) {
+                        const uint32_t r = cellOf[i];
+                        if (!pick[r] || kept[i] || nOf[r] >= g_heldCellTwins) continue;
+                        if (pass == 0 && i != r) continue;
+                        if (pass == 1 && nxt[i].held == nxt[r].held) continue;
+                        kept[i] = 1;
+                        ++nOf[r];
+                        idx.push_back(i);
+                    }
+                std::sort(idx.begin(), idx.end());
+            };
+            const size_t cellsKept = keepIdx.size();
+            withTwins(keepIdx);
+            if (cellCap) {
+                capDropped += (long long)(nxt.size() - keepIdx.size());
+                cellTwinsKept += (long long)(keepIdx.size() - cellsKept);
+            }
             std::sort(keepIdx.begin(), keepIdx.end());
+            // --searchcensus: the same water-fill, with each class's stride taken over the
+            // class sorted by (y, vy) instead of in layer order. Counted, never kept.
+            if (g_searchCensus > 0) census.cap(nxt.size(), capNow, nDied);
+            if (censusHere) {
+                std::vector<uint32_t> altIdx;
+                size_t leftA = capNow;
+                for (size_t n = 0; n < ord.size(); ++n) {
+                    std::vector<uint32_t> v = byCls[ord[n]];
+                    std::sort(v.begin(), v.end(), [&](uint32_t a, uint32_t b) {
+                        if (nxt[a].y != nxt[b].y) return nxt[a].y < nxt[b].y;
+                        if (nxt[a].vy != nxt[b].vy) return nxt[a].vy < nxt[b].vy;
+                        return a < b;
+                    });
+                    const size_t fair = leftA / (ord.size() - n);
+                    const size_t take = std::min(v.size(), fair);
+                    if (take == v.size()) {
+                        altIdx.insert(altIdx.end(), v.begin(), v.end());
+                    } else if (take > 0) {
+                        const double stride = (double)v.size() / (double)take;
+                        for (double i = 0; (size_t)i < v.size() && take > 0; i += stride)
+                            altIdx.push_back(v[(size_t)i]);
+                    }
+                    leftA -= std::min(leftA, take);
+                }
+                withTwins(altIdx);
+                census.coverage(nxt, keepIdx, altIdx, curDxF);
+            }
             std::vector<State> kept;
             kept.reserve(keepIdx.size());
             for (uint32_t i : keepIdx) kept.push_back(nxt[i]);
@@ -5629,13 +6820,16 @@ inline int cliMain(int argc, char** argv) {
                 if (idx < 0) {
                     std::printf("refwatch: LOST t=%lld gate=cap alive=%zu "
                                 "cap=%zu\n",
-                                t, nxt.size(), (size_t)g_aliveCap);
+                                t, nxt.size(), capNow);
                     g_refLostAt = t;
                 } else {
                     g_refParent = idx;    // the cap reordered the layer
                 }
             }
         }
+        // --heldcellcap keeps more states than the cap counts: charge what the layer really keeps.
+        if (cellCap) g_outcome.workStates += (long long)nxt.size() - (long long)std::min(qfPre, capNow);
+        if (g_searchCensus > 0) census.kept(nxt);
         // How many complete routes the final pick is choosing between, and how
         // far back they are actually different (--clearprobe only; reads the
         // arena, changes nothing).
@@ -5720,7 +6914,8 @@ inline int cliMain(int argc, char** argv) {
         // be alive `horizon` ticks later. Cost is at most 2x the search.
         if (horizon > 0 && !solved && t - t0 >= horizon * 2) {
             solved = true;
-            goalState = cur.front();
+            g_outcome.horizonCut = true;   // survived, did not reach the end (SearchOutcome)
+            goalState = pickOf(cur);
             planCut = t0 + horizon;
             break;
         }
@@ -5797,7 +6992,7 @@ inline int cliMain(int argc, char** argv) {
                                + seen.bucket_count() * 8 + seen.size() * 48;
             if (est > g_memLimitMiB * (size_t)1048576) {
                 solved = true;
-                goalState = cur.front();
+                goalState = pickOf(cur);
                 planCut = t0 + (t - t0) / 2;
                 std::printf("MEMORY_LIMIT: est=%zuMiB arena=%zu alive=%zu "
                             "t=%lld x=%.0f -> plan cut at t=%lld "
@@ -5835,8 +7030,13 @@ inline int cliMain(int argc, char** argv) {
         }
         // ---- the caller has stopped caring ----
         // Read every layer: once the game has refuted a checkpoint, every layer after it is paid
-        // for and thrown away. One relaxed load, and only with a subscriber.
-        if (checkWanted && g_check.cancel.load(std::memory_order_relaxed)) {
+        // for and thrown away. One relaxed load -- and read with no subscriber too, because the
+        // mod also cancels when its session ends (the player left the level). Read only under
+        // `dpcheck`, which is off by default, that cancel did nothing: the search ran on to its
+        // end on its detached thread, and the next level's Solve sat queued behind it with the
+        // old search's numbers on its HUD (lv16 left mid-search went on for 22 s at 2,000 states
+        // while lv1 waited). The CLI never sets the flag, so its output is unchanged.
+        if (g_check.cancel.load(std::memory_order_relaxed)) {
             std::printf("CANCELLED: at t=%lld (search abandoned by the caller)\n", t);
             std::fflush(stdout);
             g_outcome.verdict = VerdictCancelled;
@@ -5971,6 +7171,12 @@ inline int cliMain(int argc, char** argv) {
                     " (both must be 0)\n", g_fireBNoTick, g_fireBNoBit, g_fireBTooEarly);
     std::printf("capstat: maxAlive=%zu capHits=%lld dropped=%lld cap=%zu\n",
                 maxAlive, capHits, capDropped, g_aliveCap);
+    if (g_heldCellCap && g_heldAll)
+        std::printf("cellcap: spared=%lld cut=%lld twinsKept=%lld (layers over the cap in states "
+                    "whose cells fit / layers cut by cells / twins kept past the cap)\n",
+                    cellSpared, cellCuts, cellTwinsKept);
+    if (g_searchCensus > 0) census.print();
+    twin.print();
     // --keycensus: the per-box tally, with the uid so it can be joined against
     // objrects. Boxes that never divided the key are printed as 0 rather than
     // omitted -- "absent" and "zero" are the distinction this project keeps
@@ -6009,8 +7215,8 @@ inline int cliMain(int argc, char** argv) {
         for (size_t b = 0; b < g_touch.size() && b < (size_t)kTouchBits; ++b)
             std::printf("keycensus: box=%zu uid=%d cx=%.0f moveTicks=%lld splits=%lld\n",
                         b, g_touch[b].uid, g_touch[b].cx,
-                        b < g_touchMoveTicks.size() ? g_touchMoveTicks[b] : -1,
-                        g_keyCount[b].load());
+                        (long long)(b < g_touchMoveTicks.size() ? g_touchMoveTicks[b] : -1),
+                        (long long)g_keyCount[b].load());
     }
     clearReport();
     g_outcome.capHits = capHits;
@@ -6029,9 +7235,9 @@ inline int cliMain(int argc, char** argv) {
         // arrive under either name and a frame-only count cannot say which.
         for (int f = 0; f < 4; ++f)
             for (int r = 0; r < 2; ++r)
-                if (g_frameRevReach[f][r] || g_frameRevCall[f][r] || g_frameRevHit[f][r])
+                if (frameRevReach(f, r) || g_frameRevCall[f][r] || g_frameRevHit[f][r])
                     std::printf("framerev: f%d rev%d steps=%lld lookups=%lld hits=%lld\n",
-                                f, r, g_frameRevReach[f][r], g_frameRevCall[f][r],
+                                f, r, frameRevReach(f, r), g_frameRevCall[f][r],
                                 g_frameRevHit[f][r]);
         std::printf("fixupcall:  f0=%lld f1=%lld f2=%lld f3=%lld rotated=%d",
                     g_fixupCallFrame[0], g_fixupCallFrame[1],
@@ -6052,15 +7258,20 @@ inline int cliMain(int argc, char** argv) {
     // to be as visible as a loss or the instrument only ever speaks when it has
     // something to blame.
     if (g_refWatch)
-        std::printf("refwatch: %s\n",
+        std::printf("refwatch: %s%s%s%s\n",
                     g_refLostAt < 0 ? "CARRIED to the end"
-                                    : "lost (see the line above)");
+                                    : "lost (see the line above)",
+                    // Past an ADOPT the carrier is a substitute, not the reference.
+                    g_refAdoptT >= 0 ? " -- a SUBSTITUTE lineage since t=" : "",
+                    g_refAdoptT >= 0 ? std::to_string(g_refAdoptT).c_str() : "",
+                    g_refAdoptT >= 0 ? (", overlooked:" + g_refAdoptFields).c_str() : "");
     if (g_phaseProf) {
         ppMark(6);
         const double tot = std::chrono::duration<double>(std::chrono::steady_clock::now() - ppStart).count();
         std::printf("phaseprof: layers=%lld total=%.2fs setup=%.2f step=%.2f dedupe=%.2f cap=%.2f "
-                    "gc=%.2f mem=%.2f rest=%.2f\n", bestT - t0, tot, pp[0], pp[1], pp[2], pp[3], pp[4],
-                    pp[5], pp[6]);
+                    "gc=%.2f mem=%.2f rest=%.2f prep=%.2f\n", bestT - t0, tot, pp[0], pp[1], pp[2],
+                    pp[3], pp[4], pp[5], pp[6],
+                    std::chrono::duration<double>(ppStart - cliT0).count());
     }
     if (g_rjOn)
         std::printf("rejoin: t0=%lld after=%lld reached=%lld layers=%lld exact=%lld(m%d,n%lld) "
@@ -6099,7 +7310,7 @@ inline int cliMain(int argc, char** argv) {
     // to the driver's `Test-Path $tail` check and the loop would never move.
     if (!solved && horizon > 0 && !nxt.empty()) {
         solved = true;
-        goalState = nxt.front();
+        goalState = pickOf(nxt);
         planCut = 0;   // no truncation: the driver wants to reach the wall
         std::printf("PARTIAL: frontier died at t=%lld x=%.1f, emitting the "
                     "deepest branch\n", bestT, bestX);
@@ -6291,7 +7502,12 @@ inline int cliMain(int argc, char** argv) {
             for (size_t b = 0; b < tw.size(); ++b) {
                 if (s.trig & touchBit(b)) continue;
                 const TouchTrig& T = tw[b];
-                if (T.cx + T.hw < x - 40 || T.cx - T.hw > x + 40) continue;
+                // --walkgates: the search's window keeps these (see `standing` there).
+                const bool standing = g_walkGates && (T.id == 1611 || T.id == 3620)
+                                      && T.count >= 0 && !T.tap;
+                const bool anywhere = g_walkGates && T.id == 3620 && T.count >= 0;
+                if (!anywhere && !standing && T.cx + T.hw < x - 40) continue;
+                if (!anywhere && T.cx - T.hw > x + 40) continue;
                 rt.push_back({&T, touchBit(b)});
             }
             sl->forRange(x - 40, x + 40, [&](const Obj& o) { rn.push_back(&o); });
@@ -6307,7 +7523,10 @@ inline int cliMain(int argc, char** argv) {
             std::vector<const Obj*> rv;
             vl->forRange(x - 80, x + 80, [&](const Obj& o) { rv.push_back(&o); });
             rLf->dyn.collect(Dynamics::SPEED, x - 80, x + 80, rv);
-            const StepCtx K{x, xPrevR, rDxUsed, t, &rn, &rp, &rd, &ro, &rs, &rv, &SP, &SPmini, &UP, &UPmini, &rt};
+            std::vector<const Obj*> rnSolid;   // --solidorder: rn in GD's solid order, once per tick
+            solidOrderInto(rn, rnSolid);
+            const StepCtx K{x, xPrevR, rDxUsed, t, &rn, &rp, &rd, &ro, &rs, &rv, &SP, &SPmini, &UP, &UPmini, &rt,
+                            nullptr, nullptr, &rnSolid};
             bool rdead = false;
             const bool rPrevGrounded = (s.grounded != 0);
             const double rPrevY = (double)s.y;
@@ -6325,6 +7544,12 @@ inline int cliMain(int argc, char** argv) {
                     rrebind(*rLf);
                 }
             }
+            // --walkgates: the item gates the search's own step fires (itemGates),
+            // so the witness walks the world the search planned in. Same gate as
+            // the search's: alive, and not on a tick that turned the player.
+            if (g_walkGates && coinOn && !rdead && (int)c.frame == rFrame0)
+                itemGates(c, s.action, (int)lvl[i], K, rFrame0, (double)c.xAbs,
+                          (double)c.y, hazardHalfFor(c.mode, c.mini != 0), t);
             // ...and rdead is not read. It was declared, passed, and dropped:
             // the witness resim walks the whole plan whether or not the player
             // survived it, so a plan that dies at tick 40 of 1,200 still writes
@@ -6542,9 +7767,9 @@ inline int cliMain(int argc, char** argv) {
                 (rDead > 0 && (long long)(rLast - rFirst + 1) == rDead) ? 1 : 0,
                 rWhy ? rWhy : "-");
     if (g_resimDead > 0)
-        std::printf("resimwho: uid=%d obj=(%.1f,%.1f) frame=%d trig=0x%08x\n",
+        std::printf("resimwho: uid=%d obj=(%.1f,%.1f) frame=%d trig=0x%08llx\n",
                     g_resimUid, g_resimObjX, g_resimObjY, g_resimFrame,
-                    g_resimTrig);
+                    (unsigned long long)g_resimTrig.word(0));
     // --verdictinfo (default off): one line per SOLVED call, carrying that call's
     // verdict beside its OWN witness walk's death. Print only -- the verdict is not
     // touched here and the plan is not withheld. The direction is "send the plan,
@@ -6624,6 +7849,181 @@ inline int cliMain(int argc, char** argv) {
     std::printf("plan: %d edges, %zu ticks -> %s\n", edges, lvl.size(),
                 outPath.c_str());
     return 0;
+}
+
+// --capladder <c0>: solve with a small alive cap first, and raise it only where that search runs
+// out of states.
+//
+// Measured 2026-09-25 on the official lv1-15 from t=0 (one search each, the loop's cap 2000 as
+// the reference): cap 125 reaches the end on 13 of 15 levels with 0.068-0.099 of the stepped
+// children, and where it does not (lv11, lv12) the frontier dies at one or two narrow passages.
+// Raising the cap over a window starting some distance BEFORE the passage gets through it
+// (lv12: 1000 from >= 300 px before, not 100; lv11: 250 from >= 600 px), because the passage
+// needs states that have to be kept on the way to it, not at it. Which cap a passage needs also
+// depends on what the search kept earlier (lv11's second passage fails with 250 from x=12,111 to
+// the end, and passes with 250 from 3,000 px before it), so each attempt is a whole search again
+// rather than a resumed one.
+//
+// The attempts:
+//   1. --cap c0 everywhere.
+//   2. The frontier died at x_w: add a window [x_w - 600, x_w + 300] at 4 * c0, search again.
+//   3. Died inside a window again: that window's cap x4 (at most --cap) and its lead x2. Died
+//      outside every window: a new window at the new wall. Windows are kept, since each attempt
+//      starts from t0.
+//   4. Died inside a window that already has the full --cap, or more than kLadderMaxAttempts
+//      attempts: the plain search with the caller's own arguments, i.e. exactly what runs
+//      without the flag.
+//   5. The plain search's frontier died too, on an EARLIER tick than the deepest attempt's did:
+//      that attempt is searched again (the first attempt to reach that tick, with its own map)
+//      and its result is the ladder's. The alive cap is not monotone -- measured 2026-09-26 with
+//      --heldall, the plain cap-2000 search died at lv21 t=1,961 and lv19 t=2,317 where the
+//      ladder's attempts had reached t=13,930 and t=11,350 -- and without this step the ladder
+//      handed back the shallower plan. "Deeper" is the tick the frontier died on (deepT), not x,
+//      which runs backwards in a reversed section; on a tie the plain search's result stands.
+//      A death is still a death either way (PARTIAL/FAILED): this picks which one, not whether.
+// Anything that is not a frontier death (SOLVED, a horizon cut, CANCELLED, an early return)
+// ends the ladder with that attempt's result. Every attempt writes the same output files, so
+// the last search's are the ones left behind -- which is why step 5 searches again rather than
+// keeping copies: the plan, its trace and g_outcome all come from that one search.
+//
+// A search restriction only: every attempt steps the model exactly as a plain search does.
+inline constexpr int kLadderMaxAttempts = 8;
+inline constexpr double kLadderLead = 600.0;
+inline constexpr double kLadderPast = 300.0;
+
+inline int cliMain(int argc, char** argv) {
+    long long c0 = 0;
+    std::vector<std::string> base;
+    for (int i = 0; i < argc; ++i) {
+        if (i + 1 < argc && !std::strcmp(argv[i], "--capladder")) {
+            c0 = std::atoll(argv[++i]);
+            continue;
+        }
+        // the ladder writes its own maps; a caller's would be overwritten by them anyway
+        if (i + 1 < argc && !std::strcmp(argv[i], "--capmap")) { ++i; continue; }
+        if (i + 1 < argc && !std::strcmp(argv[i], "--gridmap")) { ++i; continue; }
+        base.push_back(argv[i]);
+    }
+    if (c0 <= 0) return cliMainOnce(argc, argv);
+    // The attempts share one level (LadderLevelCache), for this ladder only.
+    static unsigned long long s_ladders = 0;
+    g_ladder = ++s_ladders;
+    struct EndLadder {
+        ~EndLadder() {
+            g_ladder = 0;
+            g_ladderLevel = LadderLevelCache{};
+        }
+    } endLadder;
+    // --inputgrid under the ladder: a wall the grid makes (a press it cannot place) looks to the
+    // ladder exactly like a wall the cap makes, so the plain search that ends the ladder runs
+    // without the grid (--gridmap -1e9:1). The windows keep it.
+    // TRIED AND REVERTED (2026-09-25): lifting the grid inside every window as well (a --gridmap
+    // over the stretches whose cap was raised). On lv3/11/12/16/22 and two custom levels at
+    // --capladder 125 --inputgrid 2 it cost 199M stepped children against 147M with the grid kept
+    // (lv11 3 -> 5 attempts, the custom level 2 -> 4): the lifted window searched finer and took other
+    // routes, and none of the seven had needed it -- all were SOLVED with the grid kept.
+    // The full cap is whatever the caller's --cap (or the default) leaves g_aliveCap at, which
+    // is known once an attempt has parsed the arguments; the first attempt always runs.
+    long long fullCap = -1;
+
+    auto run = [&](const std::string* map, const std::string* grid) {
+        std::vector<std::string> a = base;
+        if (map) {
+            a.push_back("--capmap");
+            a.push_back(*map);
+        }
+        if (grid) {
+            a.push_back("--gridmap");
+            a.push_back(*grid);
+        }
+        std::vector<char*> p;
+        p.reserve(a.size());
+        for (std::string& s : a) p.push_back(s.data());
+        return cliMainOnce((int)p.size(), p.data());
+    };
+
+    struct Window { double wall, lead; long long cap; };
+    std::vector<Window> wins;
+    // The map is a step function (thread_pool.hpp capAtX), so overlapping windows are resolved
+    // here: each stretch between two window edges takes the largest cap that covers it.
+    auto mapOf = [&]() {
+        std::vector<double> edges;
+        for (const Window& w : wins) {
+            edges.push_back(w.wall - w.lead);
+            edges.push_back(w.wall + kLadderPast);
+        }
+        std::sort(edges.begin(), edges.end());
+        edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "-1e9:%lld", c0);
+        std::string m = buf;
+        for (double e : edges) {
+            long long c = c0;
+            for (const Window& w : wins)
+                if (e >= w.wall - w.lead && e < w.wall + kLadderPast) c = std::max(c, w.cap);
+            std::snprintf(buf, sizeof(buf), ",%.1f:%lld", e, c);
+            m += buf;
+        }
+        return m;
+    };
+
+    auto frontierDied = [] {
+        const int v = g_outcome.verdict;
+        return (v == VerdictPartial || v == VerdictFailed) && g_outcome.deepX >= 0.0
+               && g_outcome.capHits >= 0;
+    };
+    // Step 5: the first attempt whose frontier died deepest, and the map it ran with.
+    long long bestT = -1;
+    int bestAttempt = 0;
+    std::string bestMap;
+    for (int attempt = 1;; ++attempt) {
+        const std::string m = mapOf();
+        const int rc = run(&m, nullptr);
+        const int v = g_outcome.verdict;
+        const double wx = g_outcome.deepX;
+        std::printf("capladder: attempt=%d map=%s verdict=%d deepX=%.1f rc=%d\n", attempt,
+                    m.c_str(), v, wx, rc);
+        std::fflush(stdout);
+        if (fullCap < 0) fullCap = (long long)g_aliveCap;
+        const bool died = frontierDied();
+        if (!died || c0 >= fullCap) return rc;
+        if (g_outcome.deepT > bestT) {
+            bestT = g_outcome.deepT;
+            bestAttempt = attempt;
+            bestMap = m;
+        }
+        Window* hit = nullptr;
+        for (Window& w : wins)
+            if (wx >= w.wall - w.lead && wx < w.wall + kLadderPast) hit = &w;
+        bool plain = attempt >= kLadderMaxAttempts;
+        if (hit && hit->cap >= fullCap) {
+            plain = true;
+        } else if (hit) {
+            hit->cap = std::min(hit->cap * 4, fullCap);
+            hit->lead *= 2;
+        } else {
+            wins.push_back({wx, kLadderLead, std::min(c0 * 4, fullCap)});
+        }
+        if (plain) {
+            std::printf("capladder: attempt=%d plain search at --cap %lld\n", attempt + 1,
+                        fullCap);
+            std::fflush(stdout);
+            const std::string noGrid = "-1e9:1";
+            const int prc = run(nullptr, &noGrid);
+            const long long plainT = g_outcome.deepT;
+            if (!frontierDied() || plainT >= bestT) return prc;
+            std::printf("capladder: the plain search died at t=%lld, before attempt %d's t=%lld"
+                        " - searching attempt %d again for the result\n",
+                        plainT, bestAttempt, bestT, bestAttempt);
+            std::fflush(stdout);
+            const int brc = run(&bestMap, nullptr);
+            std::printf("capladder: attempt=%d again map=%s verdict=%d deepT=%lld (was %lld)"
+                        " deepX=%.1f rc=%d\n", bestAttempt, bestMap.c_str(), g_outcome.verdict,
+                        g_outcome.deepT, bestT, g_outcome.deepX, brc);
+            std::fflush(stdout);
+            return brc;
+        }
+    }
 }
 
 

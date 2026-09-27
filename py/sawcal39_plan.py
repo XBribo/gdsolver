@@ -1,6 +1,6 @@
 """What each kA39 station should measure, and the sweep that measures it.
 
-brief-013 asks whether lv22's kA39 flag is what picks GD's circle-hazard
+This asks whether lv22's kA39 flag is what picks GD's circle-hazard
 branch. The rigs are generated in pairs (mklevel sawcal39_*, once with --ka39
 and once without) and this prints, per station and mode, the boundary branch A
 and branch B each predict -- plus the ready-to-run hitbox_sweep command.
@@ -10,7 +10,7 @@ dp/src/dp/object.hpp and are written out here once, so the expected numbers
 cannot drift away from the model they are testing.
 
     python py/sawcal39_plan.py                       # every station, cube
-    python py/sawcal39_plan.py --modes cube spider   # the two brief-013 asks for
+    python py/sawcal39_plan.py --modes cube spider   # the two modes in question
     python py/sawcal39_plan.py --commands            # emit the sweep lines too
 
 NO WORKER IS TOUCHED. This is arithmetic and text; whoever holds a worker runs

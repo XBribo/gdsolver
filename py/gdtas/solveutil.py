@@ -68,7 +68,6 @@ MODE_ID = {"ship": 1, "ball": 2, "ufo": 3, "wave": 4, "robot": 5, "spider": 6,
 # flag never set, but a swing's arc apex also reads as |vy| ~ 0, so that does
 # not separate "structurally never" from "not in this corpus". If a level
 # grounds a flipped swing, the reach-2 number expires.
-# See notes/measure-onground-stickiness-per-mode-2026-09-07.
 FLYING = (1, 3, 4)
 
 # The two definitions of "GD was grounded" that `cause_of` can sign a family
@@ -381,7 +380,6 @@ def grounded_of(mode: int, on_ground: str, on_ground2: str, yvel: str) -> int:
     not, and none of the 25 widened (grounded_of's non-flying branch also
     accepts yvel == 0, which no such row had) -- that zero is the world's, not
     the filter's.
-    See notes/measure-onground-phase-offset-2026-09-06.
 
     WHICH OF THOSE THREE NAMES IS RIGHT was measured on 2026-09-07 from GD's
     dump against the level's own trigger table -- no model and no anchor, so a
@@ -431,7 +429,6 @@ def grounded_of(mode: int, on_ground: str, on_ground2: str, yvel: str) -> int:
     corroborated would lose lv19 21,401. What the three verdicts argue for, if
     anything, is a third predicate that can tell a floor from a ceiling -- and
     that is a separate measurement.
-    See notes/measure-ground-letter-verdicts-2026-09-07.
 
     THAT SEPARATE MEASUREMENT WAS DONE, 2026-09-07, and it says DO NOT BUILD THE
     THIRD PREDICATE. Reach, over the population this function actually seeds --
@@ -474,11 +471,9 @@ def grounded_of(mode: int, on_ground: str, on_ground2: str, yvel: str) -> int:
     The same census closes the other side: the whole corpus holds exactly 567
     upright still ticks with onGround=1 and onGround2=0, and they are one ride --
     lv2 12,281-12,847, the ride the single seed above sits in.
-    See notes/measure-ground-false-negatives-2026-09-07.
 
-    Corroborated from the other direction by the column-phase audit
-    (notes/measure-dump-column-phases-2026-09-06), which swept d = -3..+3 over
-    379,480 ticks in the same kind of window and found d=0 the strict minimum
+    Corroborated from the other direction by a column-phase audit, which swept
+    d = -3..+3 over 379,480 ticks in the same kind of window and found d=0 the strict minimum
     in all 16 (mode, flipped) regimes -- for the raw column, for `onGround2`,
     and for this function's output alike. Two instruments, opposite starting
     assumptions, no shift in either.

@@ -1,90 +1,61 @@
 #pragma once
-// Developer control panel shown on menu scenes.
+// Entering a level the mod names itself: auto-enter, the level suite and the mid-session
+// swap. A level the player picks goes through the game's own play button and the play menu
+// (hooks_playmenu.cpp).
 #include "mod/helpers_game.hpp"
 
 using namespace p1;
 
-// ---- On-screen control panel (shown on the screens a level is started from) ----
-// Mode switching only. Level selection uses the game's own UI as-is (custom levels supported).
-// On level entry (PlayLayer::init) the session is configured automatically with the current
-// mode. Kept across scenes with SceneManager, and hidden everywhere else.
-// 0=Normal (normal play) 1=Replay (a stored solution) 2=Solve (the mod solves it here and now).
-// Under Replay and Solve a second switch, Coins On/Off, makes the session about the level's coins
-// (g_uiCoins): Solve routes for every coin, Replay plays the coin solution.
-// The modes and their names live in fxcensus.hpp, next to g_uiMode -- the session setup needs
-// them and comes earlier in the include chain.
-
-class SolverPanelLayer : public cocos2d::CCLayer {
-public:
-    cocos2d::CCLabelBMFont* m_modeLabel = nullptr;
-    // The Coins switch (g_uiCoins). Its own button under the mode, so the mode cycle stays the
-    // three it always was; hidden in Normal, where it means nothing.
-    cocos2d::CCLabelBMFont* m_coinLabel = nullptr;
-    cocos2d::CCMenuItemLabel* m_coinItem = nullptr;
-
-    static const char* coinText() { return g_uiCoins ? "Coins: On" : "Coins: Off"; }
-
-    void syncCoins() {
-        if (m_coinLabel) m_coinLabel->setString(coinText());
-        if (m_coinItem) m_coinItem->setVisible(g_uiMode != UI_MODE_NORMAL);
+// ---- where a suite level comes from (cfg `leveldir`, see suite:: in config.hpp) ----
+//
+// Sets g_cfg.levelFile for the suite's current level: `<dir>/<id>.lvl` for an ID that is not
+// a main level when a directory is set, nothing otherwise. The first call checks the whole
+// list -- strictly ascending, and a file for every ID outside 1-22 -- so a missing level stops
+// the run before its first level instead of in the middle. Returns false (and says why) when
+// the suite must not run.
+inline bool suiteLevelSource() {
+    g_cfg.levelFile.clear();
+    const std::string& dir = suite::g_levelDir;
+    if (dir.empty()) return true;
+    auto fileOf = [&](int id) { return dir + "/" + std::to_string(id) + ".lvl"; };
+    if (!suite::g_levelDirChecked) {
+        suite::g_levelDirChecked = true;
+        for (size_t i = 1; i < suite::g_levels.size(); ++i)
+            if (suite::g_levels[i] <= suite::g_levels[i - 1]) {
+                writeResult("suite: refused - with leveldir the levels must be strictly ascending (a "
+                            "fixed order, no duplicates); " + std::to_string(suite::g_levels[i])
+                            + " follows " + std::to_string(suite::g_levels[i - 1]));
+                return false;
+            }
+        std::string missing;
+        for (int id : suite::g_levels) {
+            if (id >= 1 && id <= 22) continue;
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(fileOf(id), ec))
+                missing += (missing.empty() ? "" : ",") + std::to_string(id);
+        }
+        if (!missing.empty()) {
+            writeResult("suite: refused - no level file in leveldir for " + missing
+                        + " (nothing else is read for those IDs)");
+            return false;
+        }
     }
+    const int id = suite::current();
+    if (id < 1 || id > 22) g_cfg.levelFile = fileOf(id);
+    return true;
+}
 
-    static SolverPanelLayer* create() {
-        auto* r = new SolverPanelLayer();
-        if (r->init()) { r->autorelease(); return r; }
-        delete r;
-        return nullptr;
+// FNV-1a of a level's bytes, for the `levelsource:` line: which level a run actually played.
+inline std::string levelContentSig(const std::string& bytes) {
+    uint64_t h = 1469598103934665603ULL;
+    for (char c : bytes) {
+        h ^= (uint8_t)c;
+        h *= 1099511628211ULL;
     }
-
-    bool init() override {
-        using namespace cocos2d;
-        if (!CCLayer::init()) return false;
-        this->setID("panel"_spr);
-        auto* tag = CCLabelBMFont::create("GDSOLVER", "bigFont.fnt");
-        tag->setScale(0.3f);
-        tag->setAnchorPoint({0.f, 0.5f});
-        // Three rows since the Coins switch; the lowest used to sit at y=14 and its label was cut
-        // off by the bottom edge of the window, so the stack starts higher.
-        tag->setPosition({10.f, 66.f});
-        tag->setOpacity(140);
-        tag->setID("panel-tag"_spr);
-        this->addChild(tag);
-        m_modeLabel = CCLabelBMFont::create(uiModeName(g_uiMode), "bigFont.fnt");
-        m_modeLabel->setScale(0.55f);
-        auto* item = CCMenuItemLabel::create(m_modeLabel, this,
-            menu_selector(SolverPanelLayer::onMode));
-        item->setAnchorPoint({0.f, 0.5f});
-        m_coinLabel = CCLabelBMFont::create(coinText(), "bigFont.fnt");
-        m_coinLabel->setScale(0.4f);
-        m_coinItem = CCMenuItemLabel::create(m_coinLabel, this,
-            menu_selector(SolverPanelLayer::onCoins));
-        m_coinItem->setAnchorPoint({0.f, 0.5f});
-        auto* menu = CCMenu::create(item, m_coinItem, nullptr);
-        menu->setID("panel-menu"_spr);
-        item->setID("mode-button"_spr);
-        m_coinItem->setID("coins-button"_spr);
-        menu->setPosition({0, 0});
-        item->setPosition({10.f, 46.f});
-        m_coinItem->setPosition({10.f, 24.f});
-        this->addChild(menu);
-        syncCoins();
-        this->scheduleUpdate();
-        return true;
-    }
-
-    void onMode(CCObject*) {
-        g_uiMode = (g_uiMode + 1) % UI_MODE_COUNT;
-        if (m_modeLabel) m_modeLabel->setString(uiModeName(g_uiMode));
-        syncCoins();
-    }
-
-    void onCoins(CCObject*) {
-        g_uiCoins = !g_uiCoins;
-        syncCoins();
-    }
-};
-
-inline SolverPanelLayer* g_panel = nullptr;
+    char b[24];
+    snprintf(b, sizeof(b), "%016llx", (unsigned long long)h);
+    return b;
+}
 
 // ---- entering the level g_cfg names ----------------------------------------
 //
@@ -101,9 +72,16 @@ inline bool enterConfiguredLevel() {
     // re-entry would under-report the elapsed seconds)
     if (solver::g_totalAttempts == 0)
         solver::g_solveStart = std::chrono::steady_clock::now();
+    // A suite level is the suite's current ID and nothing else (see suiteLevelSource).
+    if (suite::active() && g_cfg.levelId != suite::current()) {
+        writeResult("suite: refused - about to enter level " + std::to_string(g_cfg.levelId)
+                    + " where the suite is at " + std::to_string(suite::current()));
+        return false;
+    }
     // Main levels are 1-22; anything else is a saved / online-cached custom level
     GJGameLevel* level = nullptr;
     auto* glm = GameLevelManager::sharedState();
+    std::string srcKind, srcBytes;   // for the `levelsource:` line below
     // If levelfile= is given, build the level from the RAW level string in that file
     // (the save file is never touched). Used for calibration maps.
     if (!g_cfg.levelFile.empty()) {
@@ -118,25 +96,34 @@ inline bool enterConfiguredLevel() {
         level = GJGameLevel::create();
         level->m_levelName = "gdsolver calib";
         level->m_levelID = g_cfg.levelId;
-        level->m_levelType = GJLevelType::Editor;
+        level->m_levelType = g_cfg.levelFileMain ? GJLevelType::Main : GJLevelType::Editor;
         // Run it through GD's own compression. Doing base64+gzip by hand here silently
         // fails to load because of encoding differences, so ALWAYS hand it to ZipUtils.
         level->m_levelString = cocos2d::ZipUtils::compressString(raw, false, 0);
         log::info("phase1: built the level from levelfile {} ({} chars)",
                   g_cfg.levelFile, raw.size());
+        srcKind = "file";
+        srcBytes = raw;
     } else if (g_cfg.levelId >= 1 && g_cfg.levelId <= 22) {
         level = glm->getMainLevel(g_cfg.levelId, false);
+        srcKind = "main";
     } else {
         level = glm->getSavedLevel(g_cfg.levelId);
         if (!level && glm->m_onlineLevels)
             level = static_cast<GJGameLevel*>(
                 glm->m_onlineLevels->objectForKey(std::to_string(g_cfg.levelId)));
+        srcKind = "saved";
     }
     if (!level) {
         log::error("phase1: level {} not found (main or saved)", g_cfg.levelId);
         writeResult("error: level not found");
         return false;
     }
+    // Which level this run played, by content: the raw file for a level file, the level string
+    // the game holds otherwise. A run's manifest keeps it (py/cold_manifest.py).
+    if (srcKind != "file") srcBytes = std::string(level->m_levelString);
+    writeResult("levelsource: id=" + std::to_string(g_cfg.levelId) + " kind=" + srcKind
+                + " sig=" + levelContentSig(srcBytes) + " bytes=" + std::to_string(srcBytes.size()));
     // Line for ruling out the suspicion that the calibration rig (levelfile=) and the
     // official levels have DIFFERENT physics. The rig's gravity-flipped ship climbed at
     // 0.069/tick while the same condition in lv7 gave 0.103. Compares the defaults of
@@ -154,40 +141,47 @@ inline bool enterConfiguredLevel() {
     return true;
 }
 
-// Which screens the panel belongs on. It used to ride every scene that was not PlayLayer,
-// which parked it on top of whatever the current menu happened to keep in its bottom-left
-// corner. The mode switch only means anything on a screen a level is started from, so those
-// are the only ones it appears on: the main-level wheel (LevelSelectLayer) and the page of a
-// downloaded or online level (LevelInfoLayer) or a locally saved one (EditLevelLayer) --
-// which is what makes custom levels reachable.
-// Depth 2 rather than 1 because during a scene transition the running scene is the
-// CCTransitionScene and the real layer is its grandchild; without it the panel blinks out
-// for the length of every fade.
-inline bool isLevelLaunchScreen(cocos2d::CCNode* n, int depth = 0) {
-    if (!n || depth > 2) return false;
-    if (geode::cast::typeinfo_cast<LevelSelectLayer*>(n)
-        || geode::cast::typeinfo_cast<LevelInfoLayer*>(n)
-        || geode::cast::typeinfo_cast<EditLevelLayer*>(n)) return true;
-    auto* kids = n->getChildren();
-    if (!kids) return false;
-    for (unsigned i = 0; i < kids->count(); ++i)
-        if (isLevelLaunchScreen(static_cast<cocos2d::CCNode*>(kids->objectAtIndex(i)),
-                                depth + 1))
-            return true;
-    return false;
+// ---- swapping the level mid-session (cmd `swaplevel <path>`) ----------------
+//
+// The same construction as the levelfile= branch above, minus the fade: the
+// level a section solve wants is not the level the loop around it is playing.
+// A clone cut down to what the window can reach restores two to three times
+// faster, and the restore is 86-89% of a section search.
+//
+// WHAT THE SWAP DOES NOT CARRY: the new PlayLayer starts the level from the
+// top. Every group, toggle, counter and moved object is back at its load state,
+// and so is the attempt counter -- a caller that wants the world as it stood at
+// tick T has to replay to T again, which is what the section handoff already
+// does with practiceat / checkpointat.
+//
+// Called on the frame AFTER the request (queueInMainThread): the poll that
+// reads the command runs inside GJBaseGameLayer::update, and replacing the
+// scene from there tears down the layer that call is standing in.
+inline bool swapLevelNow(const std::string& path) {
+    std::ifstream lf(path, std::ios::binary);
+    if (!lf.is_open()) {
+        writeResult("swaplevel: cannot open " + path);
+        return false;
+    }
+    std::string raw((std::istreambuf_iterator<char>(lf)), std::istreambuf_iterator<char>());
+    auto* level = GJGameLevel::create();
+    level->m_levelName = "gdsolver swap";
+    level->m_levelID = g_cfg.levelId;
+    level->m_levelType = g_cfg.levelFileMain ? GJLevelType::Main : GJLevelType::Editor;
+    level->m_levelString = cocos2d::ZipUtils::compressString(raw, false, 0);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - g_swapT0).count();
+    g_forceCleanStart = true;
+    auto* scene = PlayLayer::scene(level, false, false);
+    CCDirector::sharedDirector()->replaceScene(scene);
+    writeResult("swaplevel: read+compressed " + std::to_string(raw.size()) + " chars in "
+                + std::to_string(ms) + " ms; scene replaced");
+    return true;
 }
 
-// Resident ticker that decides whether the panel is attached at all. It hangs off Geode's
-// OverlayManager, a node that outlives the running scene, so nothing here has to follow scene
-// transitions.
-//
-// [2026-08-30] This used to re-parent the panel onto each new running scene, under a comment
-// saying "This Geode version has no keepAcrossScenes, so we follow by ourselves". That was wrong
-// about the SDK rather than about GD: geode::OverlayManager is in 5.8.2 and is exactly this.
-// The attach/detach below is NOT part of what it replaces -- see the note on touches.
 // Resident poll that carries a suite from one level to the next. It hangs off the director's
-// scheduler for the same reason the panel keeper does: between two levels there is no game
-// layer and no session, so nothing else in the mod is running.
+// scheduler because between two levels there is no game layer and no session, so nothing
+// else in the mod is running.
 //
 // The wait is the whole of it. endSession asks PlayLayer to quit, GD fades to the level-select
 // screen, and a level entered before that fade finishes replaces a scene that is still being
@@ -235,8 +229,15 @@ public:
         g_cfg = Config{};
         loadConfig();
         g_cfg.levelId = suite::current();
-        g_cfg.levelFile.clear();          // a suite is main levels by id, never a rig file
         openFiles();                      // endSession closed them
+        // Main levels by ID; with cfg leveldir, the others from that directory (never a rig file
+        // left in the cfg by `levelfile=`).
+        if (!suiteLevelSource()) {
+            writeResult("suite: done " + std::to_string(suite::g_levels.size()) + " levels");
+            if (g_cfg.quitWhenDone)
+                Loader::get()->queueInMainThread([] { utils::game::exit(false); });
+            return;
+        }
         writeResult("suite: level=" + std::to_string(g_cfg.levelId)
                     + " (" + std::to_string(suite::g_at + 1) + "/"
                     + std::to_string(suite::g_levels.size()) + ")");
@@ -255,26 +256,5 @@ public:
         writeResult("suite: done " + std::to_string(suite::g_levels.size()) + " levels");
         if (g_cfg.quitWhenDone)
             Loader::get()->queueInMainThread([] { utils::game::exit(false); });
-    }
-};
-
-class PanelKeeper : public cocos2d::CCObject {
-public:
-    void tick(float) {
-        using namespace cocos2d;
-        if (!g_panel) return;
-        auto* scene = CCDirector::sharedDirector()->getRunningScene();
-        if (!scene) return;
-        // While playing the HUD has the screen; everywhere outside a level-launch screen the
-        // panel is detached rather than merely hidden, so it cannot eat a touch meant for the
-        // menu underneath it.
-        if (PlayLayer::get() != nullptr || !isLevelLaunchScreen(scene)) {
-            if (g_panel->getParent())
-                g_panel->removeFromParentAndCleanup(false);
-            return;
-        }
-        if (!g_panel->getParent())
-            OverlayManager::get()->addChild(g_panel, 9999);
-        g_panel->setVisible(true);
     }
 };

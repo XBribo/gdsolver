@@ -8,8 +8,13 @@ using namespace p1;
 namespace {
 
 // Only while a session records moving geometry: the box goes into that recording and nowhere else.
+// Not inside a section search: its steps revisit one frame again and again (a player-snapshot
+// restore does not re-stamp the objects), so every revisit read as a second varying action on the
+// same object in the same frame. Measured (4002, dpsecauto): compound=1692 and the cold run's check
+// called the level NOT CLEAN, on a route whose own flights never ran an Area Move at all.
 bool envActive() {
-    return g_cfg.areaEnv && grouptrace::g_on && g_started && !g_sessionOver;
+    return g_cfg.areaEnv && grouptrace::g_on && g_started && !g_sessionOver
+           && !secsolve::g_active;
 }
 
 // Area Rotate / Area Scale draw from the same table (their variances), and nothing here bounds

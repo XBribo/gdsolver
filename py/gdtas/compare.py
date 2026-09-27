@@ -239,8 +239,7 @@ MODEL = "model"    # a trace written by leveldp (*.trace.csv)
 # The blind spot of all of the above: a zero-divergence window only exists
 # where the model is already right. lv20 contributes 37% of its ticks, lv22
 # 51%, lv19 51%. A phase defect that is itself a cause of divergence is
-# precisely what this cannot witness. Details and the per-regime tables are in
-# the lab note measure-dump-column-phases-2026-09-06.
+# precisely what this cannot witness.
 COLUMNS: dict[tuple[str, Half], dict[str, str]] = {
     (GD, Half.P1): {"y": "y", "vy": "yvel", "x": "x", "mode": "mode",
                     "vsize": "vsize", "speed": "speed", "gravity": "upsideDown",

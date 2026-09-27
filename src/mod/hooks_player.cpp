@@ -1,5 +1,6 @@
 // EnhancedGameObject (pad trace) and PlayerObject hooks: state dump, physics tracing.
 #include "mod/playlayer_helpers.hpp"
+#include <Geode/modify/EndTriggerGameObject.hpp>
 
 using namespace p1;
 
@@ -45,6 +46,17 @@ class $modify(PadTraceGameObject, EnhancedGameObject) {
                                                    : portalseed::g_first2;
                 if (m.find(this->m_uniqueID) == m.end())
                     m[this->m_uniqueID] = (int)g_tick;
+            }
+            // ...and pads, for dp's --spentpad (padseed in sweep.hpp). Unconditional for
+            // the same reason as the two recorders above.
+            if (ty == 8 || ty == 9 || ty == 10 || ty == 34) {
+                ++padseed::g_calls;
+                auto* l = GJBaseGameLayer::get();
+                if (l && p == l->m_player1) {
+                    auto& m = padseed::g_first;
+                    if (m.find(this->m_uniqueID) == m.end())
+                        m[this->m_uniqueID] = (int)g_tick;
+                }
             }
         }
         if (g_cfg.padTrace) {
@@ -415,6 +427,22 @@ class $modify(PlayerObject) {
     void ringJump(RingObject* object, bool skipCheck) {
         auto* l = GJBaseGameLayer::get();
         bool isP1 = object && l && this == l->m_player1;
+        // ringseed (sweep.hpp), for dp --spentorb: a call that fires sets one of the per-tick
+        // fire latches 0x98b / 0x98c / 0x98d; one that returns early leaves them alone.
+        const unsigned char* const fireLatch = (const unsigned char*)this + 0x98b;
+        auto latchBits = [&]() {
+            return (fireLatch[0] ? 1 : 0) | (fireLatch[1] ? 2 : 0) | (fireLatch[2] ? 4 : 0);
+        };
+        const int latchBefore = isP1 ? latchBits() : 0;
+        auto noteRingFire = [&]() {
+            if (!isP1) return;
+            ++ringseed::g_calls;
+            if ((latchBits() & ~latchBefore) == 0) return;
+            const int uid = object->m_uniqueID;
+            for (const auto& f : ringseed::g_fired)
+                if (f.first == uid) return;
+            ringseed::g_fired.push_back({uid, (int)g_tick});
+        };
         // SUBSTITUTION PROBE (cfg `subringspent=1` + the hbfrom/hbto window, default off).
         // Observation answers "what differs"; this answers "what does changing the RULE do",
         // in GD's own arithmetic. 0x389f18 copies 0x986 ("this press has not been consumed")
@@ -447,6 +475,7 @@ class $modify(PlayerObject) {
         if (!watch) {
             PlayerObject::ringJump(object, skipCheck);
             if (subst) *spentMirror = savedSpent;
+            noteRingFire();
             return;
         }
         // This function is a test path called every tick for the whole contact, not the
@@ -489,6 +518,7 @@ class $modify(PlayerObject) {
         }
         PlayerObject::ringJump(object, skipCheck);
         if (subst) *spentMirror = savedSpent;
+        noteRingFire();
         float vyAfter = (float)this->m_yVelocity;
         if (std::abs(vyAfter - vyBefore) < 1e-4f) return; // did not fire
         // Log-flood guard: only near the targeted x + a total cap
@@ -583,7 +613,7 @@ class $modify(PlayerObject) {
     // gated on `this == m_player1`, so the instrument that names what GD
     // resolved the player against could not see the SECOND BODY at all -- and
     // the second body is exactly what every dual investigation ends up asking
-    // about. Custom level 1777565 is the case in point: its second body is held
+    // about. A custom level is the case in point: its second body is held
     // two ticks past box overlap at an edge its first body leaves on time, and
     // with only p1 traced there is no way to ask GD what is holding it.
     //
@@ -857,5 +887,19 @@ class $modify(PlayerObject) {
         auto* l = GJBaseGameLayer::get();
         if (l && this == l->m_player1) ev("PO_releaseButton", (int)button);
         return PlayerObject::releaseButton(button);
+    }
+};
+
+// An End trigger fired: the level finishes here, wherever "here" is (cfg dpendtrigclear reads the
+// tick at the clear). SubZero 4002 ends this way on the way back through its reversal, 6,278 px short
+// of its end portal.
+class $modify(EndTrigHook, EndTriggerGameObject) {
+    void triggerObject(GJBaseGameLayer* layer, int uniqueID, gd::vector<int> const* remapKeys) {
+        if (g_started && solver::g_endTriggerFiredTick < 0) {
+            solver::g_endTriggerFiredTick = (long long)g_tick;
+            writeResult("endtrigger: uid " + std::to_string(this->m_uniqueID) + " fired at t="
+                        + std::to_string(g_tick));
+        }
+        EndTriggerGameObject::triggerObject(layer, uniqueID, remapKeys);
     }
 };

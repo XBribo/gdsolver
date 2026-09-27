@@ -11,7 +11,7 @@ inline long long g_ckptTick = -1;
 // twice, the constructor) and neither resetObject nor loadFromCheckpoint nor
 // PlayerCheckpoint touches it, so a restore leaves whatever the PREVIOUS run
 // left behind. Recorded here so the restore can put back the value a replay
-// from the head would hold (checkpoint-restore-audit-2026-09-01 §4.1).
+// from the head would hold.
 inline unsigned char g_ckptOobLatch = 0;
 // ...and WHERE it lives, which is not where the decompilation appears to say.
 //
@@ -34,11 +34,11 @@ inline unsigned char g_ckptOobLatch = 0;
 // So the latch is 0xC38 and the audit's correction was the wrong way round.
 inline constexpr std::size_t kOobLatchOff = 0xC38;
 // (the dash held across a restore lives with its type, in secsolve.hpp)
-// y velocity at the checkpoint, full precision, for hole 3 of brief-018 -- the
+// y velocity at the checkpoint, full precision, for hole 3 -- the
 // restore is read as re-rounding it onto the 0.001 grid, which would lose the
 // half-grid values flipGravity (x0.5) and a ball tap (x0.6) make.
 inline double g_ckptVy = 0.0, g_ckptVyRel = 0.0;
-// The restore probe (brief-018 hole 2): how many updates still to report. The
+// The restore probe (hole 2): how many updates still to report. The
 // substep counter it reads is g_pcCalls, which already exists in config.hpp.
 inline int g_restoreProbe = 0;
 // Set beside the section search's own step, for the whole of that step: is this
@@ -49,10 +49,10 @@ inline int g_stepDepth = -1;
 // The plan's cursors as they stood at the checkpoint, so a restore can rewind
 // them with the game (see the note where they are captured).
 inline size_t g_ckptNextInput = 0, g_ckptNextToggle = 0;
-// brief-017 part B: the entry snapshots of one replay pass. Each carries the
+// The entry snapshots of one replay pass. Each carries the
 // plan's cursors as well as the checkpoint, because a restore has to rewind
 // those with the game or the restored run is fed a different input stream
-// (brief-018 hole 2 -- that mistake looked like a state hole for a whole day).
+// (hole 2 -- that mistake looked like a state hole for a whole day).
 struct SnapState { long long t; double x, y, vy; };
 struct EntrySnap {
     long long tick;
@@ -86,11 +86,15 @@ inline bool g_restorePending = false;
 constexpr int TRACE_LIMIT = 1000000;
 
 // Our own tick counter: incremented on every processCommands (= fixed 1/240s substep).
-// m_currentStep is not used because it measured as always 0 (see findings.md).
+// m_currentStep is not used because it measured as always 0.
 inline long long g_tick = 0;
 // Current rotation (0/1/2/3 = 0/90/180/270). Updated in rotateGameplay and emitted in the gframe
 // column of the dump. Reset to 0 at the head of a run (does not carry across attempts).
 inline int g_gameFrame = 0;
+// How many times rotateGameplay has run this session. A section search compares it against its own
+// start: g_gameFrame is one global, and a branch that turns the frame does not turn it back for the
+// next branch the search restores.
+inline long long g_rotGameplayCalls = 0;
 
 inline std::ofstream g_trace;
 inline std::ofstream g_dump;
@@ -142,7 +146,7 @@ inline void openFiles() {
               "dead,speed,gravityMod,platXVel,vsize,gy1,gy2,"
               "dual,p2y,p2vy,p2up,p2ground,p2dead,pmin,pmax,snapuid,snapdist,"
               "camscale,gframe,ctrlOff,camx,camy,p2ground2,p2mode,p2vsize,p2x,"
-              "rotch,rotidx,rotrev,firedw\n";
+              "rotch,rotidx,rotrev,firedw,bandst,bandmode,camoffy,freemode,bandforce\n";
 }
 
 inline void ev(const char* name, double a = 0, double b = 0, double c = 0) {

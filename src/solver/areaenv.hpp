@@ -181,7 +181,7 @@ inline double g_maxErr = 0.0;
 inline std::string g_firstMiss;
 // The solver's kills by these boxes (dp's hazard twins), counted from the level's entry. The box
 // is conservative -- it also closes routes one game's seeds would leave open -- so non-zero means
-// the search was pruned by uncertainty, not only by the level (audit AUD-20260920-01).
+// the search was pruned by uncertainty, not only by the level.
 inline long long g_killsBase = 0;
 inline long long solverKills() { return ::dpbridge::envKillsTotal() - g_killsBase; }
 

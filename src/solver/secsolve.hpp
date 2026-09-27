@@ -19,26 +19,29 @@
 // per layer x 300 layers = 60,000 expansions that is 2-3 minutes, practical as
 // long as it stays section-limited.
 //
-// How state is held: only ONE CheckpointObject is kept, for the section entry.
-// Each node is represented as "the input sequence from the section start" and
-// is rebuilt on every expansion by
-//   restore -> replay the prefix -> branch
-// Holding one checkpoint per layer would mean holding "all object state" in
-// batches of 100 — what caused the old implementation's OOM — so that is not
-// done. Replaying the prefix is about 0.007ms per tick, so even at depth 300 it
-// adds only about 2ms.
+// How state is held: each frontier node keeps its own restorable state -- a
+// CheckpointObject, or under psnap a snapshot of a few KB -- released as soon as
+// the layer moves on, so an expansion is one restore and one step. (The first
+// design kept one checkpoint for the section entry and replayed each node's
+// prefix from it; that cost grew with the square of the depth.) A node's
+// identity is its parent and the input it took; walking the parents gives the
+// plan.
 //
 // The search is per-layer breadth-first + quantised dedupe + cap truncation.
 // It is shaped like the DP on purpose, to keep the truncation properties the
-// same as known ones (docs/HANDOFF.md update 28).
+// same as known ones.
 //
-// Two ways to start it:
+// Ways to start it:
+//   * as a rung of the repair loop (cfg `dpsecauto`, on by default; or the
+//     runtime command `secrung <startTick> <targetX> [horizon] [cap]`): the
+//     loop suspends, its deepest VERIFIED plan replays to the section head (the
+//     handoff in dpsolve::poll, repair.hpp), and a leaf the plain replay
+//     reproduces is spliced back into the plan and the loop resumes.
 //   * cfg keys at session open (the served path, py/secsolve_run.py) -- a plan
 //     in the cfg reaches the section head, `checkpointat`/`secstart` take over.
 //   * the runtime command `secsolve <startTick> <targetX> [horizon] [cap]`
-//     (cmd.txt) DURING an in-process solve session: the repair loop retires and
-//     its deepest VERIFIED plan replays to the section head (the handoff in
-//     dpsolve::poll, repair.hpp). One-way -- the search ends the session itself.
+//     (cmd.txt) DURING an in-process solve session: the same handoff, but
+//     one-way -- the search ends the session itself.
 // ============================================================================
 
 namespace secsolve {
@@ -50,8 +53,7 @@ inline int g_horizon = 300;          // section length (ticks)
 inline size_t g_cap = 100;           // states kept per layer
 // ---- exit conditions (other than x) -----------------------------------------
 // The axis of travel is NOT necessarily x. lv22's x≈2,266 is a 90-degree
-// rotated section: travel is -y and pressing moves x (docs/HANDOFF.md update
-// 71). "Crossing x" is not a valid goal there, so the exit can also be written
+// rotated section: travel is -y and pressing moves x. "Crossing x" is not a valid goal there, so the exit can also be written
 // in y and in depth.
 // The test is OR — meeting any one of the enabled ones is success. Default is
 // both disabled, the old behaviour of looking at x only.
@@ -79,7 +81,7 @@ inline bool g_done = false;          // once per session
 // said once: "secsolve=1 but no checkpoint, so nothing ran"
 inline bool g_warnedNoCkpt = false;
 
-// ---- the reference spine (brief-017 part C) --------------------------------
+// ---- the reference spine ----------------------------------------------------
 //
 // One rollout is pinned: the verified solution's own inputs, followed from the
 // section head, exempt from BOTH the dedupe and the cap. Without it a window
@@ -95,8 +97,8 @@ inline bool g_warnedNoCkpt = false;
 // dedupe was the binding constraint, and the class the solution lives in was
 // being merged into one that dies.
 //
-// This does not put a seed into a solve. 017 is a measurement pass -- the
-// campaign rule allows a reference replay as an INSTRUMENT, and what the spine
+// This does not put a seed into a solve. This is a measurement pass -- a
+// reference replay is allowed as an INSTRUMENT, and what the spine
 // buys is that the window is always crossed, so the diff tables are always
 // complete around the path rather than absent whenever the search loses it.
 inline bool g_spineOn = true;        // cfg `secspine=0` turns it off for A/B
@@ -141,7 +143,7 @@ inline double g_dt = 1.0 / 240.0;
 // necessarily the value that falls straight out of "the restore lands at tick
 // ckptTick+1".
 //
-// [2026-08-27] SWEEP IT, never read one run. On 1474319 at ckptTick=300 the
+// [2026-08-27] SWEEP IT, never read one run. On a custom level at ckptTick=300 the
 // series -2/-1/0/1/2 gave diedAt 125/118/114/110/106, and only -2 reproduced the
 // plain run's death (x=553.055, t=426) to three decimals. Read at the default 0
 // alone, the same section says "the restore is unfaithful, the replay dies 11
@@ -163,6 +165,15 @@ inline int g_snapMode = 0;
 // shifted by 10,000 ticks, but a real search expands 100k times per section,
 // so this is a safety valve to stay inside the measured range.
 inline int g_rephase = 5000;
+// The wave trail is not in a player snapshot (cfg `sectrail=0` leaves it alone). In wave mode
+// every step appends a point to HardStreak::m_pointArray and nothing takes one away short of a
+// checkpoint restore, while GJBaseGameLayer::update walks the whole array (updateStroke) four
+// times a step. lv4003: +173 points a layer, ~0.34 us a point -- 49 us a step at 166 points,
+// 512 at 1,544. The trail is only drawn, so every snapshot restore empties it: the three wave
+// windows of the bench went 33/38/28 s -> 6.7/6.8/8.6 s, and all eight windows kept every
+// layer's fingerprint. (A checkpoint restore every 200 snapshot restores had got the first part
+// of that for the wrong reason, and moved the world's phase with it.)
+inline bool g_trailClear = true;
 inline bool g_snapOn = false;        // is psnap actually used in this section
 // Whether to restore moving objects too (`wsnap`). psnap splits in moving
 // sections because it does not restore GameObject positions, so restore ONLY
@@ -176,7 +187,7 @@ inline std::vector<GameObject*> g_movSet;   // decided once at the section start
 // cfg `secworld=N`: compare the world object-by-object after checkpoint restore
 // vs after psnap restore
 inline int g_worldDiff = 0;
-// WHAT THIS SEARCH CANNOT SEE [2026-08-27, measured on 1474319]
+// WHAT THIS SEARCH CANNOT SEE [2026-08-27, measured on a custom level]
 // A branch is one restore plus one step, so any death GD only reaches by
 // ACCUMULATING state over consecutive ticks -- the out-of-bounds latch that
 // wants two of them, a one-shot trigger the restore puts back -- is reset
@@ -289,6 +300,63 @@ inline int g_leafDeadAt = -1;
 // IS NO CONTINUATION FROM THAT EXIT (DOOMED). In a state where input works,
 // normally one of them lives.
 inline int g_grace = 600;
+// ...and in a mode that steers in the air (ship, UFO, wave, swing), which the test above passes
+// on its first tick, how many ticks one of the lines has to live (cfg `secgracefly`, 0 = none).
+// A rung's leaf only has to be alive at its depth: on coin-off SubZero lv4001 30 of 43 rungs
+// were fired by a death 2-9 ticks past the previous splice, a ship the model and the game both
+// killed on the same tick from the spliced state.
+inline int g_graceFly = 0;
+// Which leaf a depth goal takes first (cfg `secleafmid`, on: the middle of the band; 0 = the
+// old order). The frontier comes out of the cap sorted by y, and the layer that reaches the goal
+// depth took the first child alive there -- the band's lowest edge. Coin-off SubZero lv4001: in
+// every one of the rungs that were fired 2-9 ticks past the previous splice, the leaf was the
+// frontier's lowest y (y 564 over a band 564..840, the floor's killer at 546), whatever the
+// depth (254 or 632). Loop A/B with dpsecauto (same geode and pricing, coin off): 4001
+// 66 rounds / 1,867 s -> 23 / 247, 4002 30 / 514 -> 25 / 461, 4003 68 / 918 -> 71 / 872.
+inline bool g_leafMid = true;
+// cfg `secleaflife=N` (print only, 0 = off): an accepted exit's life under the best of the grace
+// lines, up to N ticks (`secleaf:` lines).
+inline int g_leafLife = 0;
+// cfg `secdrift=1` (print only): per layer, the object furthest from its start position
+// (`secdrift:` lines).
+inline bool g_driftLog = false;
+// cfg `seccoins` (on; 0 = off), under cfg coinroute: the search takes the coins itself. GD
+// collects nothing in practice mode -- collisionCheckObjects skips the whole coin branch
+// (destroyObject, pickupItem) while PlayLayer+0x31f0, which togglePracticeMode writes, is set --
+// and a section search runs in practice mode, so until now it simply ignored coins: a rung whose
+// window held a coin could splice a route past it, and the pin then kept the ladder from ever
+// taking it back. Each node now carries the coins its path has touched (the player's box
+// overlapping the coin's, where GD credits: offsets up to 34.8 px in one axis, measured on the
+// 22 stored solutions), and a branch past a coin's far edge + 15 without it is dead -- the loop's
+// own coinmiss bound. Coins already taken or already passed at the section head do not count, nor
+// do disabled ones, nor any while the player runs left or sideways (as coinmiss).
+inline bool g_secCoins = true;
+// cfg dpseccoinrung: the coin this rung was fired for (-1 = none). Leaving it behind is final and
+// a leaf without it is no answer. Set by the handoff, cleared when the rung ends.
+inline int g_rungCoin = -1;
+// cfg `secbound` (on; 0 = off): inside a search, an object outside the level's box (every
+// object's position at the section head, plus kBoundMargin px) is not re-bucketed into GD's
+// sections. A player snapshot puts the in-progress moves back but not the objects they move, so
+// a move re-applies on top of where the last step left it, and on lv4001 x~27,000 objects under
+// a player-locked move, a follow of it, and later others ran off by millions of px within a layer
+// (id 1011 uid 17884 to x +3.3M / y -10.6M). Every section crossed on the way stays allocated,
+// and every checkpoint restore's sortSectionVector walks them all: secPhys 4,551 -> 1.5M over a
+// run, a restore 1.3 -> 5.8 ms, and a fresh process at the same place still at 1.5-1.6.
+// Out there an object touches nothing the player can reach, and the checkpoint restore that puts
+// it back re-buckets it as usual. Bench: all 11 windows (lv4003 x8, lv4001 x3) keep every layer's
+// fingerprint and the leaf; lv4001's go 25/29/30 s -> 17/20/19 s (~430 re-buckets a step skipped).
+inline bool g_boundOn = true;
+constexpr double kBoundMargin = 3000.0;
+inline double g_boxX0 = 0.0, g_boxX1 = 0.0, g_boxY0 = 0.0, g_boxY1 = 0.0;
+inline long long g_boundSkips = 0;
+// cfg `secshaderskip=1` (EXPERIMENT, off by default): inside a search, leave the shader layer as
+// it is. resetLevel calls GJBaseGameLayer::updateShaderLayer twice per restore (once through
+// resetLevelVariables), and it moves the layers that hold every object's sprite in and out of the
+// shader's container; each move walks the whole subtree through onExit / onEnter, Geode's hooks
+// on them included. A late restore of a long search (a heavy custom level's slice, 09-26) spent
+// 87% of its time there, and the cost grew with the number of restores.
+inline bool g_shaderSkip = false;
+inline long long g_shaderSkips = 0;
 // After how many doomed exits to give up with "nothing from this entry"
 // (cfg `secmaxdoomed`). Each one costs a replay + 10 grace lines ≈ 1,300 steps,
 // measured 344 of them in 104 seconds. That is plenty as evidence, so stop there.
@@ -386,7 +454,7 @@ inline std::vector<Node> g_nodes;
 // RESTORE does not read it back -- see the note above DashState.
 inline std::vector<DashState> g_dash;
 // Per-node exact y velocity. The checkpoint restore re-rounds it onto the 0.001
-// grid (brief-018 hole 3), and a search restores once per tick, so the rounding
+// grid (hole 3), and a search restores once per tick, so the rounding
 // is applied once per step instead of once per section.
 inline std::vector<double> g_vy;
 // Per-node boost accumulator (m_accelerationOrSpeed) and pad-touch flag. The
@@ -409,8 +477,8 @@ inline std::vector<double> g_vy;
 // explained: the first tick of a boost is the same either way.
 inline std::vector<double> g_accel;
 inline std::vector<uint8_t> g_pad;
-// ...and the same thing for the plain checkpoint/restore path (hole 2 of
-// brief-018), which 017's section runs use and which had no dash handling at
+// ...and the same thing for the plain checkpoint/restore path (hole 2),
+// which the section runs use and which had no dash handling at
 // all. MEASURED without injection: lv22 checkpoint at t=2,112 mid-dash,
 // restore at t=2,232, and from two ticks on the restored run FALLS (vy 0.324,
 // -0.272, -0.570, ...) while the run from the head holds y=241.7341 at
@@ -554,6 +622,14 @@ inline void reset() {
     g_frontierNow = 0;
     g_done = false;
     g_active = false;
+    // A search dropped in the middle -- the player left the level -- also leaves these raised,
+    // and the next session inherited them: with g_noKill up the destroyPlayer hook swallowed
+    // every death, so the next solve "cleared" at once and replayed (lv16, lv20), or never got
+    // anywhere (lv22) (user report on the panel, 2026-09-25).
+    g_on = false;
+    g_noKill = false;
+    g_died = false;
+    g_rungCoin = -1;
     g_feed = 0;
     g_held = 0;
     g_nodes.clear();
@@ -637,11 +713,16 @@ inline bool reachedGoal(double px, double py, int depth) {
 // the solution died in plain replay exactly at the wall's x. The input at
 // depth d belongs to tick ckptTick + 1 + d of the plain run (the restore
 // lands on the state at tick ckptTick+1).
-inline std::string inputsOf(int leaf) {
+inline std::vector<uint8_t> inputVecOf(int leaf) {
     std::vector<uint8_t> seq;
     for (int i = leaf; i > 0; i = g_nodes[(size_t)i].parent)
         seq.push_back(g_nodes[(size_t)i].in);
     std::reverse(seq.begin(), seq.end());
+    return seq;
+}
+
+inline std::string inputsOf(int leaf) {
+    const std::vector<uint8_t> seq = inputVecOf(leaf);
     std::string s;
     for (size_t i = 0; i < seq.size(); ++i) {
         if (i) s += ',';

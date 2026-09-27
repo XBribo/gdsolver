@@ -11,7 +11,7 @@
   "id": 1583,
   "scale": 0.0,
   "rot": 90,
-  "why": "the same blade turned 90 degrees. id 1583 is 31x23, so w/w0 stops being the scale and becomes the SWAP ratio 0.742: the model recovers a radius of 2.968 where GD's is still 4.00. The axis boundary tells them apart, 1.03 px. 31x23 is also not a multiple of 30, so this one station also separates the two pivot conventions -- getRealPosition against the rect centre -- which is the other thing brief-013 asks a rig to settle"
+  "why": "the same blade turned 90 degrees. id 1583 is 31x23, so w/w0 stops being the scale and becomes the SWAP ratio 0.742: the model recovers a radius of 2.968 where GD's is still 4.00. The axis boundary tells them apart, 1.03 px. 31x23 is also not a multiple of 30, so this one station also separates the two pivot conventions -- getRealPosition against the rect centre -- which is the other thing this rig is meant to settle"
  },
  {
   "x": 4000,

@@ -89,7 +89,8 @@ inline void clear() {
     g_curSeenShowing = false;
 }
 
-inline void show(const std::string& text, NotificationIcon icon, float seconds) {
+// The raising itself, with no gate: only the self-test below calls it directly.
+inline void showAlways(const std::string& text, NotificationIcon icon, float seconds) {
     clear();                       // never stack ours; the queue is what wedges
     auto* n = Notification::create(text, icon, seconds);
     if (!n) return;
@@ -99,6 +100,19 @@ inline void show(const std::string& text, NotificationIcon icon, float seconds) 
     g_stage = 0;
     g_curSeenShowing = false;
     n->show();
+}
+
+// What every caller in the mod uses. NOT IN A SESSION THAT QUITS THE GAME: nobody sees it,
+// and one still alive when the process exits is destroyed by Geode's atexit destructor for
+// its notification queue after the hooks that destructor goes through are gone -- an access
+// violation in tulip::hook::Wrapper::createWrapper under LdrShutdownProcess -- and Geode's
+// crash window then faults again in its focus callback and stays up, so the worker never
+// exits. Measured 2026-09-22: worker 91 wrote "solution saved" at 12:22:35 and crashed at
+// 12:22:36 in exactly that stack. A UI-started session sets quitWhenDone=false and keeps its
+// notifications.
+inline void show(const std::string& text, NotificationIcon icon, float seconds) {
+    if (g_cfg.quitWhenDone) return;
+    showAlways(text, icon, seconds);
 }
 
 // Once per frame, from the same place audio::sync runs.
@@ -189,7 +203,7 @@ inline void selfTest() {
     if (g_testStage == 0) {
         g_testStage = 1;
         g_testT0 = std::chrono::steady_clock::now();
-        show("gdsolver: notification self-test", NotificationIcon::Info, 3.f);
+        showAlways("gdsolver: notification self-test", NotificationIcon::Info, 3.f);
         writeResult("notifytest: shown (3s), purging under it in 1s");
         return;
     }
@@ -221,14 +235,14 @@ inline void selfTest() {
     if (g_testStage == 3 && el >= 11.0) {
         g_testStage = 4;
         g_testT0 = std::chrono::steady_clock::now();
-        show("gdsolver: notification self-test A", NotificationIcon::Info, 3.f);
+        showAlways("gdsolver: notification self-test A", NotificationIcon::Info, 3.f);
         writeResult("notifytest2: A shown (3s)");
         return;
     }
     if (g_testStage == 4 && el >= 0.6) {
         g_testStage = 5;
         // A is still up, so show() retires it and B goes into the queue behind A's fade-out...
-        show("gdsolver: notification self-test B", NotificationIcon::Info, 3.f);
+        showAlways("gdsolver: notification self-test B", NotificationIcon::Info, 3.f);
         purgeDanglingActions();   // ...and the purge lands on that fade-out, pop and all
         writeResult(std::string("notifytest2: B queued, purged under A - A=")
                     + (g_retiring && g_retiring->isShowing() ? "showing" : "gone")

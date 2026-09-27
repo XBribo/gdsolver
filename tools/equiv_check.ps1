@@ -18,7 +18,7 @@
 
 .EXAMPLE
   # after rebuilding, against the frozen reference
-  tools\equiv_check.ps1 -OldExe ..\GD-lab\exe\leveldp_r108b.exe `
+  tools\equiv_check.ps1 -OldExe <frozen copy>\leveldp_ref.exe `
                         -NewExe build\dp\RelWithDebInfo\leveldp.exe
 #>
 [CmdletBinding()]
@@ -30,7 +30,8 @@ param(
     [string]$OutDir = "$env:TEMP\gdsolver-equiv",
     # Solutions live in the repository; the level dumps live in the private lab.
     [string]$Data = 'data',
-    [string]$LevelData = $(if ($env:GDSOLVER_LAB) { "$env:GDSOLVER_LAB\data" } else { '..\GD-lab\data' }),
+    # gdtas.paths decides where (GDSOLVER_LAB, or its default beside the repository).
+    [string]$LevelData = $(python -c "import sys; sys.path.insert(0, 'py'); from gdtas.paths import LEVEL_DATA; print(LEVEL_DATA)"),
     [int[]]$ReplayLevels = @(1, 16, 18, 20, 22),
     [int[]]$ColdLevels = @(1..22),
     [int]$ColdHorizon = 3000

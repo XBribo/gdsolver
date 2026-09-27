@@ -21,6 +21,11 @@ target_link_libraries(leveldp PRIVATE gdsolver_dp)
 add_executable(seqcall src/seqcall_main.cpp)
 target_link_libraries(seqcall PRIVATE gdsolver_dp)
 
+# The rules a corpus of whole sections cannot referee -- a boundary the recordings in it do not
+# contain. Run it by hand next to quick_regress; it needs no game and no data.
+add_executable(dptest src/dptest_main.cpp)
+target_link_libraries(dptest PRIVATE gdsolver_dp)
+
 # Keep the code generation identical to the historical standalone build
 # (GD-approx-physics: /W4 /permissive- /utf-8, Release = /O2 /Ob2 /DNDEBUG).
 # The search is throughput-bound, and the DP inside the mod must behave
@@ -31,7 +36,10 @@ if (MSVC)
         $<$<CONFIG:RelWithDebInfo>:/Ob2>)
     target_compile_options(seqcall PRIVATE /W4 /permissive- /utf-8
         $<$<CONFIG:RelWithDebInfo>:/Ob2>)
+    target_compile_options(dptest PRIVATE /W4 /permissive- /utf-8
+        $<$<CONFIG:RelWithDebInfo>:/Ob2>)
 else()
     target_compile_options(leveldp PRIVATE -Wall -Wextra -Wpedantic -O2)
     target_compile_options(seqcall PRIVATE -Wall -Wextra -Wpedantic -O2)
+    target_compile_options(dptest PRIVATE -Wall -Wextra -Wpedantic -O2)
 endif()

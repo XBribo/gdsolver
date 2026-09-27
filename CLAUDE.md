@@ -17,6 +17,8 @@ py/       cold regression (cold_regress.py), verification, fidelity
 mcp/      MCP server: ask the running game questions interactively
 data/     solutions (tracked) and per-run working files (not tracked)
 data/rigs calibration levels (.lvl / .units.json / .plan.txt)
+docs/     architecture, the section solver, coins, the level slice,
+          custom levels, watching a run
 tools/    repo utilities (e.g. check_code_only_diff.py)
 ```
 
@@ -68,6 +70,11 @@ python py/dev.py                                   # build, deploy, launch GD
    never exercised. A leak of exactly that kind (one level's moving-geometry
    recording adopted by the next) sat under a green 22/22 for months and was
    found by hand, not by the suite.
+   Every cold run writes `cold_manifest.json` beside its logs — the commit, the
+   package, every cfg value the mod held and the core's built-in defaults.
+   `python py/cold_manifest.py compare <a> <b>` refuses two runs that differ in
+   anything not named with `--allow`, and `check` confirms a run against the
+   expected settings before it is blessed.
 4. **Measure the instrument before believing it.** Buffered logs, stale dumps,
    a second process writing the same data root, an isolated data dir carrying
    yesterday's files — these have each produced convincing wrong conclusions.

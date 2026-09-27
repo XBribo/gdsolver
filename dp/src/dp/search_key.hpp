@@ -59,6 +59,21 @@ inline double g_cubeVq = 10.0;
 // Dedupe multiplier for a dual's second body while it is in open air (see
 // stepBoth / keyOf). 0.125 = 4 px / 0.8 vy bins instead of 0.5 px / 0.1.
 inline double g_dualFreeQ = 0.125;
+// --heldkeyread (off): key `held` only for a body whose next tick reads it or writes it from the
+// button -- ship, UFO, wave and swing (and every dual) -- instead of in every mode. Only the wave
+// and flight branches write `held` (without --heldall), so in a cube, ball, robot or spider it
+// is whatever the last flight section left, read by nothing, and it split those cells: measured
+// by --searchcensus over the 22 official levels and 7 customs, 15% of cube cells, 21% of ball
+// and 6% of spider cells were kept apart by `held` alone.
+inline constexpr bool kDefHeldKeyRead = false;
+inline bool g_heldKeyRead = kDefHeldKeyRead;
+// --keyxq / --keyxqfly (default 4.0 = the 0.25 px x bucket): the x-phase bucket multiplier for
+// the ground modes (cube, ball, robot, spider) and for the flying ones (ship, UFO, wave, swing).
+// The x term keeps the snap phases apart (see keyOf); --searchcensus measured it as the largest
+// single divider of the frontier (56% of cube cells, 59% of ship cells).
+inline constexpr double kDefKeyXq = 4.0;
+inline double g_keyXq = kDefKeyXq;
+inline double g_keyXqFly = kDefKeyXq;
 
 // TRIED AND REVERTED (2026-08-03): one bit per nearby portal in the key,
 // saying "is this state lined up to fire it right now" (the step's own y-box
@@ -77,11 +92,11 @@ inline double g_dualFreeQ = 0.125;
 // (t=18,330, x=24,721.0) and the arena grows 0.25%.
 // (The 17-level cold regression it was run against came back 16/17 with lv9
 // STUCK at x=21,225, but that is NOT this change's doing -- lv9 fails at the
-// same x on the build without the bits. It is a pre-existing break; see
-// docs/findings.md.) Reverted for having no measured benefit, on the same
-// grounds as the `s.action` experiment recorded at the end of the key below.
-// What actually happens at that portal is in docs/findings.md: the touching
-// branch exists, the driver just never re-anchors far enough back to take it.
+// same x on the build without the bits. It is a pre-existing break.)
+// Reverted for having no measured benefit, on the same grounds as the
+// `s.action` experiment recorded at the end of the key below. What actually
+// happens at that portal: the touching branch exists, the driver just never
+// re-anchors far enough back to take it.
 
 // GD's `upsideDown` for a state whose `flip` is the model's frame-local sign.
 // `toFrame` gives frame 1 v = +X and frame 3 v = -X, so frame 3 is the mirror.
@@ -91,6 +106,35 @@ inline double g_dualFreeQ = 0.125;
 // portals -- convert; the physics keeps using `flip`.
 inline uint8_t gdUpOf(const State& s) {
     return (s.frame == 3) ? (uint8_t)!s.flip : s.flip;
+}
+
+// A HELD state near a toggle block it has not fired (g_pressWin, triggers.hpp). Frame 0 only:
+// the windows are frame-0 x ranges, and the one block that needs this (SubZero 4003's uid 4001)
+// sits in frame 0.
+inline bool nearPressBox(const State& s) {
+    if (g_pressWin.empty() || s.frame != 0) return false;
+    const double x = (double)s.xAbs;
+    for (const PressWin& w : g_pressWin)
+        if (x >= w.lo && x <= w.hi && !s.trig.test(w.bit)) return true;
+    return false;
+}
+// ...and the key term for it. Inside a block's window, a held state that has not fired it and a
+// state that HAS are each their own node: the second matters as much as the first, because the
+// tick a held child enters the block its sibling that let go does not, and the layer is only
+// partitioned by `trig` from the NEXT tick -- within the tick both share the parent's dedupe, and
+// the one that fired used to merge into the one that did not (measured on 4003: 1,003 entries at
+// t=7,750, not one of them alive at t=7,752). 0 for a released state that has not fired it, so
+// those keys stay bit-identical.
+inline uint64_t pressKey(const State& s) {
+    if (g_pressWin.empty() || s.frame != 0) return 0;
+    const double x = (double)s.xAbs;
+    uint64_t k = 0;
+    for (const PressWin& w : g_pressWin) {
+        if (x < w.lo || x > w.hi) continue;
+        if (s.trig.test(w.bit)) k ^= 0x5851F42D4C957F2Dull * (uint64_t)(w.bit + 1);
+        else if (s.action) k ^= 0xE7037ED1A0B428DBull * (uint64_t)(w.bit + 1);
+    }
+    return k;
 }
 
 // `t` is the tick the state belongs to. It is a parameter rather than a field
@@ -105,6 +149,15 @@ inline uint8_t gdUpOf(const State& s) {
 // fails to match and reads as "the reference left the frontier" when nothing
 // left it. The two call sites there rebuild the reference key at the tick they
 // compare at, for that reason.
+// Whether the flight band clamps this state: the modes whose clamps read it (step.hpp's
+// ship/UFO/swing, ball/spider and wave branches), for either body of a dual. A cube and a robot
+// never read it, and GD's pmin/pmax there are camera state that carries the run's history, so two
+// flights of one plan record different values (SubZero 4001, 2026-09-26). The loop records the band
+// only around these modes (repair.hpp) and the key and the cap classes use it only here.
+inline bool bandClamps(const State& s) {
+    auto m = [](int k) { return k == 1 || k == 2 || k == 3 || k == 4 || k == 6 || k == 7; };
+    return m(s.mode) || (s.dual && m(s.mode2));
+}
 inline uint64_t keyOf(const State& s, long long t) {
     // dedupe key: exact enough to keep distinct behaviours, coarse enough to
     // saturate. cube y 0.5px / vy 0.1; ship coarser (y 1px / vy 0.2) or the
@@ -143,7 +196,9 @@ inline uint64_t keyOf(const State& s, long long t) {
     // misses. The search had BOTH phases available and collapsed them into one,
     // so it never had the choice. The bucket is 0.25 px, far finer than a snap
     // and far coarser than the float noise, so it costs almost no extra states.
-    const int32_t xq = (int32_t)std::lround(s.xAbs * 4.0);
+    // (--keyxq / --keyxqfly; both 4.0 unless given, which is this expression exactly)
+    const bool flyX = (s.mode == 1 || s.mode == 3 || s.mode == 4 || s.mode == 7);
+    const int32_t xq = (int32_t)std::lround(s.xAbs * (flyX ? g_keyXqFly : g_keyXq));
     uint64_t k = ((uint64_t)(uint32_t)yq << 32) ^ ((uint64_t)(uint32_t)xq << 18)
            ^ ((uint32_t)vq << 6)
            ^ ((uint64_t)s.mini << 5)
@@ -202,7 +257,12 @@ inline uint64_t keyOf(const State& s, long long t) {
            // same y and vy that came in through different mode portals are
            // clamped by different ceilings and floors, so they are not
            // interchangeable (lv1's two lanes into its last ship section).
-           ^ ((uint64_t)(uint32_t)(int32_t)std::lround(s.bandFloor) << 46)
+           // Only for a body the band clamps (bandClamps): a cube or a robot never
+           // reads it, and the next mode portal sets it again, so two such states
+           // with different bands are the same state. Keyed there, the band's
+           // camera noise split cells that are one (see bandClamps).
+           ^ (bandClamps(s) ? ((uint64_t)(uint32_t)(int32_t)std::lround(s.bandFloor) << 46)
+                            : 0)
            // ...and in BRANCH A the band's HEIGHT is animating rather than
            // fixed, so two states at the same y and vy that reached this tick
            // at different points of the tween are clamped by different
@@ -216,7 +276,7 @@ inline uint64_t keyOf(const State& s, long long t) {
            // lv22 itself wherever the mode holds the band.
            // WHAT THIS COSTS IS NOT MEASURED. A new key dimension fragments
            // the arena, and the only instrument for that is a cold run.
-           ^ (((s.bandBranch & 3) == 1)
+           ^ (((s.bandBranch & 3) == 1 && bandClamps(s))
                   ? ((uint64_t)(uint32_t)(int32_t)std::lround(
                         kBandRetracted
                         - (kBandRetracted - ((double)s.bandCeil
@@ -253,6 +313,23 @@ inline uint64_t keyOf(const State& s, long long t) {
            // ...and the same for a DASH, which is held in exactly the same way
            ^ ((uint64_t)s.dashing << 54)
            ^ ((uint64_t)((s.rHover || s.dashing) ? s.action : 0) << 55)
+           // ...and near a TOGGLE BLOCK it has not fired (g_pressWin), for the
+           // same reason: the block fires on the parent's button, so the held
+           // child and the released one of an airborne cube -- same y, same vy
+           // -- answer the next tick differently, and without this the dedupe
+           // kept whichever came first, which is the released one. Measured on
+           // SubZero 4003 (2026-09-24): from t=6,958 the search passed the block
+           // at uid 4001 with no state ever entering it, while the same route
+           // with the button held through it enters it at t=7,762. Every key
+           // away from such a block, and every released key near one that has
+           // not fired it, stays bit-identical (see pressKey).
+           ^ pressKey(s)
+           // --airpress: a cube's press buffer (see g_airPress), in the air AND
+           // on the ground: a cube standing with the button held jumps on the
+           // next tick's physics pass, one that let go needs a fresh press (the
+           // rising-edge pass), so the two are different futures either way.
+           // Only a set buffer changes the key, and only under the flag.
+           ^ ((g_airPress && s.mode == 0 && s.jumpBuf) ? 0x6C62272E07BB0142ull : 0)
            // Slope ride counter (see State::slopeT): two riders at the same
            // (x, y, vy) that landed on the ride at different ticks launch with
            // different exit impulses, so they are not interchangeable. Gated
@@ -325,6 +402,13 @@ inline uint64_t keyOf(const State& s, long long t) {
            // what it always was, so every key is bit-identical.
            ^ (g_fgArmLive ? ((uint64_t)s.fgArm * 0xBF58476D1CE4E5B9ull)
                           : ((uint64_t)s.fgArm << 63))
+           // --upsidecoyote: a cube whose og is still set can jump from mid-air next tick and
+           // one at the same (y, vy) without it cannot. Set only under the flag, so every
+           // other key is bit-identical.
+           ^ (s.ogLinger ? 0x3C6EF372FE94F82Bull : 0)
+           // --holdlatch: a held button a ball's tap has spent does not thrust a ship, and one
+           // that is still live does. Set only under the flag.
+           ^ (s.holdDead ? 0x1F83D9ABFB41BD6Bull : 0)
            // ...and the id-1859 ceiling arm WOULD be the same kind of world
            // state, for the same reason: two cubes at the same (y, vy) answer
            // the ceiling above them with a bonk or with a death depending on
@@ -337,7 +421,7 @@ inline uint64_t keyOf(const State& s, long long t) {
            // holds behave alike -- and 0 in every level without an id-1859, so
            // every existing key stays bit-identical.
            // --bonkarm puts the gate back, so it puts the bit back with it.
-           ^ ((g_bonkArm && s.armT < kArmTicks) ? 0xFF51AFD7ED558CCDull : 0)
+           ^ ((s.armT < kArmTicks) ? 0xFF51AFD7ED558CCDull : 0)
            // --coins: the collected set (State::coins). Same argument as the
            // trigger mask -- a state that took the coin and one that flew
            // through the same cell without it answer the rest of the level
@@ -367,7 +451,11 @@ inline uint64_t keyOf(const State& s, long long t) {
            ^ (s.ceilT ? (0x165667B19E3779F9ull
                          * (uint64_t)(s.ceilT | ((uint32_t)s.ceilM4 << 8)))
                       : 0)
-           ^ ((uint64_t)s.held << 1) ^ s.grounded;
+           // --heldkeyread: only where the body's next tick reads or writes it (see above)
+           ^ ((!g_heldKeyRead || s.dual || s.mode == 1 || s.mode == 3 || s.mode == 4
+               || s.mode == 7)
+                  ? ((uint64_t)s.held << 1) : 0)
+           ^ s.grounded;
     // Which gravity portals this state has spent (State::portalLatch). Unlike
     // `trig` this is not partitioned into the group -- a spent portal moves no
     // geometry, so both states want the same windows -- and the separation has
@@ -378,10 +466,20 @@ inline uint64_t keyOf(const State& s, long long t) {
     // constant is a bijection, so those layers keep their dedupe exactly. Only
     // a layer that genuinely disagrees pays anything, which is the case the bit
     // exists for. Levels with no gravity portals keep bit-identical keys.
-    if (s.portalLatch)
-        k ^= (uint64_t)s.portalLatch * 0xFF51AFD7ED558CCDull;
-    if (s.portalLatch2)
-        k ^= (uint64_t)s.portalLatch2 * 0xC4CEB9FE1A85EC53ull;
+    // Word 0 is mixed EXACTLY as the uint32 was (the value is the same number while
+    // a level has at most 32), so those levels keep bit-identical keys; the higher
+    // words are mixed only when non-zero, each under its own rotation.
+    if (s.portalLatch.word(0))
+        k ^= s.portalLatch.word(0) * 0xFF51AFD7ED558CCDull;
+    if (s.portalLatch2.word(0))
+        k ^= s.portalLatch2.word(0) * 0xC4CEB9FE1A85EC53ull;
+    for (int w = 1; w < GravLatch::kWords; ++w) {
+        const unsigned r = (unsigned)(7 * w);
+        if (const uint64_t v = s.portalLatch.word(w))
+            k ^= ((v * 0xFF51AFD7ED558CCDull) << r) | ((v * 0xFF51AFD7ED558CCDull) >> (64 - r));
+        if (const uint64_t v = s.portalLatch2.word(w))
+            k ^= ((v * 0xC4CEB9FE1A85EC53ull) << r) | ((v * 0xC4CEB9FE1A85EC53ull) >> (64 - r));
+    }
     // Per-box fire ticks, for the boxes whose chain is STILL MOVING.
     //
     // `trig` itself is not in the key -- the layer is partitioned by it, the
@@ -410,7 +508,7 @@ inline uint64_t keyOf(const State& s, long long t) {
         const size_t n = std::min<size_t>(g_touchMoveTicks.size(),
                                           (size_t)kTouchBits);
         for (size_t b = 0; b < n; ++b) {
-            if (!((s.trig >> b) & (TouchMask)1)) continue;
+            if (!s.trig.test(b)) continue;
             const long long moving = g_touchMoveTicks[b];
             if (moving <= 0) continue;
             if (t - (long long)s.fireB[b] >= moving) continue;   // at rest

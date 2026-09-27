@@ -87,8 +87,7 @@ inline bool slopeUnderside(bool flip, uint8_t dir) {
 }
 
 // `bVar22`, the second gate both nudges read. Four terms, in order
-// (0x38f8c8-0x38f9f8, spelled out in measure-slope-underside-gate-2026-09-05
-// section 2):
+// (0x38f8c8-0x38f9f8, measured 2026-09-05):
 //
 //   bVar22 = (m_slopeUphill == 0)
 //            XOR goingLeft                       (m_isGoingLeft, or the
@@ -146,9 +145,8 @@ inline bool slopeNudgeMode(int mode) {
 // so the swing shares that band even though its own CLAMP is the symmetric
 // +-8.0 with chi forced to 1.0 at 0x38c959.
 //
-// Measurements: measure-ship-terminal-clamp-2026-09-06 (the disassembly) and
-// the corpus census in measure-boostlatch-2026-09-06 (lv16 8,913-8,918, both
-// halves, and lv16 14,366-14,370).
+// Measurements (2026-09-06): the disassembly, and a corpus census
+// (lv16 8,913-8,918, both halves, and lv16 14,366-14,370).
 inline bool boostLatchMode(int mode) {
     // (The pre-2026-09-06 scope, where only the swing carried the exemption, was
     // the --no-boostlatch arm; it is gone since the flag clean-up.)
@@ -215,8 +213,8 @@ inline float slopeNudge(float vy, bool flip, uint8_t dir, int mode, bool held) {
 // them all rather than just the adjacent one: at lv16 8,696 the ramp that
 // carries the veto is 3763, one further down the chain, not the neighbour 3741.
 // Would GD acquire this ramp with the player here? The acquisition gate is
-// `targetY > y` (0x38fea5) against the CAPPED target of measure-slopeypos section
-// 4: max(min(slopeYPos(cx) + playerH/(2 cos t), objMaxY + playerH/2), objMinY).
+// `targetY > y` (0x38fea5) against the CAPPED target (measured):
+// max(min(slopeYPos(cx) + playerH/(2 cos t), objMaxY + playerH/2), objMinY).
 //
 // This exists because the model's own `onSlope` is the wrong proxy for it. GD
 // holds m_isOnSlope for as long as the player's box overlaps the ramp's -- the
@@ -332,9 +330,8 @@ inline double slopeSeatTarget(const Obj* R, double px, double pHalf,
 // top-ness differs. The model's stand-ins are `s.onSlope` for m_wasOnSlope and
 // `s.slopeUidNow` for m_currentSlope; `m_vehicleSize` is 1.0 full / 0.6 mini
 // (gdref's `vsize` column has exactly those two values across the corpus), so
-// the offset is 20.0 / 12.0 px. UNWITNESSED: no corpus tick has bVar9 set (see
-// the census in measure-slopeseat-2026-09-06), so this arm is carried for the
-// DP's sake alone.
+// the offset is 20.0 / 12.0 px. UNWITNESSED: no corpus tick has bVar9 set (a
+// census, 2026-09-06), so this arm is carried for the DP's sake alone.
 inline double slopeSeatOff(const Obj* R, const std::vector<const Obj*>* slopes,
                            int prevUid, bool wasOnSlope, bool mini) {
     if (!wasOnSlope || !slopes || prevUid < 0 || prevUid == R->uid) return 0.0;
@@ -347,14 +344,35 @@ inline double slopeSeatOff(const Obj* R, const std::vector<const Obj*>* slopes,
     return 0.0;
 }
 
-inline bool slopeVetoesSolid(const Obj* o, const std::vector<const Obj*>* slopes,
-                             double px, double py, double pHalfW, double pHalfH,
-                             bool faceIsTop, double prevX, double prevY,
-                             int curSlopeUid) {
-    if (!slopes || o->type != 0) return false;
+// The overlap test slopeVetoesSolid starts with, taken with the widest
+// inflation either way (1.2 on both axes): whatever `turned` says below,
+// iw <= hw*1.2 and ih <= hh*1.2, so a pair that fails this fails the real test
+// too -- and this one needs no std::fmod, which profiled at ~11% of the search
+// on lv16 (one call per solid x ramp x state). It reads nothing but the two
+// rects, so a caller can also take it once per pair ahead of the states (see
+// SlopeVetoIndex). A negative half would break the ordering, so it passes.
+inline bool rampMayVetoSolid(const Obj* R, const Obj* o) {
+    if (!(R->hw >= 0.0 && R->hh >= 0.0)) return true;
     const double sx0 = o->cx - o->hw, sx1 = o->cx + o->hw;
     const double sy0 = o->cy - o->hh, sy1 = o->cy + o->hh;
-    for (const Obj* R : *slopes) {
+    const double jw = R->hw * 1.2, jh = R->hh * 1.2;
+    return R->cx - jw <= sx1 && R->cx + jw >= sx0
+        && R->cy - jh <= sy1 && R->cy + jh >= sy0;
+}
+
+// slopeVetoesSolid over the ramps [rb, re). The answer is "some ramp in the
+// range vetoes", with no other effect, so any range that keeps every ramp
+// passing rampMayVetoSolid gives the same answer as the whole list.
+inline bool slopeVetoesSolidIn(const Obj* o, const Obj* const* rb,
+                               const Obj* const* re,
+                               double px, double py, double pHalfW, double pHalfH,
+                               bool faceIsTop, double prevX, double prevY,
+                               int curSlopeUid) {
+    if (o->type != 0) return false;
+    const double sx0 = o->cx - o->hw, sx1 = o->cx + o->hw;
+    const double sy0 = o->cy - o->hh, sy1 = o->cy + o->hh;
+    for (const Obj* const* rp = rb; rp != re; ++rp) {
+        const Obj* R = *rp;
         // A spiked ramp is NOT skipped. GD's scan has no kind filter and no
         // direction filter, and slopeYPos already carries the hazard's own +-4
         // shift (0x623748 / 0x622E90) -- which reaches here for free, because
@@ -369,6 +387,7 @@ inline bool slopeVetoesSolid(const Obj* o, const std::vector<const Obj*>* slopes
         // ridden, the underside site wants a ceiling ramp or the one being ridden.
         if (faceIsTop ? (isTop && R->uid != curSlopeUid)
                       : (!isTop && R->uid != curSlopeUid)) continue;
+        if (!rampMayVetoSolid(R, o)) continue;
         // getObjectRect(1.2f, 1.1f) @0x622C84/0x622C54 scales the object's LOCAL
         // W and H and then swaps for rotation (obj+0x390), so a quarter-turned
         // ramp takes 1.1 across world x and 1.2 up world y. Measured on the pair
@@ -409,6 +428,43 @@ inline bool slopeVetoesSolid(const Obj* o, const std::vector<const Obj*>* slopes
     }
     return false;
 }
+inline bool slopeVetoesSolid(const Obj* o, const std::vector<const Obj*>* slopes,
+                             double px, double py, double pHalfW, double pHalfH,
+                             bool faceIsTop, double prevX, double prevY,
+                             int curSlopeUid) {
+    if (!slopes) return false;
+    return slopeVetoesSolidIn(o, slopes->data(), slopes->data() + slopes->size(),
+                              px, py, pHalfW, pHalfH, faceIsTop, prevX, prevY,
+                              curSlopeUid);
+}
+
+// The ramps each solid of a window can be vetoed by, worked out once per
+// frontier group instead of once per state. rampMayVetoSolid reads only the two
+// rects, and both stay put while the group's states are stepped, so the pairs it
+// rejects are the same for every state. The solid loops ask the veto of every
+// solid in the window (the flying one twice), and on lv16 walking the whole ramp
+// list for each was 28% of the search. `off` is indexed by position in `near`;
+// solid i's candidates are ramps[off[i], off[i+1]), in the list's own order.
+struct SlopeVetoIndex {
+    const std::vector<const Obj*>* near = nullptr;     // the lists it was built
+    const std::vector<const Obj*>* slopes = nullptr;   // from
+    std::vector<uint32_t> off;
+    std::vector<const Obj*> ramps;
+    void build(const std::vector<const Obj*>& nr, const std::vector<const Obj*>& sl) {
+        near = &nr;
+        slopes = &sl;
+        off.assign(nr.size() + 1, 0);
+        ramps.clear();
+        for (size_t i = 0; i < nr.size(); ++i) {
+            off[i] = (uint32_t)ramps.size();
+            const Obj* o = nr[i];
+            if (o->type != 0) continue;
+            for (const Obj* R : sl)
+                if (rampMayVetoSolid(R, o)) ramps.push_back(R);
+        }
+        off[nr.size()] = (uint32_t)ramps.size();
+    }
+};
 inline double slopeExitVy(double m, uint8_t mode, float dxF, bool mini) {
     const double a = std::fabs(m);
     // BALL. The old single point (4.316, "lv16 t=4565") was wrong -- read one

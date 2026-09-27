@@ -107,7 +107,9 @@ struct SearchCheckpoints {
         std::vector<std::pair<long long, int>> edges;
     };
     std::atomic<bool> enabled{false};   // a subscriber exists
-    std::atomic<bool> cancel{false};    // the caller has stopped caring about this search
+    // The caller has stopped caring about this search. Read by the layer loop with or without a
+    // subscriber: the mod also raises it when its session ends.
+    std::atomic<bool> cancel{false};
     // WHICH CALL OWNS THE CHANNEL. Bumped by reset(), which cliMain runs at the start of every
     // call AND on the way out of it. A judgement names the call it is about, and one for a call
     // that has already returned is refused.
@@ -172,9 +174,18 @@ enum Verdict {
 
 struct SearchOutcome {
     int verdict = VerdictFailed;
+    // VerdictSolved because the frontier outlived --horizon (cli.hpp's horizon rule), not because
+    // it reached the end. Such a plan survives; it claims nothing about the goal -- and under
+    // --coins the goal includes every coin, which a horizon survivor may not have taken.
+    bool horizonCut = false;
     long long deepT = -1;    // where the frontier died (PARTIAL / FAILED); -1 = never reported
     double deepX = -1.0;
     long long capHits = -1;  // -1 = no capstat line, i.e. the layer loop never ran
+    // The search's own work: the states its layers carried forward (each layer's frontier after
+    // the alive cap, summed). Deterministic, printed nowhere -- the mod weighs a repair round's
+    // cost with it (cfg dpsecrent), where a wall clock would make the loop's decisions depend on
+    // the machine's load.
+    long long workStates = 0;
     // VerdictCancelled only: the layer the search was on when it noticed the cancel. -1 = the
     // call was never cancelled. The caller logs it so a cancelled round says how much of the
     // search was paid for before the game refuted it.
@@ -201,7 +212,7 @@ struct SearchOutcome {
     // to an object at all.
     int resimUid = -1;               // the LEVEL's uid, not this build's ordinal
     float resimObjX = 0.f, resimObjY = 0.f;
-    TouchMask resimTrig = 0;         // the walk's trigger mask at that tick
+    TouchMask resimTrig{};         // the walk's trigger mask at that tick
     int resimFrame = -1;             // the frame resimObjX/Y are expressed in
     // --replay only: the tick the model died on, or -1 if it survived the plan. The fixup
     // recorder needs it for the case where the two agree all the way and only the MODEL kills:
@@ -218,8 +229,8 @@ struct SearchOutcome {
     // already past. A requirement the anchor cannot possibly satisfy empties the frontier
     // before a single tick runs, and from outside that is indistinguishable from a physics
     // wall -- so the caller needs to be able to tell the two apart and drop the box.
-    TouchMask needTrigMask = 0;    // bit b = box b was required
-    TouchMask needTrigPassed = 0;  // bit b = the anchor starts past box b
+    TouchMask needTrigMask{};    // bit b = box b was required
+    TouchMask needTrigPassed{};  // bit b = the anchor starts past box b
     // --seeddump only: the ready-made `--startrotq` argument for the dumped
     // tick, exactly as stdout carries it on the `seedrotq:` line. The mod has
     // no pipe (dp_bridge.hpp:57), so a caller in-process cannot read that line;
@@ -242,6 +253,11 @@ struct SearchOutcome {
     // `coinUid,chan,x,y,dir,item,need` (dir as the queue print: 1 y+, 2 y-,
     // 3 x-, else x+). Empty when there is none or the coin is --coinskip'd.
     std::string coinGates;
+    // --coins: the coins this call does NOT treat as missed when passed (cli.hpp coinPruneOk ==
+    // 0 -- something past them turns the player round, or the frame comes back behind them),
+    // as `;`-separated uids, so the mod's own attempt cut can make the same call (cfg
+    // coinmissrev). Empty without --coins.
+    std::string coinNoPrune;
     // --startrotq's own read-back, for the same caller: how many of the seed's
     // uids bound to a queue slot, out of how many were given, and the ones that
     // did not. -1/-1 = this call carried no --startrotq.
@@ -252,7 +268,7 @@ struct SearchOutcome {
     // mod (dp_bridge.hpp:57). That is not a theoretical gap: grepping the
     // loop's result.txt for the gate's own printf returned 0 for a line that
     // fires on every load, and the 0 was nearly read as "the gate never
-    // fired" (audit AUD-20260920-11, -12).
+    // fired".
     //   trigWinTouch  1 = the auto-window fired and the box set is windowed
     //                 from the anchor instead of the level's head. -1 = this
     //                 call had no touch boxes at all, which is not the same
@@ -267,22 +283,28 @@ struct SearchOutcome {
     long long trigTotal = 0, trigRelevantN = 0, trigKept = 0,
               trigDroppedRelevant = 0;
     // ...split by side. Only `Ahead` is a world this call cannot see; `Behind`
-    // is the window doing its job (audit AUD-20260921-15).
+    // is the window doing its job.
     long long trigDroppedBehind = 0, trigDroppedAhead = 0;
     double trigMaxKeptX = 0.0;
     unsigned long long trigMapSig = 0;
+    // Level::unsupported, when the load refused the level (cliMain returned 2 before
+    // searching). Empty otherwise.
+    std::string unsupported;
 
     void reset() {
         verdict = VerdictFailed;
+        horizonCut = false;
         deepT = -1; deepX = -1.0; capHits = -1; replayDiedT = -1; cancelT = -1; rejoinT = -1;
+        workStates = 0;
         rejoinBadT = -1; rejoinBadWhy = nullptr;
         resimDead = -1; resimFirst = -1; resimWhy = nullptr;
-        resimUid = -1; resimObjX = 0.f; resimObjY = 0.f; resimTrig = 0;
+        resimUid = -1; resimObjX = 0.f; resimObjY = 0.f; resimTrig = TouchMask{};
         resimFrame = -1;
-        needTrigMask = 0; needTrigPassed = 0;
+        needTrigMask = TouchMask{}; needTrigPassed = TouchMask{};
         seedRotQ.clear();
         rotQOrder.clear();
         coinGates.clear();
+        coinNoPrune.clear();
         startRotHit = -1; startRotGiven = -1;
         startRotMiss.clear();
         trigWinTouch = -1;
@@ -290,6 +312,7 @@ struct SearchOutcome {
         trigDroppedBehind = trigDroppedAhead = 0;
         trigMaxKeptX = 0.0;
         trigMapSig = 0;
+        unsupported.clear();
     }
 };
 

@@ -575,13 +575,44 @@ inline bool flipHeadArms(double x, double y, double pHalf, int t) {
 // (0x392474 and 0x3928ed).
 // The armed-mini case (lv22's switch band, 1859 at (3,195,255)) is covered by
 // the verified solutions that run through it.
-struct ArmBox { double cx, cy, hw, hh; };
+//
+// [2026-09-26] THE BOX IS READ AT ITS LIVE POSITION, like the 2866's under
+// --fgarmlive, and for the same reason: lv22's switch-band 1859 (uid2152, group
+// 21) RIDES THE PLAYER. A move trigger locked to the player's x carries it from
+// t=2,445 for 1.61 s, 1.95 px a tick, so GD re-arms on every tick of the ride.
+// Read at the parked (3,195,255) the model lets the arm lapse two ticks after
+// the player walks off the parked box, and a mini cube that GD clamps under
+// uid2182 at t=2,484 (y 261.000, vy 0) dies on the block's side at 2,487.
+// Measured in the game (worker 99, 5f13395's lv22 plan): GD clamps with the arm
+// last renewed 27, 31, 39, 67, 147, 87, 177 or 277 ticks earlier by the parked
+// box's reckoning (the player held at x 3,221.5 or 3,240 by injection), and
+// kills once the attempt never overlaps the box -- teleported from x 3,164 or
+// 3,168 to 3,221.5, so the box rides 26 px behind. The counter's two-tick life
+// is right; the box was in the wrong place.
+struct ArmBox {
+    double cx, cy, hw, hh;      // LOAD-TIME position
+    int uid = -1;
+    std::vector<ModRow> live;   // the recording's rows for this uid (see FlipHeadBox)
+};
 inline std::vector<ArmBox> g_armBoxes;
-inline bool armBoxTouch(double x, double y, double pHalf) {
-    for (const auto& b : g_armBoxes)
-        if (std::fabs(x - b.cx) <= b.hw + pHalf
-            && std::fabs(y - b.cy) <= b.hh + pHalf)
+inline bool armBoxTouch(double x, double y, double pHalf, int t) {
+    for (const auto& b : g_armBoxes) {
+        double bx = b.cx, by = b.cy;
+        if (!b.live.empty()) {
+            size_t lo = 0, hi = b.live.size();
+            while (lo < hi) {
+                const size_t m = lo + (hi - lo) / 2;
+                if (b.live[m].t <= t) lo = m + 1; else hi = m;
+            }
+            if (lo > 0) {
+                bx = (double)b.live[lo - 1].cx;
+                by = (double)b.live[lo - 1].cy;
+            }
+        }
+        if (std::fabs(x - bx) <= b.hw + pHalf
+            && std::fabs(y - by) <= b.hh + pHalf)
             return true;
+    }
     return false;
 }
 // DART SLIDE ARM (id 1755, GameObjectType 40 -- m_stateDartSlide in the counter

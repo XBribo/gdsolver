@@ -76,7 +76,7 @@ namespace dp {
 // [2026-09-20, coin routing] 64 WAS TRIED AND IS HELD, NOT REJECTED. It fixes
 // lv22's coverage outright (61 relevant, 61 kept, maxKeptX 3,675 -> 20,111) and
 // the level then fails to solve. Measured with the variable isolated, same tree
-// and flags, one Wine worker each:
+// and flags, one worker each:
 //
 //   32   lv22 CLEARED  41 iterations,  962 s, deepest x=21,897
 //   64   lv22 stuck   201 iterations, 3516 s, deepest x=10,755
@@ -128,25 +128,139 @@ namespace dp {
 // 61, TWENTY-FIVE never divide the key at all and 22 carry 90% of the dividing.
 // So boxes differ by orders of magnitude in what their bit costs, and a rule
 // that keeps the free ones costs nothing. It is NOT evidence about why the cold
-// run failed (audit AUD-20260921-12).
+// run failed.
 constexpr int kTouchBits = 32;
-using TouchMask = std::conditional_t<(kTouchBits > 32), uint64_t, uint32_t>;
-static_assert(kTouchBits <= 8 * (int)sizeof(TouchMask),
-              "kTouchBits does not fit in TouchMask");
+// (TouchMask itself is declared below Bits, which it is.)
+// ============================================================================
+
+// ---- A FIXED-WIDTH BIT SET THAT STAYS POD ------------------------------------
+// State is copied with memcpy and compared with memcmp (refwatch.hpp), and its
+// size is pinned by a static_assert, so a member of it must be trivially copyable
+// with no padding of its own and no heap. std::bitset promises none of that. This
+// is N bits in (N + 63) / 64 words, zero when value-initialised (`Bits<N> b{}`).
+// word(i) is for the hash: a key that mixes word 0 exactly as it mixed the old
+// integer stays bit-identical for everything that fits in the first word.
+template <int N>
+struct Bits {
+    static_assert(N > 0, "Bits<0>");
+    static constexpr int kWords = (N + 63) / 64;
+    uint64_t w[kWords];
+    void set(int i) { w[i >> 6] |= (uint64_t)1 << (i & 63); }
+    bool test(int i) const { return ((w[i >> 6] >> (i & 63)) & 1u) != 0; }
+    bool any() const {
+        for (int k = 0; k < kWords; ++k)
+            if (w[k]) return true;
+        return false;
+    }
+    uint64_t word(int k) const { return w[k]; }
+    // The lowest set bit, or -1 when empty.
+    int lowest() const {
+        for (int k = 0; k < kWords; ++k)
+            if (w[k])
+                for (int b = 0; b < 64; ++b)
+                    if ((w[k] >> b) & 1u) return k * 64 + b;
+        return -1;
+    }
+    // A set with exactly bit i.
+    static Bits bit(int i) {
+        Bits r{};
+        r.set(i);
+        return r;
+    }
+    // The bit operators a mask is written with, so code that treated the mask as
+    // an integer reads the same. `~` is masked to N bits: the words carry spare
+    // high bits past N, and a complement that set them would make any() and ==
+    // lie about sets that agree on every real bit.
+    explicit operator bool() const { return any(); }
+    Bits& operator|=(const Bits& o) {
+        for (int k = 0; k < kWords; ++k) w[k] |= o.w[k];
+        return *this;
+    }
+    Bits& operator&=(const Bits& o) {
+        for (int k = 0; k < kWords; ++k) w[k] &= o.w[k];
+        return *this;
+    }
+    Bits& operator^=(const Bits& o) {
+        for (int k = 0; k < kWords; ++k) w[k] ^= o.w[k];
+        return *this;
+    }
+    friend Bits operator|(Bits a, const Bits& b) { return a |= b; }
+    friend Bits operator&(Bits a, const Bits& b) { return a &= b; }
+    friend Bits operator^(Bits a, const Bits& b) { return a ^= b; }
+    friend Bits operator~(Bits a) {
+        for (int k = 0; k < kWords; ++k) a.w[k] = ~a.w[k];
+        if (N % 64) a.w[kWords - 1] &= ((uint64_t)1 << (N % 64)) - 1;
+        return a;
+    }
+    friend bool operator==(const Bits& a, const Bits& b) {
+        for (int k = 0; k < kWords; ++k)
+            if (a.w[k] != b.w[k]) return false;
+        return true;
+    }
+    friend bool operator!=(const Bits& a, const Bits& b) { return !(a == b); }
+};
+static_assert(std::is_trivially_copyable_v<Bits<128>>
+                  && std::is_standard_layout_v<Bits<128>>,
+              "Bits must stay POD: State is memcpy'd and memcmp'd");
+
+// ---- THE TOUCH MASK ----------------------------------------------------------
+// [2026-09-22] A Bits<kTouchBits>, where it was the smallest unsigned integer
+// that held kTouchBits (uint32_t at 32). The type changes; the width does NOT:
+// widening to 64 stalled lv22 (41 -> 201 iterations) and stays out until that is
+// understood. The mod's side of the boundary (unsigned long long masks in
+// dp_bridge.hpp) is fed word(0), which is the whole mask while the width is 64
+// or less.
+using TouchMask = Bits<kTouchBits>;
+static_assert(kTouchBits <= 64, "the mod's boundary masks are one word");
 // `1 << bit` in the mask's own width. Writing `1u << bit` against a 64-bit mask
-// is the silent truncation this constant exists to prevent.
-constexpr TouchMask touchBit(int b) { return (TouchMask)1 << b; }
+// is the silent truncation this helper exists to prevent.
+inline TouchMask touchBit(int b) { return TouchMask::bit(b); }
 // ...and the way back: which bit a single-bit mask is. THE POINT IS THE TYPE.
 // Three sites wrote `uint32_t mbit = tb.second; while (!(mbit & 1u) && b < 31)`,
 // which at a width of 64 truncates every box above 31 to zero AND stops the
 // walk at 31, so all of them reported bit 31 -- one shared fire tick for
 // thirty-two different boxes, in markTouched, every tick. Taking a TouchMask
 // and bounding by kTouchBits makes that shape impossible to write again.
-constexpr int touchBitIndex(TouchMask m) {
-    int b = 0;
-    while (b < kTouchBits - 1 && !(m & (TouchMask)1)) { m >>= 1; ++b; }
-    return b;
+// An empty mask answers kTouchBits - 1, as the shifting loop this replaces did.
+inline int touchBitIndex(const TouchMask& m) {
+    const int b = m.lowest();
+    return (b < 0 || b > kTouchBits - 1) ? kTouchBits - 1 : b;
 }
-// ============================================================================
+
+// ---- HOW MANY GRAVITY PORTALS A LEVEL MAY HOLD (State::portalLatch) ----------
+// Its own constant, NOT tied to kTouchBits: the touch window is a search-cost
+// question with its own measured stall (lv22 at 64), this is a capacity one. It
+// was 32 (a uint32) until custom levels with 43, 68 and 72 made the loader stop,
+// and the stop was a std::exit inside the game's process. Obj::gpBit is int8_t,
+// so 127 is the last bit it can name.
+constexpr int kGravPortalBits = 128;
+static_assert(kGravPortalBits - 1 <= 127, "Obj::gpBit is int8_t");
+using GravLatch = Bits<kGravPortalBits>;
+// ...and past it, on a level with no reversal, a bit is SHARED: the gravity portal kGravPortalBits
+// later in x order takes the bit of the one before it, and the step clears the bit where x crosses
+// the point between the two (the earlier portal is behind the player for good by then, and GD's
+// latch on it can no longer matter). One entry per handed-on bit; empty on every level that fits,
+// so those levels step exactly as before. Filled by the loader, cleared per call (reset.hpp).
+// Two custom levels (135 and 147 gravity portals respectively) were refused whole without it.
+struct GpHandoff {
+    double x;   // where the bit changes hands
+    int bit;
+};
+inline std::vector<GpHandoff> g_gpHandoff;
+// The latch as hex, printed EXACTLY as the uint32 was ("0x%x") while it fits in
+// the first word -- --seeddump's line is parsed by the lab's seedcheck -- and with
+// the higher words prepended (most significant first) only once they are used.
+inline std::string gravLatchHex(const GravLatch& b) {
+    int top = GravLatch::kWords - 1;
+    while (top > 0 && b.word(top) == 0) --top;
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)b.word(top));
+    std::string s = buf;
+    for (int k = top - 1; k >= 0; --k) {
+        std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)b.word(k));
+        s += buf;
+    }
+    return s;
+}
 
 }  // namespace dp

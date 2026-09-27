@@ -2,7 +2,7 @@
 
 A worker is "a renamed GD + a dedicated Geode root + a dedicated save + a dedicated
 data root". GD has no single-instance lock, so any number of them run independently.
-Always read the results from the worker's data_root (not from D:\\GD\\data).
+Always read the results from the worker's data_root (not from the repository's data dir).
 
 The traps collected here (each one cost real debugging time, once):
   - Without Steam, GD WEDGES SILENTLY INSTEAD OF FAILING (kill does not work either).

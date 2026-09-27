@@ -1,6 +1,6 @@
 """cold_regress's verdict and bless rules, checked on saved results -- no GD.
 
-What is pinned (AUD-20260922-26/-28):
+What is pinned:
   * the iteration cap is printed, never a failure;
   * a bless needs a known resolution, and on a coin run every level at full coins;
   * --adopt blesses from a saved --one-session run and writes that run's commit,

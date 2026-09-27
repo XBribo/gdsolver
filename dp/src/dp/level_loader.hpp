@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdarg>
 #include "dp/triggers.hpp"
 
 namespace dp {
@@ -61,16 +62,99 @@ inline std::unordered_map<int, ObbBox> loadObb(const std::string& path) {
 }
 inline std::unordered_map<int, ObbBox> g_obb;
 
+// How many comma fields of an objrects row the loader reads. The dump has 49
+// columns (rev is the last); the headroom is deliberate, and a column read by
+// NAME past this bound is refused rather than read out of range.
+inline constexpr int kObjFields = 64;
+
+// A row's comma fields into f[0..n), exactly as a loop of
+// `std::getline(std::stringstream(line), f[i], ',')` fills them -- an empty field between two
+// commas is read, the loop stops at the end of the line, and a field it never reaches keeps what
+// it had (the callers pass fresh, empty strings) -- without building a stream for every row. On
+// a custom level's 117,356 rows the stream was most of each in-process call's level parse.
+inline void splitCommaFields(const std::string& line, std::string* f, int n) {
+    size_t pos = 0;
+    for (int i = 0; i < n && pos < line.size(); ++i) {
+        const size_t c = line.find(',', pos);
+        if (c == std::string::npos) {
+            f[i].assign(line, pos, std::string::npos);
+            break;
+        }
+        f[i].assign(line, pos, c - pos);
+        pos = c + 1;
+    }
+}
+
+// Everything loadLevelFrom prints goes through here, byte for byte what std::printf would have
+// written. With a sink set, the text is also kept: the ladder's level cache (cli.hpp) prints it
+// again when it hands back a level it did not build.
+inline std::string* g_loadPrinted = nullptr;
+inline void loadPrintf(const char* fmt, ...) {
+    va_list ap, again;
+    va_start(ap, fmt);
+    va_copy(again, ap);
+    char buf[1024];
+    const int n = std::vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    std::string big;
+    const char* s = buf;
+    if (n >= (int)sizeof buf) {
+        big.resize((size_t)n + 1);
+        std::vsnprintf(big.data(), big.size(), fmt, again);
+        big.resize((size_t)n);
+        s = big.c_str();
+    }
+    va_end(again);
+    if (n <= 0) return;
+    std::fwrite(s, 1, (size_t)n, stdout);
+    if (g_loadPrinted) g_loadPrinted->append(s, (size_t)n);
+}
+
 // Parse an objrects CSV from any stream.
+//
+// EVERY GLOBAL THIS WRITES IS LISTED IN LoadLevelWrites below, which the ladder's level cache
+// (cli.hpp) keeps beside the Level and puts back when it hands a level out again. A global
+// written here and missing there would keep, on every attempt after a ladder's first, whatever
+// resetInvocationState left in it.
 //
 // The stream, rather than a path, is what makes the solver embeddable: the mod
 // builds the very same CSV in memory out of PlayLayer's objects and feeds it in
 // here, so THERE IS ONE PARSER. A second loader that walked GD's objects
 // directly would be a second definition of what a level is, and the two would
 // drift -- the model's fidelity is measured against this text.
-inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
+// GD's anti-cheat spike: PlayLayer creates it last (the highest uid), an id-8 spike at (0,105),
+// 6x12 with a 30x30 unscaled size. It sits in m_objects but never collides -- GD only hands it to
+// destroyPlayer as a check -- and the mod no longer writes it (solver.hpp writeObjRects). Every
+// dump written before that carries it, and read as a hazard it killed a ship or ball start on
+// tick 2 (two custom levels, GD alive there). Recognised by all of those at once.
+inline bool isAnticheatSpikeRow(const std::string& row, int maxUid) {
+    std::stringstream ss(row);
+    std::string f;
+    std::vector<std::string> v;
+    while (v.size() < 17 && std::getline(ss, f, ',')) v.push_back(f);
+    return v.size() == 17 && v[0] == "8" && v[2] == "0" && v[3] == "105" && v[4] == "6"
+           && v[5] == "12" && v[15] == "30" && v[16] == "30" && std::atoi(v[7].c_str()) == maxUid;
+}
+inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullptr,
                 const std::vector<TouchTrig>* tt = nullptr,
                 const std::vector<AutoTrig>* at = nullptr) {
+    std::istringstream filtered;
+    {
+        std::string all, row;
+        std::vector<std::string> rows;
+        while (std::getline(inRaw, row)) rows.push_back(row);
+        int maxUid = -1;
+        for (size_t i = 1; i < rows.size(); ++i) {
+            std::stringstream ss(rows[i]);
+            std::string f;
+            for (int k = 0; k < 8 && std::getline(ss, f, ','); ++k)
+                if (k == 7) maxUid = std::max(maxUid, std::atoi(f.c_str()));
+        }
+        for (size_t i = 0; i < rows.size(); ++i)
+            if (i == 0 || !isAnticheatSpikeRow(rows[i], maxUid)) all += rows[i] + "\n";
+        filtered.str(all);
+    }
+    std::istream& in = filtered;
     Level L;
     // Rows the MOD marked `env` (DynSample::env): an Area Move with a variance puts the object
     // somewhere in that box, and where depends on GD's own random seeds, which differ from one
@@ -129,7 +213,7 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
     // dump whose column order differs reads as "column absent" and keeps the
     // old behaviour instead of silently reading a neighbour.
     int colFree = -1, colTouch = -1, colSpawn = -1, colChan = -1;
-    int colAxis = -1, colExStat = -1;
+    int colAxis = -1, colExStat = -1, colRev = -1, colNoCol = -1;
     {
         std::stringstream hs(line);
         std::string name;
@@ -143,6 +227,8 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             else if (name == "chan") colChan = i;
             else if (name == "axis") colAxis = i;
             else if (name == "exstat") colExStat = i;
+            else if (name == "rev") colRev = i;
+            else if (name == "nocol") colNoCol = i;
         }
     }
     // Counted per load, not per invocation: loadLevelFrom runs again for each
@@ -162,11 +248,11 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
     // re-dump. Nothing was riding on them -- quick_regress was identical
     // across all 22 once refreshed -- but the next omission may not be free.
     if (!g_freeModeCol || !g_trigGateCol || !g_staticCamCol)
-        std::printf("objrects: dump predates a column this build reads --"
-                    "%s%s%s (re-dump to enable them)\n",
-                    g_freeModeCol ? "" : " free",
-                    g_trigGateCol ? "" : " touch/spawn",
-                    g_staticCamCol ? "" : " axis/exstat");
+        loadPrintf("objrects: dump predates a column this build reads --"
+                   "%s%s%s (re-dump to enable them)\n",
+                   g_freeModeCol ? "" : " free",
+                   g_trigGateCol ? "" : " touch/spawn",
+                   g_staticCamCol ? "" : " axis/exstat");
     // uid -> which triggers move it, and where to. Built once so the
     // routing below can ask in O(1). Touch and autonomous controls share the
     // map; an object under both keeps the touch mask (per-state truth beats
@@ -184,7 +270,7 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
         // dyn.trigMask) has always been TouchMask -- only the producer here
         // truncated, which is the shape that hides: widening a short value into
         // a wide vector compiles and says nothing.
-        TouchMask mask = 0; float dx = 0, dy = 0; double dur = 0;
+        TouchMask mask{}; float dx = 0, dy = 0; double dur = 0;
         int ease = 0; double erate = 2.0;
         int aAnchor = -1; float adx = 0, ady = 0; double adur = 0;
         int aease = 0; double aerate = 2.0;
@@ -368,16 +454,16 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
                               || stops || recGate;
             ++nBoxes;
             if (moveNoop) { ++nMoveNoop; if (live) ++nNoopLive; }
-            std::printf("trigeffect: box %zu uid %d reaches=%lld uids=%lld "
-                        "movedUids=%lld maxNet=%.3f maxDur=%.1f tmodeUids=%lld "
-                        "lockUids=%lld maxLock=%.1f togOn=%d stops=%zu "
-                        "recGate=%lld live=%d%s\n",
-                        b, (*tt)[b].uid, effReach[b], uids, moved, maxNet,
-                        maxDur, tmodeUids, lockUids, maxLock, togOn, stops,
-                        recGate, live ? 1 : 0, moveNoop ? "  MOVE-NOOP" : "");
+            loadPrintf("trigeffect: box %zu uid %d reaches=%lld uids=%lld "
+                       "movedUids=%lld maxNet=%.3f maxDur=%.1f tmodeUids=%lld "
+                       "lockUids=%lld maxLock=%.1f togOn=%d stops=%zu "
+                       "recGate=%lld live=%d%s\n",
+                       b, (*tt)[b].uid, effReach[b], uids, moved, maxNet,
+                       maxDur, tmodeUids, lockUids, maxLock, togOn, stops,
+                       recGate, live ? 1 : 0, moveNoop ? "  MOVE-NOOP" : "");
         }
-        std::printf("trigeffect: %lld boxes, MOVE-NOOP %lld, of which live %lld\n",
-                    nBoxes, nMoveNoop, nNoopLive);
+        loadPrintf("trigeffect: %lld boxes, MOVE-NOOP %lld, of which live %lld\n",
+                   nBoxes, nMoveNoop, nNoopLive);
         std::fflush(stdout);
     }
     if (at) {
@@ -461,11 +547,11 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
         // for 28 iterations (baseline: CLEARED in 42).
         const bool autoMoves = (tit != trigOf.end())
                                && (tit->second.adx != 0.f || tit->second.ady != 0.f);
-        const bool noopTouch = (tit != trigOf.end()) && tit->second.mask != 0
+        const bool noopTouch = (tit != trigOf.end()) && tit->second.mask.any()
                                && tit->second.dx == 0.f && tit->second.dy == 0.f
                                && tit->second.dur == 0.0
                                && tit->second.aAnchor >= 0 && autoMoves;
-        const bool controlled = (tit != trigOf.end()) && tit->second.mask != 0
+        const bool controlled = (tit != trigOf.end()) && tit->second.mask.any()
                                 && !noopTouch;
         const bool autoCtl = (tit != trigOf.end()) && !controlled
                              && tit->second.aAnchor >= 0;
@@ -500,14 +586,14 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
         // passed --triggers, and went unseen because quick_regress sends each
         // section's stdout to DEVNULL.
         if (g_dynDbg >= 0 && tit != trigOf.end())
-            std::printf("ctl: uid=%d mask=0x%llx dx=%.2f dy=%.2f dur=%.3f "
-                        "aAnchor=%d adx=%.2f ady=%.2f adur=%.3f "
-                        "autoMoves=%d noopTouch=%d controlled=%d autoCtl=%d\n",
-                        o.uid, (unsigned long long)tit->second.mask,
-                        tit->second.dx, tit->second.dy,
-                        tit->second.dur, tit->second.aAnchor, tit->second.adx,
-                        tit->second.ady, tit->second.adur, autoMoves ? 1 : 0,
-                        noopTouch ? 1 : 0, controlled ? 1 : 0, autoCtl ? 1 : 0);
+            loadPrintf("ctl: uid=%d mask=0x%llx dx=%.2f dy=%.2f dur=%.3f "
+                       "aAnchor=%d adx=%.2f ady=%.2f adur=%.3f "
+                       "autoMoves=%d noopTouch=%d controlled=%d autoCtl=%d\n",
+                       o.uid, (unsigned long long)tit->second.mask.word(0),
+                       tit->second.dx, tit->second.dy,
+                       tit->second.dur, tit->second.aAnchor, tit->second.adx,
+                       tit->second.ady, tit->second.adur, autoMoves ? 1 : 0,
+                       noopTouch ? 1 : 0, controlled ? 1 : 0, autoCtl ? 1 : 0);
         const auto it = (gt && o.uid >= 0) ? gt->find(o.uid) : GroupTimeline::const_iterator();
         const bool timed = gt && o.uid >= 0 && it != gt->end() && !it->second.empty();
         // A turned object with a computable orbit belongs in dyn even with no
@@ -601,7 +687,7 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
         L.dyn.baseSy1.push_back((float)o.sy1);
         L.dyn.on.push_back(1);
         L.dyn.prevCy.push_back((float)o.cy);
-        L.dyn.trigMask.push_back(controlled ? tit->second.mask : (TouchMask)0);
+        L.dyn.trigMask.push_back(controlled ? tit->second.mask : TouchMask{});
         L.dyn.trigDx.push_back(controlled ? tit->second.dx : 0.f);
         L.dyn.trigDy.push_back(controlled ? tit->second.dy : 0.f);
         L.dyn.trigDur.push_back(controlled ? tit->second.dur : 0.0);
@@ -657,9 +743,9 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             } else if (g_lockBox != tit->second.tlockBox) {
                 // Two boxes would need two accumulators. Say so rather than
                 // serve one of them silently.
-                std::printf("triggers: WARNING second touch lock box %d (using "
-                            "%d) -- objects on it will not follow the player\n",
-                            tit->second.tlockBox, g_lockBox);
+                loadPrintf("triggers: WARNING second touch lock box %d (using "
+                           "%d) -- objects on it will not follow the player\n",
+                           tit->second.tlockBox, g_lockBox);
             }
         }
         L.dyn.autoParts.push_back(autoCtl ? tit->second.parts
@@ -701,7 +787,7 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
                 // Same width rule as TrigOf::mask above: p.trig is a touch BIT
                 // INDEX, so `& 31` folded boxes 32..63 onto 0..31 and let two
                 // different boxes answer for each other in this test.
-                TouchMask upB = 0, downB = 0;
+                TouchMask upB{}, downB{};
                 for (const auto& p : tit->second.tparts) {
                     const int tb = p.trig & (kTouchBits - 1);
                     if (p.dy > 0.01f) upB |= touchBit(tb);
@@ -819,7 +905,7 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
                 }
                 aLag = bestN;
             }
-            // --lagfit (print only, AUD-20260922-24): does the first motion belong to
+            // --lagfit (print only): does the first motion belong to
             // the autonomous curve at all? The first row of a two-controller object is
             // whichever fired first; the lag above is only right if that is the
             // autonomous one. Residual of the first three moving rows against each
@@ -847,10 +933,10 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
                                         recFire - aLag);
                 const double rt = resid(e.tldx, e.tldy, e.tldur, e.tlease, e.tlerate,
                                         recFire - lag);
-                std::printf("lagfit: uid=%d autoAnchor=%d recFire=%d recLag=%d autoLag=%d "
-                            "resid auto=%.4f touch=%.4f -> %s\n",
-                            o.uid, e.aAnchor, recFire, lag, aLag, ra, rt,
-                            ra < rt ? "auto" : "touch");
+                loadPrintf("lagfit: uid=%d autoAnchor=%d recFire=%d recLag=%d autoLag=%d "
+                           "resid auto=%.4f touch=%.4f -> %s\n",
+                           o.uid, e.aAnchor, recFire, lag, aLag, ra, rt,
+                           ra < rt ? "auto" : "touch");
             }
         }
         L.dyn.autoLag.push_back(aLag);
@@ -923,7 +1009,6 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
                               (double)o.cy + (double)tit->second.ady + (double)o.hh);
     };
     while (std::getline(in, line)) {
-        std::stringstream ss(line);
         // 21 fields now: ...,sup,w0,h0,tpy,tpg,tpix,tpiy (see the objrects
         // header in solver.hpp). An older dump simply leaves the extra ones
         // empty, which reads as "not known" and falls back to the previous
@@ -942,7 +1027,9 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
         //           trigger's touch/spawn admission, 2026-09-02). Those three
         //           are found by name above, so the bound here only has to be
         //           big enough to REACH them; the headroom is deliberate.
-        std::string f[48];
+        // 48 -> 49 (rev: property 117, 2026-09-22). It is the 49th column, one
+        //           past the old bound of 48, which is why the bound moved.
+        std::string f[kObjFields];
         // 41, not 28. The bound was left at 26 when mvdir/gnddir were added
         // (2026-08-15), so f[26]/f[27] were never filled and BOTH of them read
         // as "column absent" -- the whole id-2900 direction change was dead
@@ -952,7 +1039,7 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
         // WHEN A COLUMN IS ADDED, RAISE THIS BOUND TOO. Forgetting it throws no
         // exception and only ever shows up as "that rule was dead from the
         // start".
-        for (int i = 0; i < 48 && std::getline(ss, f[i], ','); ++i) {}
+        splitCommaFields(line, f, kObjFields);
         if (f[5].empty()) continue;
         const int type = std::atoi(f[1].c_str());
         Obj o{std::atof(f[2].c_str()), std::atof(f[3].c_str()),
@@ -1031,6 +1118,11 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
         o.rot = f[9].empty() ? 0.0 : std::atof(f[9].c_str());
         o.flipY = (uint8_t)(f[31] == "1" ? 1 : 0);
         o.freeMode = (uint8_t)((colFree >= 0 && f[colFree] == "1") ? 1 : 0);
+        // atoi, not `== "1"`: rev is the LAST column, and a dump written to a file
+        // on Windows ends its lines in CRLF, so the field reads "1\r" there while
+        // the in-process copy (an ostringstream) has no CR.
+        o.rev = (uint8_t)((colRev >= 0 && colRev < kObjFields
+                           && std::atoi(f[colRev].c_str()) == 1) ? 1 : 0);
         // Recover the real box from the bound when the object is turned by
         // something other than a multiple of 90 (see Obj::oriented). Multiples
         // of 90 are left alone: there the bound IS the shape, so nothing that
@@ -1084,22 +1176,22 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             // off) and m_ignoreY (keep player y).
             if (o.id != 747 && (o.tpEx != 0.0 || o.tpEy != 0.0)
                 && !igx && std::fabs(o.tpEx - o.cx) > 0.5)
-                std::printf("teleport: uid %d at (%.0f,%.0f) moves x to %.0f "
-                            "- NOT modelled\n", o.uid, o.cx, o.cy, o.tpEx);
+                loadPrintf("teleport: uid %d at (%.0f,%.0f) moves x to %.0f "
+                           "- NOT modelled\n", o.uid, o.cx, o.cy, o.tpEx);
             if (igy)
-                std::printf("teleport: uid %d at (%.0f,%.0f) uses ignoreY "
-                            "- NOT modelled\n", o.uid, o.cx, o.cy);
+                loadPrintf("teleport: uid %d at (%.0f,%.0f) uses ignoreY "
+                           "- NOT modelled\n", o.uid, o.cx, o.cy);
             // A non-747 teleport resolves its target from the linked exit half
             // (m_orangePortal), NOT the tpy closed formula -- an old dump
             // without the tpex/tpey columns plans against a target measured
             // wrong on lv22 (705 saved vs 1905 real). Refresh objrects.
             if (o.id != 747 && o.tpEx == 0.0 && o.tpEy == 0.0)
-                std::printf("teleport: uid %d id %d at (%.0f,%.0f) has NO exit "
-                            "columns (old objrects dump) - target unreliable, "
-                            "refresh objrects\n", o.uid, o.id, o.cx, o.cy);
+                loadPrintf("teleport: uid %d id %d at (%.0f,%.0f) has NO exit "
+                           "columns (old objrects dump) - target unreliable, "
+                           "refresh objrects\n", o.uid, o.id, o.cx, o.cy);
             if (o.tpGrav)
-                std::printf("teleport: uid %d at (%.0f,%.0f) sets gravity mode %d\n",
-                            o.uid, o.cx, o.cy, (int)o.tpGrav);
+                loadPrintf("teleport: uid %d at (%.0f,%.0f) sets gravity mode %d\n",
+                           o.uid, o.cx, o.cy, (int)o.tpGrav);
         }
         if (o.radius == 0.0 && !o.slope && w0 > 1.0 && h0 > 1.0) {
             const double m = std::fabs(std::fmod(o.rot, 90.0));
@@ -1247,7 +1339,20 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             // suite while this was a flag that ran OFF there, the line never reached --
             // and would surface only as "the 4,889 death is gone", which is exactly
             // what a truncated level looks like too.
-            if (o.id == kNoCollideId) continue;
+            //
+            // ...and the ID was only ever a STAND-IN for the byte, which the dump
+            // now carries (`nocol`). It held while the corpus had exactly one
+            // id-1910 object; SubZero 4002's uid 11433 is the second, is NOT
+            // flagged, and the game crushes the player against it -- the model
+            // walked through and the run ended 12,000 px later on a plan GD
+            // refuses. So: with the column, the byte decides; without it (a dump
+            // written before this), the old ID rule stands, because dropping it
+            // there would put lv22's t=4,889 death back.
+            const bool noCollide =
+                (colNoCol >= 0 && colNoCol < kObjFields && !f[colNoCol].empty())
+                    ? std::atoi(f[colNoCol].c_str()) != 0
+                    : o.id == kNoCollideId;
+            if (noCollide) continue;
             const auto tw = envTwin.empty() ? envTwin.end() : envTwin.find(o.uid);
             if (tw == envTwin.end()) {
                 emit(Dynamics::NEAR, o);
@@ -1319,10 +1424,10 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             // portal's own numbers next to it -- a silent gate is how a rule
             // ends up "dead from the day it was written".
             if (o.freeMode && bandHeightFor(o.type) > 0.0)
-                std::printf("freemode: portal uid %d id %d at (%.0f,%.0f) "
-                            "carries Free Mode - band stays as it was "
-                            "(would have written H=%.0f)\n",
-                            o.uid, o.id, o.cx, o.cy, bandHeightFor(o.type));
+                loadPrintf("freemode: portal uid %d id %d at (%.0f,%.0f) "
+                           "carries Free Mode - band stays as it was "
+                           "(would have written H=%.0f)\n",
+                           o.uid, o.id, o.cx, o.cy, bandHeightFor(o.type));
             emit(Dynamics::PORT, o);   // 16 = ball
         }
         // 9 = pink pad, 12 = pink orb (lv12 onward)
@@ -1351,7 +1456,7 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             // (press<=9984 fires / >=9985 does not): neither the AABB nor a
             // fitted circle but the ROTATED BOX -- the local-axis SAT threshold
             // 18+15*sqrt(2)=39.21 is bracketed exactly by the firing side
-            // v=36.77 and the non-firing side v=39.88 (findings 2026-08-13).
+            // v=36.77 and the non-firing side v=39.88 (measured 2026-08-13).
             // The scale is recovered from the bound: w0/h0 are the raw sprite
             // size, which for this ring is 15 and would drop the firing side
             // (the real size is 18 at 1.2x). The portal's oriented path (above)
@@ -1484,8 +1589,8 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
                      && std::atoi(f[colChan].c_str()) != 0)
                 dropped = "on a rotate channel";
             if (dropped)
-                std::printf("zoom: uid %d at x=%.0f is %s - never fires on an "
-                            "x crossing, IGNORED\n", o.uid, o.cx, dropped);
+                loadPrintf("zoom: uid %d at x=%.0f is %s - never fires on an "
+                           "x crossing, IGNORED\n", o.uid, o.cx, dropped);
             if (zm > 0.0 && !dropped) {
                 g_zoomTrigs.push_back({o.cx, zm,
                                        (f[23].empty() ? 0.0
@@ -1494,9 +1599,9 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
                                           : std::atof(f[25].c_str()),
                                        f[24].empty() ? 0
                                           : std::atoi(f[24].c_str())});
-                std::printf("zoom: uid %d at x=%.0f -> %.6f over %.2fs\n",
-                            o.uid, o.cx, zm,
-                            f[23].empty() ? 0.0 : std::atof(f[23].c_str()));
+                loadPrintf("zoom: uid %d at x=%.0f -> %.6f over %.2fs\n",
+                           o.uid, o.cx, zm,
+                           f[23].empty() ? 0.0 : std::atof(f[23].c_str()));
             }
         }
         // STATIC CAMERA (id 1914): the one thing that opens branch A of
@@ -1537,21 +1642,21 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
                 queued = false;
             if (axis != 1 && queued) {
                 g_staticCams.push_back({o.cx, ex});
-                std::printf("staticcam: uid %d at x=%.0f axis=%d %s\n",
-                            o.uid, o.cx, axis, ex ? "EXIT" : "on");
+                loadPrintf("staticcam: uid %d at x=%.0f axis=%d %s\n",
+                           o.uid, o.cx, axis, ex ? "EXIT" : "on");
             }
         }
         // TIME WARP (id 1935): the `tw` column carries m_timeWarpTimeMod.
         else if (o.id == 1935) {
             const double tw = f[21].empty() ? 0.0 : std::atof(f[21].c_str());
             if (tw <= 0.0) {
-                std::printf("timewarp: uid %d at x=%.0f has NO tw column - "
-                            "objrects is older than the 2026-08-14 dump, "
-                            "IGNORED\n", o.uid, o.cx);
+                loadPrintf("timewarp: uid %d at x=%.0f has NO tw column - "
+                           "objrects is older than the 2026-08-14 dump, "
+                           "IGNORED\n", o.uid, o.cx);
             } else {
                 g_timeWarps.push_back({o.cx, tw});
-                std::printf("timewarp: uid %d at x=%.0f mod=%.4f\n",
-                            o.uid, o.cx, tw);
+                loadPrintf("timewarp: uid %d at x=%.0f mod=%.4f\n",
+                           o.uid, o.cx, tw);
             }
         }
         else if (o.id == 2866) {
@@ -1569,21 +1674,34 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             }
             const size_t nrows = fh.live.size();
             g_flipHeadBoxes.push_back(std::move(fh));
-            std::printf("fliphead: uid %d at (%.0f,%.0f) %.1fx%.1f "
-                        "(%zu recorded rows)\n",
-                        o.uid, o.cx, o.cy, o.hw * 2.0, o.hh * 2.0, nrows);
+            loadPrintf("fliphead: uid %d at (%.0f,%.0f) %.1fx%.1f "
+                       "(%zu recorded rows)\n",
+                       o.uid, o.cx, o.cy, o.hw * 2.0, o.hh * 2.0, nrows);
         }
         else if (o.id == 1829) {
             g_dashStopBoxes.push_back({o.cx, o.cy, o.hw, o.hh});
-            std::printf("dashstop: uid %d at (%.0f,%.0f) %.1fx%.1f\n",
-                        o.uid, o.cx, o.cy, o.hw * 2.0, o.hh * 2.0);
+            loadPrintf("dashstop: uid %d at (%.0f,%.0f) %.1fx%.1f\n",
+                       o.uid, o.cx, o.cy, o.hw * 2.0, o.hh * 2.0);
         }
         // CEILING ARM (id 1859): what lets a cube family player answer a
         // ceiling with a bonk instead of dying on it (see armBoxTouch).
         else if (o.id == 1859) {
-            g_armBoxes.push_back({o.cx, o.cy, o.hw, o.hh});
-            std::printf("ceilarm: uid %d at (%.0f,%.0f) %.1fx%.1f\n",
-                        o.uid, o.cx, o.cy, o.hw * 2.0, o.hh * 2.0);
+            // ...and its recorded motion, as the 2866 above: an 1859 can ride
+            // the player (lv22's switch band; see armBoxTouch).
+            ArmBox ab{o.cx, o.cy, o.hw, o.hh, o.uid, {}};
+            if (gt && o.uid >= 0) {
+                const auto fit = gt->find(o.uid);
+                if (fit != gt->end()) {
+                    ab.live.reserve(fit->second.size());
+                    for (const auto& r : fit->second)
+                        ab.live.push_back({r.t, r.cx, r.cy});
+                }
+            }
+            const size_t nrows = ab.live.size();
+            g_armBoxes.push_back(std::move(ab));
+            loadPrintf("ceilarm: uid %d at (%.0f,%.0f) %.1fx%.1f "
+                       "(%zu recorded rows)\n",
+                       o.uid, o.cx, o.cy, o.hw * 2.0, o.hh * 2.0, nrows);
         }
         // DART SLIDE ARM (id 1755): what lets a WAVE stand on a solid at all
         // (see slideBoxTouch). The box is the scaled one, which the dump
@@ -1591,8 +1709,8 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
         // the arming tick.
         else if (o.id == 1755) {
             g_slideBoxes.push_back({o.cx, o.cy, o.hw, o.hh});
-            std::printf("dartslide: uid %d at (%.0f,%.0f) %.1fx%.1f\n",
-                        o.uid, o.cx, o.cy, o.hw * 2.0, o.hh * 2.0);
+            loadPrintf("dartslide: uid %d at (%.0f,%.0f) %.1fx%.1f\n",
+                       o.uid, o.cx, o.cy, o.hw * 2.0, o.hh * 2.0);
         }
         // FORCE FIELD (id 3645): a circular pusher, not a collider -- see
         // forceFieldAcc at the top. Not stored in L; stepOne reads the global.
@@ -1601,15 +1719,15 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             double rm = std::fmod(std::fabs(o.rot), 360.0);
             if (rm > 180.0) rm = 360.0 - rm;
             if (std::fabs(rm - 90.0) < 45.0)
-                std::printf("forcefield: uid %d at (%.0f,%.0f) rot %.0f is "
-                            "SIDEWAYS - not measured, object IGNORED\n",
-                            o.uid, o.cx, o.cy, o.rot);
+                loadPrintf("forcefield: uid %d at (%.0f,%.0f) rot %.0f is "
+                           "SIDEWAYS - not measured, object IGNORED\n",
+                           o.uid, o.cx, o.cy, o.rot);
             else {
                 g_forceFields.push_back(
                     {o.cx, o.cy, o.radius, (rm >= 90.0) ? -1 : +1});
-                std::printf("forcefield: uid %d at (%.0f,%.0f) R=%.1f push %s\n",
-                            o.uid, o.cx, o.cy, o.radius,
-                            (rm >= 90.0) ? "down" : "up (UNMEASURED mirror)");
+                loadPrintf("forcefield: uid %d at (%.0f,%.0f) R=%.1f push %s\n",
+                           o.uid, o.cx, o.cy, o.radius,
+                           (rm >= 90.0) ? "down" : "up (UNMEASURED mirror)");
             }
         }
         // FORCE BOX (id 2069): the AABB version of 3645, a flat push (measured
@@ -1657,8 +1775,8 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             double force = 0.0;
             if (f[41].empty()) {
                 force = kFF2069 * kForceGDiv / std::fabs(kCubeG);
-                std::printf("forcebox: uid %d has NO force column (old objrects "
-                            "dump) - refresh objrects\n", o.uid);
+                loadPrintf("forcebox: uid %d has NO force column (old objrects "
+                           "dump) - refresh objrects\n", o.uid);
             } else {
                 force = std::atof(f[41].c_str());
             }
@@ -1668,19 +1786,19 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             // the first cut of this line used the quantised gravities (0.194 for
             // the robot) and printed 0.303 where the model runs 0.304, which is
             // a diagnostic that disagrees with the thing it is describing.
-            std::printf("forcebox: uid %d at (%.0f,%.0f) %gx%g m_force=%.3f "
-                        "(cube %.3f / robot %.3f / swing %.3f)\n",
-                        o.uid, o.cx, o.cy, 2 * o.hw, 2 * o.hh, force,
-                        qVy(force * forceUnitFor(0, 1.29825f).v),
-                        qVy(force * forceUnitFor(5, 1.29825f).v),
-                        qVy(force * forceUnitFor(7, 1.29825f).v));
+            loadPrintf("forcebox: uid %d at (%.0f,%.0f) %gx%g m_force=%.3f "
+                       "(cube %.3f / robot %.3f / swing %.3f)\n",
+                       o.uid, o.cx, o.cy, 2 * o.hw, 2 * o.hh, force,
+                       qVy(force * forceUnitFor(0, 1.29825f).v),
+                       qVy(force * forceUnitFor(5, 1.29825f).v),
+                       qVy(force * forceUnitFor(7, 1.29825f).v));
         }
     }
     if (!envTwin.empty()) {
         envOther = (int)envTwin.size() - envTwins;
-        std::printf("groups: %d objects placed by GD's random numbers -> hazard twins%s\n",
-                    envTwins,
-                    envOther ? " (and some that are not solids or hazards: rows kept as "
+        loadPrintf("groups: %d objects placed by GD's random numbers -> hazard twins%s\n",
+                   envTwins,
+                   envOther ? " (and some that are not solids or hazards: rows kept as "
                                "recorded, NOT treated as deadly)" : "");
     }
     auto byX = [](const Obj& a, const Obj& b) { return a.cx < b.cx; };
@@ -1714,18 +1832,53 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
         // dump rather than around L.portals is a change to make when
         // State::portalLatch is widened, not before, because the two share the
         // seeding discipline that a size change re-opens.
-        int nGrav = 0;
+        // [2026-09-22] 32 -> kGravPortalBits (128), and past it the level is
+        // reported unsupported instead of std::exit(2). In the mod that exit ran on
+        // the solver's detached thread and took the game down with it (0xC0000409
+        // in abort, three custom levels with 43, 68 and 72, and a synthetic level
+        // with 33 against one with 32), leaving no line anywhere to say why.
+        int nGrav = 0, nGravAll = 0;
         for (Obj& p : L.portals)
             if (p.type == 3 || p.type == 4) {
-                if (nGrav >= 32) {
-                    std::fprintf(stderr,
-                                 "level has more than 32 gravity portals "
-                                 "(uid %d is the 33rd); State::portalLatch is a "
-                                 "uint32 and cannot hold it\n", p.uid);
-                    std::exit(2);
-                }
-                p.gpBit = (int8_t)nGrav++;
+                ++nGravAll;
+                if (nGrav < kGravPortalBits) p.gpBit = (int8_t)nGrav++;
             }
+        // Past the width, share bits (prelude.hpp, g_gpHandoff; the list is L.gpHandoff): portal
+        // i + kGravPortalBits takes portal i's bit, handed over halfway between them. Only on a
+        // level where x never runs
+        // back (no object carries a reversal), and only when every pair is far enough apart that
+        // no body can overlap both sides of the hand-over point (kGpShareGap); otherwise refuse.
+        if (nGravAll > kGravPortalBits) {
+            constexpr double kGpShareGap = 120.0;
+            bool anyRev = false;
+            for (const Obj& o : L.objs) anyRev = anyRev || o.rev;
+            for (const Obj& o : L.portals) anyRev = anyRev || o.rev;
+            for (const Obj& o : L.orbs) anyRev = anyRev || o.rev;
+            for (const Obj& o : L.pads) anyRev = anyRev || o.rev;
+            std::vector<Obj*> grav;
+            for (Obj& p : L.portals)
+                if (p.type == 3 || p.type == 4) grav.push_back(&p);
+            bool ok = !anyRev;
+            for (size_t j = kGravPortalBits; ok && j < grav.size(); ++j) {
+                const Obj& a = *grav[j - kGravPortalBits];
+                const Obj& b = *grav[j];
+                const double lo = a.cx + a.hw, hi = b.cx - b.hw;
+                if (hi - lo < kGpShareGap) ok = false;
+            }
+            if (ok) {
+                for (size_t j = kGravPortalBits; j < grav.size(); ++j) {
+                    const Obj& a = *grav[j - kGravPortalBits];
+                    Obj& b = *grav[j];
+                    b.gpBit = a.gpBit;
+                    L.gpHandoff.push_back(GpHandoff{((a.cx + a.hw) + (b.cx - b.hw)) / 2.0,
+                                                    (int)a.gpBit});
+                }
+            } else {
+                L.unsupported = "gravity portals: " + std::to_string(nGravAll)
+                                + " (limit " + std::to_string(kGravPortalBits)
+                                + (anyRev ? ", reversal" : ", too close to share bits") + ")";
+            }
+        }
         // --slopedbg: the uid -> bit map. Nothing else can report it, and
         // without it a portalLatch mask is unreadable from outside: rebuilding
         // the order by hand from the dump's type 3/4 rows sorted by cx gave a
@@ -1736,8 +1889,8 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
         if (g_slopeDbg)
             for (const Obj& p : L.portals)
                 if (p.gpBit >= 0)
-                    std::printf("gpbit bit=%d uid=%d type=%d cx=%.1f\n",
-                                (int)p.gpBit, p.uid, (int)p.type, p.cx);
+                    loadPrintf("gpbit bit=%d uid=%d type=%d cx=%.1f\n",
+                               (int)p.gpBit, p.uid, (int)p.type, p.cx);
     }
     std::sort(L.pads.begin(), L.pads.end(), byX);
     std::sort(L.orbs.begin(), L.orbs.end(), byX);
@@ -1775,8 +1928,8 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
     {
         size_t n = 0;
         for (uint8_t v : L.dyn.everRot) n += (v != 0);
-        if (n) std::printf("dynamics: %zu of %zu moving objects are rotated by "
-                           "a trigger\n", n, L.dyn.size());
+        if (n) loadPrintf("dynamics: %zu of %zu moving objects are rotated by "
+                          "a trigger\n", n, L.dyn.size());
     }
     // Resolve each orbit against the loaded level: which g_autoTrig entry gives
     // the Rotate its fire tick, where the centre ended up in dyn, and the
@@ -1803,10 +1956,10 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             ++armed;
         }
         if (g_rotCompute && !g_rotSpec.empty())
-            std::printf("rotplace: %zu of %zu orbits armed (autonomous rotate "
-                        "+ recorded centre); %zu spec'd objects reached the "
-                        "router, %zu were routed into dyn\n",
-                        armed, g_rotSpec.size(), g_rotSeen, g_rotRouted);
+            loadPrintf("rotplace: %zu of %zu orbits armed (autonomous rotate "
+                       "+ recorded centre); %zu spec'd objects reached the "
+                       "router, %zu were routed into dyn\n",
+                       armed, g_rotSpec.size(), g_rotSeen, g_rotRouted);
     }
     // ---- stage 1': give the turned objects a COMPUTED orbit in samples[] ----
     //
@@ -1909,10 +2062,10 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             ++done;
         }
         if (done || refusedFit || refusedNoAuto)
-            std::printf("rotsplit: %zu objects moved onto a computed orbit "
-                        "(worst fit %.4f px), %zu refused on fit, %zu with no "
-                        "analytic translation\n",
-                        done, worstFit, refusedFit, refusedNoAuto);
+            loadPrintf("rotsplit: %zu objects moved onto a computed orbit "
+                       "(worst fit %.4f px), %zu refused on fit, %zu with no "
+                       "analytic translation\n",
+                       done, worstFit, refusedFit, refusedNoAuto);
     }
     // --rotcheck: does the COMPUTED orbit reproduce what GD recorded?
     //
@@ -1988,9 +2141,9 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             if (worst <= 0.1) ++pass;
             if (worst > worstAll) { worstAll = worst; worstUid = kv.first; }
         }
-        std::printf("rotcheck: %zu checked, %zu within 0.1px, worst %.4f px "
-                    "(uid %d); %zu unrecorded, %zu centre not recorded\n",
-                    checked, pass, worstAll, worstUid, noRec, noCentre);
+        loadPrintf("rotcheck: %zu checked, %zu within 0.1px, worst %.4f px "
+                   "(uid %d); %zu unrecorded, %zu centre not recorded\n",
+                   checked, pass, worstAll, worstUid, noRec, noCentre);
     }
     // Say which objects came off the recording. Silent when there are none, so
     // the 21 levels this does not touch print exactly what they printed before.
@@ -2007,10 +2160,80 @@ inline Level loadLevelFrom(std::istream& in, const GroupTimeline* gt = nullptr,
             if (nLagDiff == 0 || d > lagHi) lagHi = d;
             ++nLagDiff;
         }
-        std::printf("dynamics: %d formula-driven (a touch AND an autonomous "
-                    "controller both reach them and both move); %d recorded "
-                    "with an autonomous lag other than the touch lag (%+d..%+d)\n",
-                    g_formulaDriven, nLagDiff, lagLo, lagHi);
+        loadPrintf("dynamics: %d formula-driven (a touch AND an autonomous "
+                   "controller both reach them and both move); %d recorded "
+                   "with an autonomous lag other than the touch lag (%+d..%+d)\n",
+                   g_formulaDriven, nLagDiff, lagLo, lagHi);
+    }
+    // --touchretimebox (dynamics.hpp): the recording's entry into each box, from the objects it
+    // re-times that no other box reaches -- an object two boxes move first moved for whichever
+    // came first, which dates neither. The same objects the re-timing branch serves: an
+    // autonomous controller (autoAnchor / recAuto / autoReach) leaves the recording's clock alone.
+    if (g_touchRetimeBox && !L.dyn.objs.empty()) {
+        L.dyn.boxRecEntry.assign((size_t)kTouchBits, -1);
+        std::vector<int> latest((size_t)kTouchBits, -1), n((size_t)kTouchBits, 0);
+        std::vector<int> first((size_t)kTouchBits, -1);   // uid giving the entry
+        for (size_t i = 0; i < L.dyn.objs.size(); ++i) {
+            if (L.dyn.trigRecFire[i] < 0 || L.dyn.autoAnchor[i] >= 0 || L.dyn.recAuto[i]
+                || L.dyn.autoReach[i])
+                continue;
+            int box = -1, bits = 0;
+            for (int b = 0; b < kTouchBits; ++b)
+                if (L.dyn.trigMask[i].test(b)) { box = b; ++bits; }
+            if (bits != 1) continue;
+            const int e = L.dyn.trigRecFire[i] - kTouchRetimeLat
+                          - std::max(0, L.dyn.recLag[i] - 1);
+            int& cur = L.dyn.boxRecEntry[(size_t)box];
+            if (cur < 0 || e < cur) { cur = e; first[(size_t)box] = L.dyn.objs[i].uid; }
+            latest[(size_t)box] = std::max(latest[(size_t)box], e);
+            ++n[(size_t)box];
+        }
+        // Named where it changes something: a box whose objects do not all start together.
+        for (int b = 0; b < kTouchBits; ++b)
+            if (n[(size_t)b] > 0 && latest[(size_t)b] > L.dyn.boxRecEntry[(size_t)b])
+                loadPrintf("touchretimebox: box %d entry t=%d (uid %d), %d object(s), the "
+                           "last starting %d ticks after\n", b,
+                           L.dyn.boxRecEntry[(size_t)b], first[(size_t)b], n[(size_t)b],
+                           latest[(size_t)b] - L.dyn.boxRecEntry[(size_t)b]);
+    }
+    // --activators: the objects an activator switches take their on/off from their switches
+    // (Dynamics::onEv), starting from the recording's reset snapshot. Only those objects: an
+    // x-crossing Toggle alone reaches thousands of objects in a SubZero level, and moving all of
+    // them off the recording is a different change from this one.
+    if (g_activators && tt && !L.dyn.objs.empty()) {
+        std::unordered_set<int> switched;   // uids some activator switches
+        for (size_t b = 0; b < tt->size() && b < (size_t)kTouchBits; ++b)
+            if ((*tt)[b].activator)
+                for (const TouchTrig::TogEv& e : (*tt)[b].togEv) switched.insert(e.uid);
+        if (!switched.empty()) {
+            const auto boxEv = boxOnEvents(*tt);
+            const auto autoEv = at ? autoOnEvents(*at)
+                                   : std::unordered_map<int, std::vector<OnEvent>>{};
+            L.dyn.onEv.assign(L.dyn.objs.size(), {});
+            L.dyn.onInit.assign(L.dyn.objs.size(), 1);
+            for (size_t i = 0; i < L.dyn.objs.size(); ++i) {
+                const int u = L.dyn.objs[i].uid;
+                if (!switched.count(u)) continue;
+                // NO SNAPSHOT, NO SWITCHES. The recording's first row is what a recorded run
+                // left there, which is exactly what this replaces -- a run that took the key
+                // records the platforms on -- so falling back to it would rebuild the fault it
+                // removes. The object stays on its recording and says so.
+                const auto s0 = g_groupInit.find(u);
+                if (s0 == g_groupInit.end()) {
+                    loadPrintf("activators: uid %d stays on its recording - no reset snapshot "
+                               "for it (a recording made before the snapshot existed)\n", u);
+                    continue;
+                }
+                std::vector<OnEvent>& ev = L.dyn.onEv[i];
+                if (const auto a = autoEv.find(u); a != autoEv.end())
+                    ev.insert(ev.end(), a->second.begin(), a->second.end());
+                if (const auto b = boxEv.find(u); b != boxEv.end())
+                    ev.insert(ev.end(), b->second.begin(), b->second.end());
+                L.dyn.onInit[i] = s0->second;
+                loadPrintf("activators: uid %d gets %zu switch(es), on=%d at t=0 from the reset "
+                           "snapshot\n", u, ev.size(), (int)L.dyn.onInit[i]);
+            }
+        }
     }
     return L;
 }
@@ -2084,6 +2307,76 @@ inline std::string forceIdsPathBeside(const std::string& objrectsPath) {
     std::ifstream probe(p);
     return probe ? p : std::string();
 }
+
+// The globals loadLevelFrom writes, as it left them: taken after one load and put back in place
+// of another from the same inputs (the ladder's level cache, cli.hpp). Found by reading the
+// function for assignments, container writes, `++`, sorts and non-const references to g_ names
+// (2026-09-26); its callees (bandHeightFor, envTwinUid, forceUnitFor, gdEase, isSpeedId,
+// recordLag, rotStep, touchBit) write none. g_rotSpec is here because the orbit stage arms its
+// entries in place.
+struct LoadLevelWrites {
+    decltype(g_forceFields) forceFields;
+    decltype(g_forceBoxes) forceBoxes;
+    decltype(g_flipHeadBoxes) flipHeadBoxes;
+    decltype(g_dashStopBoxes) dashStopBoxes;
+    decltype(g_timeWarps) timeWarps;
+    decltype(g_zoomTrigs) zoomTrigs;
+    decltype(g_staticCams) staticCams;
+    decltype(g_armBoxes) armBoxes;
+    decltype(g_slideBoxes) slideBoxes;
+    decltype(g_rotTrig) rotTrig;
+    decltype(g_rotSpec) rotSpec;
+    decltype(g_formulaDriven) formulaDriven{};
+    decltype(g_freeModeCol) freeModeCol{};
+    decltype(g_trigGateCol) trigGateCol{};
+    decltype(g_staticCamCol) staticCamCol{};
+    decltype(g_lockBox) lockBox{};
+    decltype(g_lockTicks) lockTicks{};
+    decltype(g_rotSeen) rotSeen{};
+    decltype(g_rotRouted) rotRouted{};
+    void take() {
+        forceFields = g_forceFields;
+        forceBoxes = g_forceBoxes;
+        flipHeadBoxes = g_flipHeadBoxes;
+        dashStopBoxes = g_dashStopBoxes;
+        timeWarps = g_timeWarps;
+        zoomTrigs = g_zoomTrigs;
+        staticCams = g_staticCams;
+        armBoxes = g_armBoxes;
+        slideBoxes = g_slideBoxes;
+        rotTrig = g_rotTrig;
+        rotSpec = g_rotSpec;
+        formulaDriven = g_formulaDriven;
+        freeModeCol = g_freeModeCol;
+        trigGateCol = g_trigGateCol;
+        staticCamCol = g_staticCamCol;
+        lockBox = g_lockBox;
+        lockTicks = g_lockTicks;
+        rotSeen = g_rotSeen;
+        rotRouted = g_rotRouted;
+    }
+    void put() const {
+        g_forceFields = forceFields;
+        g_forceBoxes = forceBoxes;
+        g_flipHeadBoxes = flipHeadBoxes;
+        g_dashStopBoxes = dashStopBoxes;
+        g_timeWarps = timeWarps;
+        g_zoomTrigs = zoomTrigs;
+        g_staticCams = staticCams;
+        g_armBoxes = armBoxes;
+        g_slideBoxes = slideBoxes;
+        g_rotTrig = rotTrig;
+        g_rotSpec = rotSpec;
+        g_formulaDriven = formulaDriven;
+        g_freeModeCol = freeModeCol;
+        g_trigGateCol = trigGateCol;
+        g_staticCamCol = staticCamCol;
+        g_lockBox = lockBox;
+        g_lockTicks = lockTicks;
+        g_rotSeen = rotSeen;
+        g_rotRouted = rotRouted;
+    }
+};
 
 // The CLI's way in: the same parse, reading the dump the mod wrote to disk.
 inline Level loadLevel(const std::string& path, const GroupTimeline* gt = nullptr,

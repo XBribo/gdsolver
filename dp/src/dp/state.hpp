@@ -84,8 +84,8 @@ struct State {
     // probe is a comment) and --start does not carry this field. What it can do
     // is mislead a reader who puts this field beside the probe's `p986` column,
     // where the two read ANTI-CORRELATED. `ringHold` is the same idea for
-    // rings ALONE; 0x986 is the shared latch of every consumer, and brief-022 named
-    // the gap ("nothing does for whatever consumed the press").
+    // rings ALONE; 0x986 is the shared latch of every consumer, which leaves
+    // a gap ("nothing does for whatever consumed the press").
     // Set by a ring firing and by the grounded impulse branch (the cube's jump, the
     // ball's tap, the spider's flip -- GD's updateJump clears 0x986 at 0x38bbef when
     // it jumps). Cleared on release, like GD's releaseButton.
@@ -236,6 +236,13 @@ struct State {
     // 0 = neither, which is what resetLevelVariables leaves and what every
     // level without a Static Camera keeps for its whole run -- so branch B,
     // bit for bit as before.
+    //   bit 2   the Free Mode byte below is known (kBandFreeKnown)
+    //   bit 3   GD's Free Mode byte, layer+0x311 (kBandFree): set = the band
+    //           clamps nothing (bands.hpp, bandIsWall). Not in the dedupe key,
+    //           which reads bits 0-1 only: it changes only at a mode portal,
+    //           which nearly always changes the mode too, and the mode is in
+    //           the key. Two states that differ here and nowhere else (one took
+    //           a portal into the mode it was already in) can merge.
     uint8_t bandBranch = 0;
     // The y the band is derived FROM. Normally the cy of the portal that last
     // wrote the band, but inside a dual it is pinned to the DUAL portal's cy:
@@ -258,7 +265,7 @@ struct State {
     // that two states at the same tick can disagree about whether a door is
     // open. It is NOT in keyOf -- the layer is partitioned by it instead, the
     // same way `dx` is, so states with different masks can never merge.
-    TouchMask trig = 0;
+    TouchMask trig{};
     int32_t trigT = -1;
     // Which of the level's gravity portals this state has already SPENT. GD
     // latches one on first overlap, not on first firing, so a pass taken at
@@ -293,8 +300,9 @@ struct State {
     // the second half of a dual can never fire a gravity portal the first half
     // has crossed, and dual levels plainly do not behave that way. The
     // by-player flag is the one a per-player refusal reads.
-    uint32_t portalLatch = 0;
-    uint32_t portalLatch2 = 0;
+    // [2026-09-22] kGravPortalBits wide (128), was a uint32. See prelude.hpp.
+    GravLatch portalLatch{};
+    GravLatch portalLatch2{};
     // ...and the tick each individual box was entered on. `trigT` is the LAST
     // box only, which is what markTouched's own note says is not enough: the
     // switch band's per-box delay needs each punch's own tick, and the
@@ -966,6 +974,56 @@ struct State {
     // the anchor sits after a seam the rider already crossed. Placed in the tail
     // padding, so sizeof is unchanged.
     int32_t groundUid = -1;
+    // The ring fired BEFORE usedOrb, by uid (-1 = none), and the same for the second
+    // body. GD does not fire a ring twice (a fired ring leaves m_touchedRings and is
+    // not offered again while the player is still in it), and one pointer cannot
+    // hold two: SubZero's Power Trip stacks two green rings on one square (3933,205),
+    // GD fires them on two presses (t=5,239 and 5,241, flip 0 -> 1 -> 0), and on the
+    // third press, still inside both, fires neither -- while the model, remembering
+    // only the second, fired the first again (t=5,246, flip, vy -11.18), and 555 of
+    // the cold run's 571 fixups sat on that square. Not seeded at an anchor, the same
+    // gap usedOrb has (an orb is consumed by a press; the recording cannot say which).
+    // At the END on purpose (positional State{...} initialisers, see jumpBuf).
+    int32_t usedOrbOld = -1, usedOrbOld2 = -1;
+    // --upsidecoyote: GD's m_isOnGround is still set on an upside-down cube that has walked off
+    // its surface (see g_upsideCoyote). Written and read only under the flag; the anchor does
+    // not seed it, but an anchor inside the window arrives with `grounded` from GD's own og and
+    // the gate reads either. At the END on purpose (positional State{...}, see jumpBuf).
+    uint8_t ogLinger = 0;
+    // --holdlatch: the button is still down but GD's m_jumpBuffered (+0x985) is 0 -- a ball's tap
+    // or a ball's or swing's ring cleared it and only a new press sets it again (pushButton). The
+    // ship's thrust reads +0x985 (updateJump's ship arm), so a ball that taps and flies into a ship
+    // portal with the button held does not thrust. Per body; 0 = live, which is also what an
+    // anchor starts with (not seeded: the dump has no +0x985). In the padding after ogLinger, so
+    // sizeof is unchanged -- the three per-half sites are declaration, swapHalves and fixup.hpp.
+    uint8_t holdDead = 0, holdDead2 = 0;
+    // --ringonce: the rings fired before usedOrbOld, newest first, per body (-1 = empty). GD fires
+    // a ring once in a run, and two slots cannot hold a maze: a custom level fires gravity ring uid 378 at
+    // t=2,528, then yellows 386 and 385, and on the next press refuses 378 while the model, down to
+    // 386 and 385, fired it again (t=2,548). Written and read only under the flag; not seeded at an
+    // anchor, the gap usedOrbOld has. At the END on purpose (positional State{...}, see jumpBuf).
+    int32_t usedOrbHist[3] = {-1, -1, -1}, usedOrbHist2[3] = {-1, -1, -1};
+    // --portalonce: the uids of the mode/size portals this body overlapped on this tick (-1 = none).
+    // GD activates a portal on its first overlap, so one the body was already in on the previous
+    // tick does not fire. Recorded from the portal loop's own overlap test rather than re-derived
+    // from the previous position: the half that test used depends on the size before that tick's
+    // portals (lv20 t=5,138: mini at the loop's start, full after the size portal, and the ball
+    // portal beside it overlaps only at the full half on t=5,139, where GD fires it). Written and
+    // read only under the flag; not seeded (an anchor inside a portal sees it as new).
+    int32_t portSeen[3] = {-1, -1, -1}, portSeen2[3] = {-1, -1, -1};
+    // --ringorder: GD's m_touchedRings for this body -- the rings in contact on this tick or the
+    // one before, in first-contact order (uids, -1 = empty) -- and which of them this tick touched
+    // (bit i for entry i). pushButton walks it front to back, so the ring touched first fires
+    // first. Written and read only under the flag; not seeded (an anchor starts it empty, and
+    // its first tick's contacts enter by uid). At the END on purpose (positional State{...}).
+    int32_t touchRing[4] = {-1, -1, -1, -1}, touchRing2[4] = {-1, -1, -1, -1};
+    uint8_t touchRingT = 0, touchRingT2 = 0;
+    // --minpulse (search_census.hpp g_minPulse): ticks since the button last changed, as of this
+    // tick (0 = this tick's input is new), saturating at 254. Written by the search's child step
+    // only while the flag is on, so it stays 255 ("free") everywhere else. NOT in keyOf: every
+    // lineage obeys its own count, so a merge only chooses among lineages that all kept the rule.
+    // At the END on purpose (positional State{...}).
+    uint8_t edgeAge = 255;
 };
 
 // THIS ASSERT IS A QUESTION, NOT A BUDGET. If you added a field and the build
@@ -1024,9 +1082,26 @@ struct State {
 // pickup behind the anchor is not in the window. The count is what the trigger
 // reads, the pickups behind cannot be taken twice (x only grows where the prune
 // applies), so base + the bits ahead is the same number GD holds.
+// [2026-09-22] 352 -> 360: usedOrbOld / usedOrbOld2 (the ring fired before usedOrb,
+// per body). They accumulate and are NOT seeded at an anchor, for the reason usedOrb
+// is not: an orb is spent by a press, and nothing in the recording says which were.
+// Printed in --seeddump; seedcheck lists it as an expected difference.
+// [2026-09-22] 360 -> 392: portalLatch / portalLatch2 went from uint32 to
+// GravLatch (Bits<kGravPortalBits>, 16 bytes at 128). MEASURED: 32 bytes, of which
+// 24 are the widening and 8 the padding an 8-byte-aligned member brings where the
+// two uint32 sat. The latch term is relative to 128, so the base holds at 128 and a
+// further widening moves the expected size (and its padding re-measured here).
+// Not seeded at an anchor beyond what the payload always did (see the field).
+// [2026-09-25] 392 -> 416: usedOrbHist / usedOrbHist2 (--ringonce, three older fired rings per
+// body). They accumulate and are not seeded, for usedOrbOld's reason; printed in --seeddump.
+// [2026-09-25] 416 -> 440: portSeen / portSeen2 (--portalonce, the portals overlapped this tick).
+// One tick of memory, rewritten every tick, so there is nothing to seed; printed in --seeddump.
+// [2026-09-25] 440 -> 480: touchRing / touchRing2 and their touched bits (--ringorder). Two ticks
+// of memory, not seeded (see the field); printed in --seeddump.
 constexpr size_t kStateBytes =
-    (352u + (size_t)(kTouchBits - 32) * sizeof(uint16_t)
-          + (sizeof(TouchMask) - sizeof(uint32_t)) + 7u) / 8u * 8u;
+    (480u + (size_t)(kTouchBits - 32) * sizeof(uint16_t)
+          + (sizeof(TouchMask) - sizeof(uint32_t))
+          + 2u * (sizeof(GravLatch) - sizeof(Bits<128>)) + 7u) / 8u * 8u;
 static_assert(sizeof(State) == kStateBytes,
               "State changed size. If the new field ACCUMULATES over ticks, "
               "seed it in the --start anchor scan, print it in --seeddump, and "

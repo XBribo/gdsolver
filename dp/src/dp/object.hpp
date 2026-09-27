@@ -133,6 +133,13 @@ struct Obj {
     // skips animateInDualGroundNew entirely. See g_freeModeCol in bands.hpp for
     // why reading it is coupled to using the band's own height.
     uint8_t freeMode = 0;
+    // REVERSE (level-string property 117, EffectGameObject::m_isReverse, objrects'
+    // `rev` column). A ring (ringJump) or a pad (GJBaseGameLayer::bumpPlayer) with
+    // it set calls reversePlayer BEFORE its own impulse, and reversePlayer flips
+    // m_isGoingLeft (+0x9c2) -- the model's State::rev. Its other branch, which
+    // mirrors the player's x about the object, is gated on the player's copy of
+    // the level's reverseSync (kA42, +0x562), which no level here sets.
+    uint8_t rev = 0;
 };
 
 // A verbatim port of GameObject::isFacingDown() (2.2081 win 0x1a1910). GD turns
@@ -256,9 +263,22 @@ constexpr double kSawMargin = 0.05;
 //          candidate states; a false pass dies in replay and records a fixup.
 // Ship stays at the default: 0.15 across the board regressed lv16's ship
 // section, which is how the margin was found to be per-mode at all.
+// (The ball and the ship have since gone to 0 -- the two notes below.)
+// Saw exact (was --sawexact, always on since 2026-09-26):
+// the BALL's addend is 0, not -0.05. Four old custom levels kill a full ball at a corner distance
+// of 32.276-32.285 from a 32.3 saw (id 88/186: t=4,256, t=18,231, t=8,011,
+// t=9,847), inside the ball's r - 0.05 by 0.03. The addends were fitted before the 0.001
+// vy grid was reproduced (kSawMargin's note), but only the ball's has a witness against it:
+// taking every mode to 0 changed a custom level's route through its saws and the cold stopped against
+// the wall at x=28,575 (it clears with the cube's and robot's addends kept).
+// Saw exact ship (was --sawexactship, always on since 2026-09-26):
+// the SHIP's addend is 0 too. It was never measured -- it is the default the note above left in
+// place -- and another old custom level has a witness against it: a mini ship at t=3,297 with its
+// box corner 32.3037 from a 32.3 saw (uid 1184) that GD does not kill (it kills on the next tick,
+// at 31.66), where the default 0.05 killed a tick early.
 inline double sawMarginFor(uint8_t mode) {
     if (mode == 5) return 0.10;
-    if (mode == 2) return -0.05;
+    if (mode == 2 || mode == 1) return 0.0;
     return kSawMargin;
 }
 
@@ -320,6 +340,27 @@ inline double sawRectHalfB(int mode, int mini) {
     if (mode == 4) return 5.0 * s;   // wave
     if (mode == 6) return 13.5 * s;  // spider
     return 15.0 * s;                 // cube/ship/ball/ufo/robot/swing
+}
+
+// Can NO point of the segment (x0,y0)-(x1,y1) be close enough to `o` for any of
+// the kill tests below to fire? A pre-check for the sub-stepped sweeps, which
+// test every hazard in the x window -- and the window spans every y -- at nine
+// points a tick. Everything those tests accept lies within the object's extent
+// (its bound, its turned box's projection, its radius) plus a player-side half
+// that never exceeds max(half, 15) (hazardHit's widest reach is branch B's rect
+// half, at most 15, plus the radius and a margin of at most 0.10), so an object
+// farther than that plus 2 px from the segment's bounding box cannot be hit
+// anywhere on it. True means "skip it": the answer the sweep would have given.
+inline bool outOfSweepReach(const Obj* o, double x0, double y0, double x1,
+                            double y1, double half) {
+    double ex = std::max(o->hw, o->radius), ey = std::max(o->hh, o->radius);
+    if (o->obbOk) {
+        ex = std::max(ex, o->bhw * std::fabs(o->bc) + o->bhh * std::fabs(o->bs));
+        ey = std::max(ey, o->bhw * std::fabs(o->bs) + o->bhh * std::fabs(o->bc));
+    }
+    const double reach = std::max(half, 15.0) + 2.0;
+    return o->cx + ex + reach < std::min(x0, x1) || o->cx - ex - reach > std::max(x0, x1)
+        || o->cy + ey + reach < std::min(y0, y1) || o->cy - ey - reach > std::max(y0, y1);
 }
 
 inline bool hazardHit(const Obj* o, double px, double py, double half,
@@ -388,7 +429,6 @@ inline bool hazardHit(const Obj* o, double px, double py, double half,
         // branch: 0x211df0 reads the flag at [[layer+0xdb0]+0x1cf] -- off the
         // LAYER, not off either object. What that field is has not been pinned
         // down; `dynObj` simply was not it.
-        // GDSOLVER_LAB/notes/measure-moving-saw-branch-2026-08-28.md
         //
         // Branch A now only catches combos sawRectHalfB has no measurement for.
         // 0x211df0 reads getObjectRect().width*0.5

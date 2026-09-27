@@ -5,9 +5,12 @@
 
 namespace p1 {
 
+inline void resetSecsolveSession();   // below, with the handoff's globals
+
 // Everything a panel-started session has in common, whichever mode it is.
 inline void uiSessionBase(int levelId) {
     resetSessionState();
+    resetSecsolveSession();
     g_cfg = Config{};
     g_cfg.enabled = true;
     g_cfg.levelId = levelId;
@@ -16,6 +19,13 @@ inline void uiSessionBase(int levelId) {
     g_cfg.cbs = 0; g_cfg.cos = 1;
     g_cfg.blockInput = true;    // the mod drives; the keyboard does not
     g_cfg.delaySec = 0.f;
+}
+
+// The stored solution Replay plays for a level: the plain one, or with Coins on the coin one.
+// The play menu asks the same question before offering Replay, so both read it from here.
+inline std::string uiSolutionPath(int levelId, bool coins) {
+    return std::string(DATA_DIR) + "/solution_lv" + std::to_string(levelId)
+           + (coins ? "_coins.txt" : "_dp.txt");
 }
 
 inline bool uiConfigureSession(int levelId) {
@@ -30,6 +40,9 @@ inline bool uiConfigureSession(int levelId) {
         // at the same speed, which is all cost and no gain
         g_cfg.fastdt = 1.f / 60.f;   // 4 physics ticks per call
         g_cfg.fastloops = 1800;      // ...and this many calls per frame once the screen is off
+        // ...but never more than 100 ms of them: the window has to keep answering on a heavy
+        // level, where 1,800 calls took 8-18 s (Config::frameBudgetMs).
+        g_cfg.frameBudgetMs = 100.0;
         // Start FAST, with the screen off -- the same state the render key produces, so the key
         // toggles out of it and back. A solve is searching (the level frozen, nothing to look at)
         // and testing candidates (replays that mostly die); at 1x each candidate costs the length
@@ -52,18 +65,18 @@ inline bool uiConfigureSession(int levelId) {
         }
         log::info("panel: solve lv{} in-process{}", levelId, g_uiCoins ? " with coins" : "");
     } else {
-        char name[128];
-        snprintf(name, sizeof(name), g_uiCoins ? "solution_lv%d_coins.txt"
-                                               : "solution_lv%d_dp.txt", levelId);
+        const std::string name = uiSolutionPath(levelId, g_uiCoins);
         std::vector<InputCmd> plan;
-        if (!loadInputsFile(std::string(DATA_DIR) + "/" + name, plan)) {
+        if (!loadInputsFile(name, plan)) {
             // Say so on screen as well: silently falling back to normal play looks exactly
-            // like "the mod did nothing", which is what it looked like the first time
+            // like "the mod did nothing", which is what it looked like the first time. The menu
+            // does not start Replay without the file, so what reaches here is a file that exists
+            // and does not load.
             log::info("panel: no solution file for lv{} ({}) -> normal play", levelId, name);
             notify::show(g_uiCoins ? "gdsolver: no coin solution file for this level - "
-                                     "switch the panel to Solve with Coins On"
+                                     "choose Solve with Coins on"
                                    : "gdsolver: no solution file for this level - "
-                                     "switch the panel to Solve",
+                                     "choose Solve",
                          NotificationIcon::Warning, 4.f);
             return false;
         }
@@ -101,6 +114,122 @@ inline long long g_secReqStart = -1;
 inline double g_secReqTarget = 0.0;
 inline long long g_secReqHorizon = -1;   // -1 = keep secsolve's current value
 inline long long g_secReqCap = -1;       // -1 = keep
+// A depth target instead of (or with) the x one: success = alive this many ticks past the head.
+// -1 = keep the session's sectargetdepth. Only the loop's own rung sets it (dpsecauto).
+inline long long g_secReqDepth = -1;
+// cfg dpseccoinrung: the coin a rung fired at the coin wall has to take (-1 = none).
+inline int g_secReqCoin = -1;
+
+// ---- section solve as a RUNG (cmd `secrung ...`) ---------------------------
+// The same search as the one-way `secsolve` handoff above, except that the
+// answer comes BACK: the inputs it finds are spliced into the plan, the loop
+// resumes, and GD verifies the new plan the way it verifies every other one.
+//
+// Measured on a level the model of 2026-09-22 could not pass: the loop died
+// 60 times at one tick while writing
+// 200 fixups around it; a 120-tick search over the stretch where those fixups
+// sit crossed it in 61 s, and with the answer spliced in the loop was past the
+// wall on its next iteration.
+//
+// THE SPLICED STRETCH HAS TO BE PINNED. The ladder's backoff grows while the
+// next wall holds, and once it reaches back past the splice the stretch is
+// re-planned by the model that could not do it: measured on the same level, a
+// pin that was dropped that way cost 3 of the next 15 rounds, each dying on the
+// wall the splice had crossed. `g_secPin` is the tick the ladder may not reach
+// back past (runLadder). A pin does not rescue a splice that dies by itself: a
+// window that ended before the death was solved in 5 s and its splice died on
+// the wall (the model could not see what killed it), so the exit goes past the
+// death.
+inline bool g_secReqRung = false;    // the queued request is a rung
+inline bool g_secRung = false;       // ...and the search in flight is one
+inline long long g_secPin = -1;      // no anchor before this tick (-1 = none)
+// The death the rung was fired at. The pin is placed past it as well as past the
+// spliced ticks: an anchor between the two hands the crossing back to the model
+// that could not do it. This is the reasoning, not a measurement -- the run first
+// quoted for it (the loop back at the wall while its best stayed past it) was a
+// bookkeeping fault, the splice never reaching g_plan. With the window's exit
+// past the death, as dpsecauto draws it, the two ticks coincide anyway.
+inline long long g_secPinWall = -1;
+// What the handoff overwrote, so the resume can put it back.
+inline int g_secSavePractice = -1, g_secSaveCkpt = -1, g_secSaveFastloops = 1;
+inline int g_secSaveTargetDepth = 0;
+inline long long g_secSaveMaxAttempts = 0;
+// A rung whose prefix never reaches its head. The handoff replays the deepest plan to the head
+// and places the checkpoint there; if GD does not replay that plan the way it once flew -- a
+// custom level teleports the player 1,528 px ahead on some attempts and not on others -- the prefix
+// dies before the head, markCheckpoint refuses a dead player, and nothing ended the rung: the
+// attempt cap is the non-rung handoff's (g_cfg.maxAttempts), and the loop is stopped while a rung
+// is in flight. 687 attempts in a row on the user's own game. Attempts (by g_attempt) that failed
+// to reach the head, the last one counted, and kSecRungPrefixTries of them abandon the rung.
+inline int g_secRungPrefixFails = 0;
+inline long long g_secRungFailAttempt = -1;
+constexpr int kSecRungPrefixTries = 2;
+
+// The section search's own settings as the session's cfg left them. A rung changes them for its
+// window -- the handoff sets the start tick, target, depth, horizon, cap and per-layer log, and
+// autoFire the branching primitive -- and nothing put them back, so the next level of a suite
+// started with the last rung's window and primitive. A run's `cfgdiff:` lines showed it on
+// levels that set no sec* key (after the spin-off 1003's rungs, on every level that followed).
+// Inert there -- the same [fp] as a process per level -- but a depth target the next handoff
+// does not set would have carried over. Taken when a solve starts (dpsolve::start), put back
+// when the session ends.
+struct SecSettings {
+    bool valid = false;
+    long long startTick = -1;
+    double targetX = 0.0;
+    int targetDepth = 0;
+    int horizon = 300;
+    size_t cap = 100;
+    bool log = false;
+    int snapMode = 0;
+    int verifyEvery = 0;
+};
+inline SecSettings g_secSettings;
+inline void captureSecsolveSettings() {
+    g_secSettings = {true, secsolve::g_startTick, secsolve::g_targetX, secsolve::g_targetDepth,
+                     secsolve::g_horizon, secsolve::g_cap, secsolve::g_log, secsolve::g_snapMode,
+                     secsolve::g_verifyEvery};
+}
+
+// The handoff's request and the rung's state belong to the session that raised them. Left
+// behind by a player leaving the level mid-rung, they handed the next session a pending handoff
+// at the old level's tick, a pin, and the search's own depth target (with secsolve::reset for
+// the search itself). Called by endSession and at a panel session's start.
+inline void resetSecsolveSession() {
+    if (g_secRung) secsolve::g_targetDepth = g_secSaveTargetDepth;
+    if (g_secSettings.valid) {
+        secsolve::g_startTick = g_secSettings.startTick;
+        secsolve::g_targetX = g_secSettings.targetX;
+        secsolve::g_targetDepth = g_secSettings.targetDepth;
+        secsolve::g_horizon = g_secSettings.horizon;
+        secsolve::g_cap = g_secSettings.cap;
+        secsolve::g_log = g_secSettings.log;
+        secsolve::g_snapMode = g_secSettings.snapMode;
+        secsolve::g_verifyEvery = g_secSettings.verifyEvery;
+        g_secSettings.valid = false;
+    }
+    g_secReqPending = false;
+    g_secReqRung = false;
+    g_secRung = false;
+    g_secPin = -1;
+    g_secPinWall = -1;
+    g_secReqCoin = -1;
+    g_secReqDepth = -1;
+}
+
+// ---- level swap (cmd `swaplevel <path>`) -----------------------------------
+// Replace the level THIS session is playing with the one in a file, without
+// leaving the game. A section solve only needs the geometry its window can
+// reach, and a clone cut down to that restores far faster (the restore is
+// 86-89% of a section search and its cost follows the level's object count) --
+// so the search wants a different level than the loop around it.
+//
+// The request is a pair of globals, consumed one frame later
+// (queueInMainThread): the poll runs inside GJBaseGameLayer::update, and
+// replacing the scene there would destroy the layer the call is standing in.
+inline std::string g_swapReq;                   // "" = nothing pending
+inline std::chrono::steady_clock::time_point g_swapT0;
+inline bool g_swapTiming = false;               // print the cost of the swap
 
 // Read one cfg value as a number, without raising if it is not one.
 //
@@ -136,6 +265,14 @@ inline T cfgNumOr(const std::string& key, const std::string& val, T fallback) {
 inline void pollCommandFileImpl(const std::string& cmd) {
     if (cmd == "pause") { g_paused = true; log::info("phase2: paused at tick {}", g_tick); }
     else if (cmd == "resume") { g_paused = false; log::info("phase2: resumed"); }
+    // `swaplevel <path>`: play a different level from here on (see g_swapReq). The swap
+    // itself happens a frame later, off the update stack.
+    else if (cmd.rfind("swaplevel ", 0) == 0) {
+        g_swapReq = cmd.substr(10);
+        g_swapT0 = std::chrono::steady_clock::now();
+        g_swapTiming = true;
+        writeResult("swaplevel: requested " + g_swapReq);
+    }
     else if (cmd == "rerun") {
         // Serve mode: swap in data/plan_in.txt, reset immediately and run the next attempt from
         // the head of the new plan. Waiting for the attempt boundary via pause does not work
@@ -167,7 +304,8 @@ inline void pollCommandFileImpl(const std::string& cmd) {
                           "onGround2,dead,speed,gravityMod,platXVel,vsize,gy1,gy2,"
                           "dual,p2y,p2vy,p2up,p2ground,p2dead,pmin,pmax,"
                           "snapuid,snapdist,camscale,gframe,ctrlOff,camx,camy,"
-                          "p2ground2,p2mode,p2vsize,p2x,rotch,rotidx,rotrev,firedw\n";
+                          "p2ground2,p2mode,p2vsize,p2x,rotch,rotidx,rotrev,firedw,"
+                          "bandst,bandmode,camoffy,freemode,bandforce\n";
             }
             if (g_trace.is_open()) {
                 g_trace.close();
@@ -209,37 +347,43 @@ inline void pollCommandFileImpl(const std::string& cmd) {
         writeResult(tr);
         return;
     }
-    else if (cmd.rfind("secsolve", 0) == 0) {
+    else if (cmd.rfind("secsolve", 0) == 0 || cmd.rfind("secrung", 0) == 0) {
         // Hand the in-process solve session over to the section solver (src/solver/secsolve.hpp):
-        //   secsolve <startTick> <targetX> [horizon] [cap]
+        //   secsolve <startTick> <targetX> [horizon] [cap]   -- one way, the session ends
+        //   secrung  <startTick> <targetX> [horizon] [cap]   -- a RUNG: the answer is spliced
+        //                                                       into the plan and the loop resumes
         // Queued here, performed by dpsolve::poll() at an idle frame boundary: the loop stops,
         // its deepest VERIFIED plan replays to <startTick>, a practice checkpoint is dropped
         // there and the section search takes over. Reporting and the session end ("secsolve")
         // are the search's own, exactly as on the cfg-driven served path. Tuning knobs
         // (secyq/secvq/secgrace/...) can be given in the session cfg at open -- without
         // `secsolve=1` and `checkpointat` they are inert until this command fires.
+        const bool rung = cmd.rfind("secrung", 0) == 0;
+        const std::string what = rung ? "secrung" : "secsolve";
         long long st = -1, hz = -1, cp = -1;
         double tx = 0.0;
         {
-            std::istringstream ss(cmd.substr(8));
+            std::istringstream ss(cmd.substr(what.size()));
             ss >> st >> tx;
             if (!(ss >> hz)) hz = -1;
             if (!(ss >> cp)) cp = -1;
         }
         if (st <= 0 || tx <= 0.0) {
-            writeResult("secsolve cmd: usage: secsolve <startTick> <targetX> [horizon] [cap]");
+            writeResult(what + " cmd: usage: " + what + " <startTick> <targetX> [horizon] [cap]");
             return;
         }
         if (!g_started || g_sessionOver || !g_cfg.dpSolve) {
-            writeResult("secsolve cmd: refused - no in-process solve session (dpsolve) is open");
+            writeResult(what + " cmd: refused - no in-process solve session (dpsolve) is open");
             return;
         }
         g_secReqStart = st;
         g_secReqTarget = tx;
         g_secReqHorizon = hz;
         g_secReqCap = cp;
+        g_secReqDepth = -1;
+        g_secReqRung = rung;
         g_secReqPending = true;
-        writeResult("secsolve cmd: queued start=" + std::to_string(st)
+        writeResult(what + " cmd: queued start=" + std::to_string(st)
             + " target=" + std::to_string(tx)
             + " - takes over at the next idle frame boundary");
         return;
@@ -279,6 +423,37 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "dprejoinfull") g_cfg.dpRejoinFull = (val == "1");
     else if (key == "dpoffboardkill") g_cfg.dpOffBoardKill = (val == "1");
     else if (key == "dpmaxiters") cfgNum(key, val, g_cfg.dpMaxIters);
+    else if (key == "dptopstop") cfgNum(key, val, g_cfg.dpTopStop);
+    else if (key == "dpwalkgates") g_cfg.dpWalkGates = (val == "1");
+    else if (key == "coinmissrev") g_cfg.coinMissRev = (val == "1");
+    else if (key == "coinmisspost") g_cfg.coinMissPost = (val == "1");
+    else if (key == "coinoverdepth") g_cfg.coinOverDepth = (val == "1");
+    else if (key == "coinapproachoff") g_cfg.coinApproachOff = (val == "1");
+    else if (key == "routeprereq") g_cfg.routePrereq = (val == "1");
+    else if (key == "routeprereqafter") g_cfg.routePrereqAfter = std::max(0, std::atoi(val.c_str()));
+    else if (key == "coinmissmove") g_cfg.coinMissMove = (val == "1");
+    else if (key == "groupsretime") g_cfg.groupsRetime = (val == "1");
+    else if (key == "dpsecauto") g_cfg.dpSecAuto = (val == "1");
+    else if (key == "dpsecstall") cfgNum(key, val, g_cfg.dpSecStall);
+    else if (key == "dpsecnorec") cfgNum(key, val, g_cfg.dpSecNoRec);
+    else if (key == "dpsecmargin") cfgNum(key, val, g_cfg.dpSecMargin);
+    else if (key == "dpsecchain") g_cfg.dpSecChain = (val == "1");
+    else if (key == "dpsecchainspan") cfgNum(key, val, g_cfg.dpSecChainSpan);
+    else if (key == "dpsecpinback") cfgNum(key, val, g_cfg.dpSecPinBack);
+    else if (key == "dpsecstateprice") cfgNum(key, val, g_cfg.dpSecStatePrice);
+    else if (key == "dpseccallprice") cfgNum(key, val, g_cfg.dpSecCallPrice);
+    else if (key == "dpseccap") cfgNum(key, val, g_cfg.dpSecCap);
+    else if (key == "dpsecsolved") g_cfg.dpSecSolved = (val == "1");
+    else if (key == "dpsecreuse") g_cfg.dpSecReuse = (val == "1");
+    else if (key == "dpsecrent") g_cfg.dpSecRent = (val == "1");
+    else if (key == "dpsecrungprior") cfgNum(key, val, g_cfg.dpSecRungPrior);
+    else if (key == "dpseccoinrung") g_cfg.dpSecCoinRung = (val == "1");
+    else if (key == "dpendtrigclear") g_cfg.dpEndTrigClear = (val == "1");
+    else if (key == "slice") g_cfg.slice = (val == "1");
+    else if (key == "slicemin") cfgNum(key, val, g_cfg.sliceMin);
+    else if (key == "sliceaddbacks") cfgNum(key, val, g_cfg.sliceAddBacks);
+    else if (key == "slicecount") g_cfg.sliceCount = (val == "1");
+    else if (key == "slicenoposition") g_cfg.sliceNoPosition = (val == "1");
     else if (key == "dpseedplan") g_cfg.dpSeedPlan = val;
     else if (key == "dpshow") cfgNum(key, val, g_cfg.dpShow);
     else if (key == "dpfixups") g_cfg.dpFixups = (val == "1");
@@ -293,7 +468,15 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "dprotseedanchor") g_cfg.dpRotSeedAnchor = (val != "0");
     else if (key == "dpsnapshot") g_cfg.dpSnapshot = (val == "1");
     else if (key == "dpcheck") g_cfg.dpCheck = (val == "1");
+    else if (key == "dpcheckobs") g_cfg.dpCheckObs = (val == "1");
+    else if (key == "dpcheckfirst") g_cfg.dpCheckFirst = (val == "1");
+    else if (key == "dpcontenthorizon") cfgNum(key, val, g_cfg.dpContentHorizon);
+    else if (key == "dpcapladder") cfgNum(key, val, g_cfg.dpCapLadder);
+    else if (key == "dpinputgrid") cfgNum(key, val, g_cfg.dpInputGrid);
+    else if (key == "dpphaseprof") g_cfg.dpPhaseProf = (val == "1");
     else if (key == "dprotqtoggle") g_cfg.dpRotQToggle = (val == "1");
+    else if (key == "dpspentpad") g_cfg.dpSpentPad = (val == "1");
+    else if (key == "dpspentorb") {}   // always on since 2026-09-26; accepted so old cfgs parse
     else if (key == "dpwatchfired") {
         g_cfg.dpWatchFired.clear();
         size_t p = 0;
@@ -383,16 +566,58 @@ inline bool loadTraceCfg(const std::string& key, const std::string& val) {
     return false;
 }
 
+// The solver-facing cfg lines as read (every key starting with "dp", `dparg` included), for the
+// `dpconfig:` line at session start.
+inline std::vector<std::string> g_dpCfgSeen;
+
+// One line naming the solver configuration this session runs: the dp cfg lines as read, in file
+// order, and the loaded package's size/FNV-1a (the solver is linked into it). A batch run under a
+// hand-written set of experiment flags checks its first run's line against the set it meant before
+// it widens to the rest.
+inline std::string dpConfigLine() {
+    std::string line = "dpconfig:";
+    for (const std::string& s : g_dpCfgSeen) line += " " + s;
+    std::string sig = "-";
+    const std::string pkg = geode::Mod::get()->getPackagePath().string();
+    std::ifstream f(pkg, std::ios::binary);
+    if (f) {
+        uint64_t h = 1469598103934665603ULL;
+        size_t n = 0;
+        char buf[65536];
+        while (f.read(buf, sizeof(buf)) || f.gcount()) {
+            const size_t got = (size_t)f.gcount();
+            n += got;
+            for (size_t i = 0; i < got; ++i) {
+                h ^= (uint8_t)buf[i];
+                h *= 1099511628211ULL;
+            }
+        }
+        char b[48];
+        snprintf(b, sizeof(b), "%zu/%08x", n, (unsigned)(h & 0xffffffffULL));
+        sig = b;
+    }
+    return line + " package=" + sig;
+}
+
+// Every cfg key with the value of what it sets (tools/gen_effective_cfg.py writes it from the
+// parsers above into cfg_effective.gen.hpp, included at the end of this file), and that line as
+// it stood before the first autorun.cfg was applied: what a key nobody wrote runs with.
+namespace effcfg { inline std::string modCfg(); }
+inline std::string g_cfgDefaults;
+
 inline void loadConfig() {
     std::ifstream f(std::string(DATA_DIR) + "/autorun.cfg");
     if (!f.is_open()) return;
+    if (g_cfgDefaults.empty()) g_cfgDefaults = effcfg::modCfg();
     g_cfgRemoved.clear();
+    g_dpCfgSeen.clear();
     std::string line;
     while (std::getline(f, line)) {
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
         auto key = line.substr(0, eq);
         auto val = line.substr(eq + 1);
+        if (key.rfind("dp", 0) == 0) g_dpCfgSeen.push_back(key + "=" + val);
         // KEYS REMOVED IN A RELEASE CLEAN-UP. Each switched the loop back to a behaviour that
         // had been measured and replaced. Columns: the key, the commit that removed it, and the
         // earlier one that folded it into the default. A file
@@ -432,6 +657,24 @@ inline void loadConfig() {
         if (loadTraceCfg(key, val)) continue;
         // Not in the chain below, which is at MSVC's block-nesting ceiling (C1061).
         if (key == "areaenv") { g_cfg.areaEnv = (val == "1"); continue; }
+        if (key == "framebudgetms") { cfgNum(key, val, g_cfg.frameBudgetMs); continue; }
+        if (key == "dplearnresets") { cfgNum(key, val, g_cfg.dpLearnResets); continue; }
+        if (key == "secsnapact") { psnap::g_snapAct = (val == "1"); continue; }
+        if (key == "secactkey") { psnap::g_actKey = (val == "1"); continue; }
+        if (key == "secdriftwhere") { g_cfg.secDriftWhere = (val == "1"); continue; }
+        if (key == "dpcaptiers") { cfgNum(key, val, g_cfg.dpCapTiers); continue; }
+        if (key == "dpsectierfirst") { cfgNum(key, val, g_cfg.dpSecTierFirst); continue; }
+        if (key == "dpsecmaxback") { cfgNum(key, val, g_cfg.dpSecMaxBack); continue; }
+        if (key == "sectrail") { secsolve::g_trailClear = (val == "1"); continue; }
+        if (key == "secgracefly") { cfgNum(key, val, secsolve::g_graceFly); continue; }
+        if (key == "secleafmid") { secsolve::g_leafMid = (val == "1"); continue; }
+        if (key == "secleaflife") { cfgNum(key, val, secsolve::g_leafLife); continue; }
+        if (key == "secdrift") { secsolve::g_driftLog = (val == "1"); continue; }
+        if (key == "secbound") { secsolve::g_boundOn = (val == "1"); continue; }
+        if (key == "secshaderskip") { secsolve::g_shaderSkip = (val == "1"); continue; }
+        if (key == "seccoins") { secsolve::g_secCoins = (val == "1"); continue; }
+        if (key == "levelfiletype") { g_cfg.levelFileMain = (val == "main"); continue; }
+        if (key == "leveldir") { suite::g_levelDir = val; continue; }
         if (key == "enabled") g_cfg.enabled = (val == "1");
         else if (key == "level") cfgNum(key, val, g_cfg.levelId);
         // `levels=1,2,3`: solve these in this order, in ONE game (see suite:: in config.hpp).
@@ -725,7 +968,7 @@ inline void loadConfig() {
         else if (key == "pauseatx") cfgNum(key, val, g_pauseAtX);
         else if (key == "clearmargin") cfgNum(key, val, g_clearMargin);
         else if (key == "uisim") g_uiSession = (val == "1"); // for tests: treat autorun as panel
-        // For tests: supply the panel mode from cfg (0=Normal 1=Replay)
+        // For tests: preset g_uiMode for the session setup (0=Normal 1=Replay 2=Solve); the play menu itself opens on what the level has stored
         else if (key == "uimode") cfgNum(key, val, g_uiMode);
         // One branch for both keys: this else-if chain is at MSVC's block-nesting limit (C1061),
         // so a new key joins an existing branch. coinroute implies coins whatever the order.
@@ -756,6 +999,11 @@ inline void loadConfig() {
 
 inline void endSession(const std::string& why) {
     if (g_sessionOver) return;
+    // The loop's rate as a section handoff saved it: only a handoff in THIS session may use it
+    // for the prefix replay (the fast loop in hooks_gamelayer), not a cfg-driven section run in
+    // the next one.
+    g_secSaveFastloops = 1;
+    resetSecsolveSession();
     // The iteration map, HOWEVER the session ended.
     //
     // It used to be written from two places only -- the clear, and giveUp -- which between them
@@ -771,6 +1019,11 @@ inline void endSession(const std::string& why) {
     // file the map at the moment it is complete, next to the solution, rather than at teardown.
     if (itermap::save(g_cfg.levelId, why == "level_complete"))
         writeResult("dpsolve: itermap saved -> " + itermap::pathFor(g_cfg.levelId));
+    // Where a slice (level_slice.hpp) left the session: which level was in play at the end.
+    {
+        const std::string s = levelslice::summary();
+        if (!s.empty()) writeResult(s);
+    }
     // Do not call purgeDanglingActions() here: when endSession runs on a clear, the actions of
     // GD's result visual effects are alive, and wiping them makes it look stuck with the result
     // screen never appearing. `endpurge=1` is the old behaviour, kept only for disproof
@@ -781,6 +1034,9 @@ inline void endSession(const std::string& why) {
     writeResult("deaths: p1=" + std::to_string(solver::g_deathsP1)
         + " p2=" + std::to_string(solver::g_deathsP2)
         + " other=" + std::to_string(solver::g_deathsOther));
+    writeResult("anticheat: destroyPlayer calls with GD's anti-cheat spike="
+        + std::to_string(solver::g_anticheatCalls) + " (counted, not logged per call)");
+    solver::g_anticheatCalls = 0;
     writeResult("avswallowed: visit=" + std::to_string(g_visitAVs)
         + " updateVisibility=" + std::to_string(g_visAVs)
         + " rendertoggles=" + std::to_string(g_watchFlips)
@@ -797,7 +1053,8 @@ inline void endSession(const std::string& why) {
     // off the screen itself (the purge, see notify.hpp).
     writeResult("audio: soundWhileSolving=" + std::to_string(g_soundWhileSolving)
         + " blocked=" + std::to_string(g_soundBlockedWhileSolving) + " reasserts=" + std::to_string(g_silenceReasserts)
-        + " notifyForced=" + std::to_string(notify::g_forced));
+        + " notifyForced=" + std::to_string(notify::g_forced)
+        + " secSongSeeksSkipped=" + std::to_string(g_secSongSeeksSkipped));
     // NOT notify::clear() here. giveUp() raises its "could not solve, stopped at N%" and then
     // ends the session, and the level is deliberately left standing so the operator can see
     // where the bot stopped -- clearing here would wipe the one message that explains the
@@ -873,6 +1130,23 @@ inline void endSession(const std::string& why) {
         }
         writeResult(m2 + " (hook calls: "
                     + std::to_string(portalseed::g_calls) + ")");
+        // ...and the pads the LAST attempt latched (padseed is per attempt), for cfg dpspentpad.
+        std::string m3 = "padseed map:";
+        first = true;
+        for (const auto& kv : padseed::g_first) {
+            m3 += (first ? " " : ",") + std::to_string(kv.first) + ":"
+                + std::to_string(kv.second);
+            first = false;
+        }
+        writeResult(m3 + " (hook calls: " + std::to_string(padseed::g_calls) + ")");
+        // ...and the rings it fired, oldest first, for dp --spentorb.
+        std::string m4 = "ringseed map:";
+        first = true;
+        for (const auto& f : ringseed::g_fired) {
+            m4 += (first ? " " : ",") + std::to_string(f.first) + ":" + std::to_string(f.second);
+            first = false;
+        }
+        writeResult(m4 + " (hook calls: " + std::to_string(ringseed::g_calls) + ")");
     }
     // ...and the proof: the level's own record, compared with the sample taken before the
     // level had run a tick. "changed: none" is the only acceptable outcome for a solver
@@ -907,6 +1181,7 @@ inline void endSession(const std::string& why) {
     // to leave the player looking at a black window with no sign the game was still there and no
     // key listed to bring it back. Mod state must not outlive the mod's session; this is the
     // same duty audio::neutral() has for the sound.
+    g_secRenderWas = -1;   // a section solve's hold ends with the session too (secRenderHold)
     if (g_renderOff) {
         g_renderOff = false;
         writeResult("session_end: rendering restored (the solve had the screen off)");
@@ -916,6 +1191,9 @@ inline void endSession(const std::string& why) {
     // A search waiting for checkpoint judgements (cfg `dpcheck`) would wait forever once nothing
     // flies them: release it. Harmless when nothing is waiting.
     dpbridge::checkSubscribe(false);
+    // ...and stop a search still running, subscribed or not. Its answer belongs to a session that
+    // is over, and while it runs it holds the job slot that the next level's Solve queues behind
+    // (dpsolve::start).
     dpbridge::cancelSearch(true);
     g_sessionOver = true;
     writeResult("session_end: " + why);
@@ -941,7 +1219,7 @@ inline void endSession(const std::string& why) {
         return;
     }
     // A suite has another level to solve: leave this one the way a player does and let the
-    // resident poll enter the next once the scene is clear (SuiteKeeper, ui_panel.hpp).
+    // resident poll enter the next once the scene is clear (SuiteKeeper, level_entry.hpp).
     //
     // AFTER the F9 branch above, which is a human stopping the run and must not step the
     // suite on, and BEFORE quitWhenDone, which is what ends the process on the last level.
@@ -972,3 +1250,5 @@ inline void endSession(const std::string& why) {
 }
 
 }  // namespace p1
+
+#include "mod/cfg_effective.gen.hpp"

@@ -17,8 +17,8 @@ enum class Mode : std::uint8_t {
     Ufo,
 };
 
-// Physical size of the player. GD's dumps do not currently expose this
-// (docs/measurement-requests.md M1); it is inferred during calibration.
+// Physical size of the player. GD's dumps did not expose this when this was
+// written; it is inferred during calibration.
 enum class Size : std::uint8_t {
     Normal,
     Mini,
@@ -95,7 +95,7 @@ struct SimulateOptions {
     // the boundary never stops a rollout.
     bool stopOnCollision = true;
     // How much clearance counts as clearly safe / clearly lethal. The defaults
-    // are the values chosen by src/tools/margin.cpp; see docs/benchmark.md.
+    // were chosen by measurement (see MarginPolicy).
     MarginPolicy margin;
     // Positional objectives. ApproxResult::targetClosest gets one entry each,
     // in the same order.

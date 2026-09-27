@@ -9,7 +9,7 @@ namespace dp {
 // travel direction and gravity do. lv22 has 20 of these (every other level in
 // the suite has none, so all of this is inert there).
 //
-// Measured on lv22 with the reference replay (findings.md 2026-08-13):
+// Measured on lv22 with the reference replay (2026-08-13):
 //   - `rot` is the ABSOLUTE screen angle, not a delta. Eight of lv22's twenty
 //     are rot=0, i.e. "turn it back".
 //   - travel = R(-rot) * xhat:  0 -> +X,  90 -> -Y,  180 -> -X,  270 -> +Y.
@@ -59,6 +59,15 @@ struct Level {
     // not kill it (measured on lv10: the player reached y = 2,792 alive), so
     // nothing pruned it and the search happily spent its frontier out there.
     double maxY = 0;
+    // Non-empty when the level holds something this build cannot represent, and
+    // then nothing may be solved on it: the caller reports this and stops. It
+    // replaces a std::exit in the loader, which in the mod ended the GAME -- the
+    // solver runs on a detached thread there, and exit() from it is an abort in
+    // the host process (0xC0000409), with no log line to say why.
+    std::string unsupported;
+    // Shared gravity-portal bits, where each changes hands (prelude.hpp, g_gpHandoff). The loader
+    // fills this; cliMain copies it into the global the step reads.
+    std::vector<GpHandoff> gpHandoff;
 };
 
 // The level turned into one frame, built on first use and kept for the whole

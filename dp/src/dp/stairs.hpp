@@ -63,14 +63,20 @@ inline std::ofstream* g_snapOut = nullptr;
 // measurement, because lv1-14 contain no speed portal. Rows other than 0.9 are
 // therefore UNVERIFIED -- levels with speed portals must be re-checked with
 // `snaptrace=1` before their results are trusted.
+// Snap table (was --snaptable, always on since 2026-09-26):
+// the 1.3 row and the fallback as checkSnapJumpToObject (win 0x393cb0) has them. For 1.3 the
+// function sets little 180 (90 when not full size), down 225, big 135, threshold 2, and a speed
+// matching no row keeps the defaults {1, 120, 150, 90} for either size. The decompiled table gave
+// 1.3 a little of 90 at every size and put 1.3's full-size values in the fallback. Witness: a custom level
+// t=18,110, speed 1.3, a full cube lands on uid 4935 (28395,135) off uid 4925 (28215,105) --
+// (+180, +30) -- and GD moves x by +2.000.
 inline StairParams stairParamsFor(double dxPerTick, double size) {
     const bool full = std::fabs(size - 1.0) < 1e-3;
     if (dxPerTick < 1.15) return {1.0, 90.0, 120.0, 60.0};            // 0.7
     if (dxPerTick < 1.45) return {1.0, full ? 120.0 : 90.0, 150.0, 90.0};   // 0.9
     if (dxPerTick < 1.78) return {2.0, full ? 150.0 : 90.0, 195.0, 120.0};  // 1.1
-    if (dxPerTick < 2.17) return {2.0, 90.0, 225.0, 135.0};           // 1.3
-    return full ? StairParams{2.0, 180.0, 225.0, 135.0}
-                : StairParams{1.0, 120.0, 150.0, 90.0};               // default
+    if (dxPerTick < 2.17) return {2.0, full ? 180.0 : 90.0, 225.0, 135.0};  // 1.3
+    return {1.0, 120.0, 150.0, 90.0};                                 // no row
 }
 
 }  // namespace dp

@@ -5,8 +5,8 @@
 
 fidelity_diff.py reports the first divergence at tol=0.3. But a single tick's
 contact test is decided at 0.02px, so a drift hiding below tol surfaces as "the
-clamp fires one tick late" (the vy 0.001 grid of 2026-08-07, top of
-docs/findings.md). This tool reads the trace/dump that fidelity_diff left behind
+clamp fires one tick late" (the vy 0.001 grid, measured 2026-08-07).
+This tool reads the trace/dump that fidelity_diff left behind
 and reports
 
   --what dy    ticks where the y drift jumped     (no jump = pure accumulation)

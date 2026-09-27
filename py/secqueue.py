@@ -1,11 +1,12 @@
 """Walk a level's section windows, cross each one with GD, and write the tables.
 
-    python py/secqueue.py --level 22                 # the whole list, Wine
-    python py/secqueue.py --level 22 --limit 3       # the top 3 by priority
-    python py/secqueue.py --level 22 --venue windows # ...on a Windows worker
-    python py/secqueue.py --level 22 --deploy        # ...after refreshing the mod
+    python py/secqueue.py --level 22                  # the whole list, local worker
+    python py/secqueue.py --level 22 --limit 3        # the top 3 by priority
+    python py/secqueue.py --level 22 --venue external # ...on a venue module (below)
+    python py/secqueue.py --level 22 --venue external --deploy  # ...refreshing its mod
 
-The mod the venue launches is NOT touched unless --deploy is passed; every run
+`--venue external` runs the sessions through the module GDSOLVER_SECQUEUE_VENUE
+names (see main). Its mod is NOT touched unless --deploy is passed; every run
 names the binary it is about to measure in its first lines either way.
 
 The windows come from py/sections.py (fixups, census, deaths, veto boxes). For
@@ -24,15 +25,14 @@ THE SPINE IS A CONFIGURATION GATE, NOT A RESULT. A window whose spine stops
 tracking the head run before the exit is reported INVALID-CONFIG and its diff
 table is left out of the aggregate: when the pinned rollout drifts, the search
 is no longer exploring from the state it believes it is, and its divergences say
-more about the harness than about the model. This is the standing invariant of
-brief-017 part C written into the data format, so that a night that quietly
+more about the harness than about the model. This is the standing invariant
+written into the data format, so that a night that quietly
 loses it cannot be read in the morning as a night that measured something.
 """
 from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import re
 import subprocess
@@ -73,28 +73,6 @@ REPLAY_BASE = [c if c != "fastloops=1" else "fastloops=1800"
 
 def log(m: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
-
-
-def say_container_mod(WS) -> None:
-    """Name the mod the container will launch, without touching it.
-
-    wine_suite.check_deployed() exits when the container's mod is not
-    byte-identical to the local build, which is the right default for a run that
-    deployed one -- but a run that deliberately did not deploy must still say
-    what it is about to measure. A run whose log does not name its binary is not
-    a measurement.
-    """
-    dst = WS.WINE_WORKER / "geode" / "mods" / WS.BUILD_MOD.name
-    if not dst.exists():
-        log(f"mod in container: {dst} IS MISSING -- pass --deploy")
-        return
-    b = dst.read_bytes()
-    sha = hashlib.sha256(b).hexdigest()[:16]
-    same = WS.BUILD_MOD.exists() and b == WS.BUILD_MOD.read_bytes()
-    log(f"mod in container: {dst} ({len(b)} B, sha {sha}) "
-        + ("== the local build" if same
-           else f"!! DIFFERS from {WS.BUILD_MOD} -- measuring the container's, "
-                "not the build tree's"))
 
 
 def say_exe(path: str) -> bool:
@@ -329,7 +307,7 @@ def anchor_fields(t0: int, r: dict, plan_path: Path, gd: dict[int, dict],
     """start_fields, with the anchor's INPUT STATE built the way the model's own
     replay builds it.
 
-    THIS IS brief-019's HARNESS SIDE. The model's --replay does a "pre-anchor
+    THIS IS THE HARNESS SIDE OF IT. The model's --replay does a "pre-anchor
     edge split" (cli.hpp, `preLevel` / `preRise`): the plan's edges are press
     ticks, and an input takes effect latOf(mode) ticks later -- 2 for ship and
     UFO, 1 for everything else -- so the level AT the anchor is computed by
@@ -349,7 +327,7 @@ def anchor_fields(t0: int, r: dict, plan_path: Path, gd: dict[int, dict],
     Measured, lv22 t=7,190 (swing, GD upsideDown 1 -> 0 at 7,191): with the
     anchor as start_fields builds it, the search's two children are identical
     -- the press edge is invisible and no flip branch exists -- while GD and the
-    model's own replay both flip. That is the whole of brief-019's family (A).
+    model's own replay both flip. That is the whole of this gap's family (A).
 
     Kept local rather than pushed into start_fields: that builder feeds
     quick_regress's whole baseline and reach_check's anchors, and changing it is
@@ -532,13 +510,13 @@ def reach_sweep(a, wins: list[dict], out_dir: Path, plan_path: Path,
 
 def refwatch_sweep(a, wins: list[dict], out_dir: Path, plan_path: Path,
                    inputs) -> int:
-    """Every window: which gate drops the reference, if any (brief-019's (3)).
+    """Every window: which gate drops the reference, if any.
 
     Two runs per window, both offline: an anchored replay of the solution to
     make the reference, then the search with --refwatch. What matters most is
     not the gates but the COUNT OF `cannot-reproduce` -- that is the search and
     the replay disagreeing about physics rather than about pruning, and the
-    acceptance for brief-019 is that it reaches zero across the whole level.
+    acceptance criterion here is that it reaches zero across the whole level.
     """
     head = out_dir / "head.dump.csv"
     if not head.exists():
@@ -585,7 +563,7 @@ def refwatch_sweep(a, wins: list[dict], out_dir: Path, plan_path: Path,
         log(f"[{i}/{len(wins)}] t0={t0} {gate}")
     log(f"refwatch: {tally} -> {index}")
     bad = tally.get("cannot-reproduce", 0)
-    log(f"brief-019 acceptance (3): cannot-reproduce = {bad}"
+    log(f"refsweep: cannot-reproduce = {bad}"
         + ("  PASS" if bad == 0 else "  not yet"))
     return 0
 
@@ -640,12 +618,12 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--level", type=int, required=True)
     ap.add_argument("--deploy", action="store_true",
-                    help="replace the container's mod with the local build "
-                         "before running. OFF by default: a night queue may be "
-                         "running under it (2026-09-02 cost 13 windows)")
-    ap.add_argument("--venue", choices=("wine", "windows"), default="wine",
-                    help="Wine is the default: a night-long queue is what that "
-                         "standing ruling exists for")
+                    help="with --venue external, let the venue replace its mod "
+                         "with the local build before running. OFF by default: "
+                         "a queue may be running under it")
+    ap.add_argument("--venue", choices=("windows", "external"), default="windows",
+                    help="windows: a local worker (gdtas.worker). external: the "
+                         "module named by GDSOLVER_SECQUEUE_VENUE")
     ap.add_argument("--worker", type=int, default=99)
     ap.add_argument("--cap", type=int, default=100)
     ap.add_argument("--limit", type=int, default=0, help="0 = every window")
@@ -666,8 +644,8 @@ def main(argv=None) -> int:
                          "from GD's own entry state. Offline, every window, "
                          "no crossing needed")
     ap.add_argument("--refsweep", action="store_true",
-                    help="every window: which gate drops the reference "
-                         "(brief-019 acceptance 3). Offline")
+                    help="which gate drops the reference in each window. "
+                         "Offline, every window")
     ap.add_argument("--tee-results", action="store_true",
                     help="keep each session's result.txt under <out-dir>/"
                          "sessions/. The per-layer telemetry lives only there "
@@ -698,35 +676,30 @@ def main(argv=None) -> int:
     if a.reach:
         return reach_sweep(a, wins, out_dir, plan_path, inputs)
 
-    if a.venue == "wine":
-        sys.path.insert(0, str(Path(r"C:\GD-lab\oneoff\py")))
-        import wine_suite as WS
-        if a.deploy:
-            WS.deploy()
-            WS.check_deployed()
-        else:
-            # DO NOT REWRITE THE CONTAINER'S MOD BY DEFAULT. This used to deploy
-            # on every start, which is silent, sounds harmless and is not: on
-            # 2026-09-02 a `--rediff` run -- an offline re-diff, no game intended
-            # -- replaced the mod under a night queue that had been running for
-            # four hours, and 13 of its 38 completed windows were measured with a
-            # different solver than the first 25 (the mod embeds dp). secnight
-            # already deploys once itself and launches its windows through
-            # secqueue_nodeploy.py for exactly this reason; this makes the plain
-            # entry point agree with it.
-            # The check still SAYS what is being measured, loudly, and a mismatch
-            # is a line rather than an exit: a session explaining a measurement
-            # has to run the binary that made it, and the build tree moves.
-            say_container_mod(WS)
+    if a.venue == "external":
+        # A venue this file does not implement: the module named by
+        # GDSOLVER_SECQUEUE_VENUE (importable from PYTHONPATH) provides
+        # prepare(deploy, log) and session(worker, cfg, timeout).
+        # prepare must NOT rewrite the venue's mod unless --deploy was passed. A
+        # silent deploy on every start once replaced the mod under a queue that
+        # had been running for four hours, and a third of its windows were
+        # measured with a different solver (the mod embeds dp). Without --deploy
+        # it still SAYS which mod it will measure: a session explaining a
+        # measurement has to run the binary that made it.
+        # session must wipe the data dir before EVERY session, not once per
+        # queue: the dump is copied out after the run, and a session that fails
+        # to write one would otherwise hand back the previous window's.
+        import importlib
+        import os
+        name = os.environ.get("GDSOLVER_SECQUEUE_VENUE")
+        if not name:
+            log("--venue external needs GDSOLVER_SECQUEUE_VENUE (a module name)")
+            return 2
+        venue = importlib.import_module(name)
+        venue.prepare(a.deploy, log)
 
         def session(cfg, timeout):
-            # Wipe before EVERY session, not once per queue. The dump is copied
-            # out of the data dir after the run, and a session that fails to
-            # write one would otherwise hand back the previous window's -- the
-            # exact shape of "measure the instrument before believing it".
-            WS.wine_wipe(a.worker)
-            return WS.wine_run_session(a.worker, cfg, timeout_s=timeout,
-                                       done_marker="session_end")
+            return venue.session(a.worker, cfg, timeout)
     else:
         from gdtas.worker import run_session
 

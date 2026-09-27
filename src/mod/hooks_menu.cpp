@@ -1,4 +1,5 @@
-// MenuLayer hook: auto-enter and the developer panel.
+// MenuLayer hook: auto-enter and the suite's resident ticker. (The mode choice for a level the
+// player picks is the play menu, hooks_playmenu.cpp.)
 #include "mod/playlayer_helpers.hpp"
 
 using namespace p1;
@@ -20,23 +21,13 @@ class $modify(P1MenuLayer, MenuLayer) {
                       "achievements, statistics, coins and the level's own record are all "
                       "blocked. Your own attempts, with the bot idle, record as usual.");
         }
-        // The panel is created once and follows scene transitions via a resident ticker
-        // (attached only on the screens a level is started from -- see isLevelLaunchScreen)
-        static bool s_panelMade = false;
-        if (!s_panelMade) {
-            s_panelMade = true;
-            if (auto* p = SolverPanelLayer::create()) {
-                p->retain(); // keep it alive so re-parenting between scenes does not free it
-                g_panel = p;
-                auto* keeper = new PanelKeeper();
-                // A 0.1 s interval is enough (every frame is wasteful). It catches up ~100ms
-                // after a scene switch
-                CCDirector::sharedDirector()->getScheduler()->scheduleSelector(
-                    schedule_selector(PanelKeeper::tick), keeper, 0.1f, false);
-            }
-            // ...and the one that carries a `levels=` suite from one level to the next. Same
-            // scheduler and same reason: between two levels of a suite there is no game layer
-            // and no session, so this is the only thing of ours still ticking.
+        // The resident ticker that carries a `levels=` suite from one level to the next. It is on
+        // the director's scheduler because between two levels of a suite there is no game layer
+        // and no session, so this is the only thing of ours still ticking. A 0.1 s interval is
+        // enough (every frame is wasteful).
+        static bool s_keeperMade = false;
+        if (!s_keeperMade) {
+            s_keeperMade = true;
             auto* suiteKeeper = new SuiteKeeper();
             CCDirector::sharedDirector()->getScheduler()->scheduleSelector(
                 schedule_selector(SuiteKeeper::tick), suiteKeeper, 0.1f, false);
@@ -52,6 +43,7 @@ class $modify(P1MenuLayer, MenuLayer) {
                 stallwatch::start();
                 updateWindowTitle();
                 writeResult("session_start", true);
+                writeResult(dpConfigLine());   // the solver configuration, one line
                 // Load the plan onto the very first attempt of serve mode too. Relying on
                 // rerun, a session that finishes without dying (nodeath) would never receive
                 // the plan. Start-Serve always writes plan_in.txt before launch (if it is
@@ -95,12 +87,20 @@ class $modify(P1MenuLayer, MenuLayer) {
         return true;
     }
 
-    // The body of this lives in ui_panel.hpp as enterConfiguredLevel(), so that the level
+    // The body of this lives in level_entry.hpp as enterConfiguredLevel(), so that the level
     // suite enters its second and later levels through the same code as its first.
     void onAutoEnter() {
-        if (suite::active())
+        if (suite::active()) {
             writeResult("suite: level=" + std::to_string(suite::current())
                         + " (1/" + std::to_string(suite::g_levels.size()) + ")");
+            // Where each level comes from, checked for the whole list before the first one.
+            if (!suiteLevelSource()) {
+                writeResult("suite: done " + std::to_string(suite::g_levels.size()) + " levels");
+                if (g_cfg.quitWhenDone)
+                    Loader::get()->queueInMainThread([] { utils::game::exit(false); });
+                return;
+            }
+        }
         enterConfiguredLevel();
     }
 };

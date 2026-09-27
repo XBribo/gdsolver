@@ -38,8 +38,8 @@ def main(argv=None) -> int:
     ap.add_argument("--resolution-index", type=int, default=25,
                     help="25=1706x960 (16:9); the table is in gdtas/gdsave.py")
     ap.add_argument("--panel", action="store_true",
-                    help="no autorun: leave the game on its menu and let the on-screen "
-                         "panel drive (recording / demo). --level is then ignored")
+                    help="no autorun: leave the game on its menu and let the play menu "
+                         "drive (recording / demo). --level is then ignored")
     ap.add_argument("--kill-others", action="store_true",
                     help="kill every other GD before starting")
     ap.add_argument("--workers-root", default=str(WORKERS_ROOT))
@@ -47,8 +47,8 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     if a.panel:
-        # The mod does nothing at all until the panel starts a session, which is the point:
-        # what is being filmed is the panel, the mode switch and the level being picked out
+        # The mod does nothing at all until the play menu starts a session, which is the point:
+        # what is being filmed is the play menu, the mode choice and the level being picked out
         # of the game's own UI. uiConfigureSession (session.hpp) writes the whole session
         # config itself when a level is entered -- input precision included -- so nothing
         # here has to be right, and a session started this way is cold either way: the loop

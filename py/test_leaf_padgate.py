@@ -57,14 +57,14 @@ arithmetic, and still the only guard on the three parts above.
 Q2 needs no transcription at all: it is two angle series against each other.
 
 SOURCES, all on disk, no game:
-    board geometry     GD-lab/data/objrects_lv20.txt, rows uid 6963/6964/
+    board geometry     <LEVEL_DATA>/objrects_lv20.txt, rows uid 6963/6964/
                        7025/7026/7027/7030 (id 35, type 8, rot 29). These six
                        are the whole rotated-pad population of the 22-level
                        corpus; the other 233 type-8 pads are within 0.5 deg of
                        a quarter turn and `oriented` is not even set for them.
     GD's per-tick x, y, rot, yvel, mode, vsize, upsideDown
                        build/fidelity/fid_lv20.dump.csv (2026-09-06 08:49),
-                       agreeing digit for digit with GD-lab/data/gdref/lv20.csv
+                       agreeing digit for digit with <LEVEL_DATA>/gdref/lv20.csv
                        on every pinned tick.
     GD's activation tick
                        the same dump's `yvel` column: -8.648 at 7,298 and
@@ -120,7 +120,7 @@ a pin like that, which is why this file moved first.
 
 CROSS-CHECK. The pinned `flat` and `gd` margin rows are the table already
 written into dp/src/dp/constants.hpp above `g_noPadPlayerRot`, and the `pre`
-row is the one in GD-lab/notes/measure-padplayerrot-2026-09-06.md section 5.
+row is the one in the measurement notes of 2026-09-06.
 They were recomputed here from the raw columns and agree to 1e-3; the table in
 constants.hpp is rounded to three decimals, which is why that is the tolerance.
 """
@@ -637,7 +637,7 @@ TRACE = {
 class TestFixtureStillMatchesTheFiles(unittest.TestCase):
     """Re-derive the fixture from the dumps when they are here.
 
-    These are working files (build/fidelity, GD-lab) and are not tracked, so
+    These are working files (build/fidelity, LEVEL_DATA) and are not tracked, so
     on a clean checkout every test in this class skips and says why. When they
     ARE present, a difference means the fixture above is stale -- the fixture
     is not a second source of truth, it is a cache of these files.

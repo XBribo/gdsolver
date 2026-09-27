@@ -202,7 +202,16 @@ inline void build(GJBaseGameLayer* l) {
 // after death, so if the commit were left to the start of the attempt, whether
 // the reader grabs "the attempt that just died" or "the one before" would depend
 // on the polling timing.
-inline Roll roll() {
+// `endTick` is the tick the RUN reached, which is not the last tick a row was
+// written at: the recording stops writing as soon as nothing moves. The reader
+// merges recordings by "the newer one wins for as far as it reaches", and with
+// the last row as the reach, an older recording's rows leak into the ticks the
+// newer run covered without moving anything. Measured on SubZero 4002:
+// the bootstrap's t=22,677 row lifted a platform the live
+// recording had dropped at t=20,711 back to where it started, and the model let
+// the player fall through a floor GD stands on. Written as a trailer line so an
+// older recording (no trailer) still loads.
+inline Roll roll(long long endTick = -1) {
     Roll r;
     // "Nothing was recorded" is an answer, and it is THIS attempt's answer -- publish it rather
     // than leaving the previous one standing for the reader to mistake for it (see g_lastRoll).
@@ -226,6 +235,7 @@ inline Roll roll() {
                 std::ifstream src(cur, std::ios::binary);
                 std::ofstream dst(tmp, std::ios::binary | std::ios::trunc);
                 dst << src.rdbuf();
+                if (endTick >= 0) dst << "end," << endTick << "\n";
                 dst.flush();
             }
             std::error_code ec;
@@ -270,6 +280,25 @@ inline void restart() {
     }
     g_rows = 0;
     g_lastTick = -1;
+}
+
+// The on column of every tracked object at the start of an attempt: after GD's own reset and
+// before the first update, the phase of the model's t=0. An object's on/off in the model is that
+// value with the switches applied in time order (dp's OnEvent), so it has to be read at exactly
+// this point -- the first row the recording writes is AFTER the first update, by which time a
+// trigger behind the start (SubZero 4002's Toggle uid 23 at x=-29) may already have fired.
+// Deriving it backwards from the recorded transitions is not unique.
+// Written as `init,<uid>,<on>` lines after the header; the recording's reader skips any line
+// whose tick is not a number, as it skips the `end,` trailer, so a reader that does not know
+// them loads the file unchanged. Called right after PlayLayer::resetLevel, not from restart():
+// that runs before the reset, when every object still holds the previous attempt's state.
+inline void snapshotInit() {
+    if (!g_on || g_objs.empty() || !g_out.is_open()) return;
+    for (const auto& tr : g_objs) {
+        if (!tr.obj) continue;
+        const int on = (tr.obj->m_isGroupDisabled || tr.obj->m_isGroupDisabledTemp) ? 0 : 1;
+        g_out << "init," << tr.uid << "," << on << "\n";
+    }
 }
 
 inline void tick(long long t) {

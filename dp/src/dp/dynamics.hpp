@@ -26,7 +26,7 @@ struct DynSample { int t; float cx, cy, hw, hh; uint8_t on; float rot = 0.f; uin
 // 0.5 s, ease 9) that takes the ceiling to a total of -122 px. GD's rect of the
 // killing spike uid18105 at t=2,599 is 96 px down; the model had it 33 px down
 // and never killed, so the loop fenced the spot off with deadbands.
-// ON since 2026-09-21 (audit AUD-20260921-20), its own unit; always on since the
+// ON since 2026-09-21, its own unit; always on since the
 // flag clean-up.
 // Per touch box (the State::trig bit): the Move triggers a Stop in its chain
 // halts. Filled with the boxes (buildTouchMoveTicks); read by applyTriggers.
@@ -91,7 +91,7 @@ struct TrigCtl {          // one object a trigger ends up moving
 // For these boxes the recording IS the timeline (the live overlay comes from
 // this plan's own replays), so the object is re-dated to its own first-motion
 // row instead of to the state's trigT -- shift 0, phase preserved.
-inline TouchMask g_recPhase = 0;
+inline TouchMask g_recPhase{};
 // GD's easing, which is cocos2d-x's CCEase* family reached through
 // EffectGameObject::m_easingType / m_easingRate. In = t^rate and Out = t^(1/rate)
 // are cocos's own convention, not a guess.
@@ -271,8 +271,85 @@ struct AutoTrig {
     // already been flipped by an earlier trigger; they are not independent
     // measurements and are not evidence of anything.
     int delay = 1;
+    // The objects a Toggle in this chain switches, which way, and how many ticks after fireT
+    // (the chain's spawn delays) -- the root's own switch when the root is a Toggle, and every
+    // spawned one below it. Read by the on/off events (autoOnEvents); nothing else.
+    struct Tog {
+        int uid;
+        uint8_t on;
+        double delay;
+    };
+    std::vector<Tog> tog;
 };
 inline std::vector<AutoTrig> g_autoTrig;
+
+// ---- an object's on/off as a sequence of switches ----------
+// One switch of an object's on-state: a Toggle (or an activate) that some trigger's chain
+// reaches, taking effect `delay` ticks after that trigger fires. A box (`box` >= 0, the
+// State::trig bit) fires at the state's own fireB[box], and only in a state that entered it. An
+// x-crossing trigger (`autoIdx` >= 0, its g_autoTrig index) fires at that trigger's fireT, a tick
+// the whole level shares and that the search resolves as it goes -- so it is read when the event
+// is resolved, not copied in. Otherwise `at` is the fire tick (-1 = never).
+//
+// A touch mask alone cannot say this. It is monotone -- a bit that is set stays set -- so it has
+// no way to express a switch-off later in the same chain, two chains fighting over one object,
+// or a delay before either takes effect. Nothing reads these yet.
+struct OnEvent {
+    int box = -1;
+    int at = -1;
+    uint8_t on = 1;       // 1 = the object comes on, 0 = it goes off
+    double delay = 0.0;   // ticks after the source fires (the chain's spawn delays)
+    int autoIdx = -1;
+};
+
+// The object's on-state at tick t: `init` (its on/off right after the game's reset) until
+// something switches it, then the event with the LATEST effective tick (fire + delay) among those
+// that have taken effect by t. On a tie the one later in the list wins, which is chain order --
+// NOT known to be the game's order, so a tie between two sources is a place to
+// measure, not to trust.
+inline bool resolveOn(bool init, const OnEvent* ev, size_t n, TouchMask mask,
+                      const uint16_t* fireB, int t) {
+    bool on = init;
+    double best = -1e300;
+    for (size_t k = 0; k < n; ++k) {
+        const OnEvent& e = ev[k];
+        double f;
+        if (e.box >= 0) {
+            if (e.box >= kTouchBits || !fireB || !(mask & touchBit(e.box))) continue;
+            f = fireB[e.box];
+        } else if (e.autoIdx >= 0) {
+            if ((size_t)e.autoIdx >= g_autoTrig.size()) continue;
+            const int ft = g_autoTrig[(size_t)e.autoIdx].fireT;
+            if (ft < 0) continue;
+            f = ft;
+        } else {
+            if (e.at < 0) continue;
+            f = e.at;
+        }
+        const double te = f + e.delay;
+        if (te > t || te < best) continue;
+        best = te;
+        on = e.on != 0;
+    }
+    return on;
+}
+
+// The switches the x-crossing triggers give each object (AutoTrig::tog), by object uid, each
+// tied to its trigger's index in `autos` -- which has to be the final g_autoTrig, sorted, since
+// the index is how the event finds its fire tick.
+inline std::unordered_map<int, std::vector<OnEvent>> autoOnEvents(
+        const std::vector<AutoTrig>& autos) {
+    std::unordered_map<int, std::vector<OnEvent>> out;
+    for (size_t a = 0; a < autos.size(); ++a)
+        for (const AutoTrig::Tog& g : autos[a].tog) {
+            OnEvent ev;
+            ev.autoIdx = (int)a;
+            ev.on = g.on;
+            ev.delay = g.delay;
+            out[g.uid].push_back(ev);
+        }
+    return out;
+}
 // Travel coordinate of each touch box, by its bit in State::trig (filled by
 // loadTouchTriggers). ownTouch's proximity gate reads it: the one measured
 // punch pair (box ~3,255..3,300 lifting uid18119 at 3,486) is 230px apart,
@@ -444,7 +521,7 @@ inline bool g_trigRaw = false;
 inline bool g_lagFitDbg = false;
 // --lockanchor: an anchor behind an auto lockToPlayerX trigger restores the lock's
 // displacement from the recording (cli.hpp, the behind-the-anchor trigger loop).
-// On since AUD-20260921-21; always on since the flag clean-up.
+// On since 2026-09-21; always on since the flag clean-up.
 // --touchentered <uid,...|->: the touch boxes (by trigger uid) the attempt's
 // recorded positions overlapped by the anchor. Given, the anchor scan opens
 // only these from the recording (cli.hpp, `mayOpen`). "-" = given, none.
@@ -461,6 +538,14 @@ inline std::unordered_map<int, int> g_touchEnteredT;
 // --dyndbg <uid>: dump one moving object's placement inputs at load (see the
 // print near the fireT resolution).
 inline int g_dynDbg = -1;
+// The search's thread pool, lent to the per-object loops of Dynamics::seek and
+// Dynamics::applyTriggers: runs task(k) for every k in [0,n) and returns when
+// all have run. Set by the search for exactly as long as its pool exists, on
+// the thread that owns the pool, and only called there, between its parallel
+// phases (seek and applyTriggers are serial-caller-only already). Empty
+// everywhere else, which is the plain loop.
+inline thread_local std::function<void(size_t, const std::function<void(size_t)>&)>
+    g_dynParTasks;
 // How many objects the loader put on the formula path, and how many of those
 // never saw either controller fire in this call. The second is the guard's
 // readout: an object that is formula-driven but whose triggers never fire sits
@@ -499,13 +584,32 @@ inline long long g_touchRetimeFrom = 0;
 // fingerprint-identical.
 // --recinterp: a recording's position between two close rows is interpolated,
 // not held (Dynamics::seek).
-// ON BY DEFAULT since 2026-09-20 (audit AUD-20260920-08), PAIRED WITH
+// ON BY DEFAULT since 2026-09-20, PAIRED WITH
 // --stickrelease. On its own it moves 9 of the corpus's 1,116 sections, all in
 // lv22, and changes no verdict; its value is that it supplies the `dcy` the
 // stick re-land needs on a tick the recorder skipped. Always on since the flag
 // clean-up, like --stickrelease.
 inline constexpr int kRecInterpGap = 4;
+// The recorder's per-channel write threshold (grouptrace.hpp kEps): a row is
+// written once any of x, y, w, h, rot has moved kRecEps or more from the last
+// row written.
+inline constexpr double kRecEps = 0.05;
 inline constexpr int kTouchRetimeLat = 2;
+// --touchretimebox: re-time a touch box's objects against the BOX's entry, not each
+// object's own first motion. Without it every object is taken to start moving
+// kTouchRetimeLat (+ its lag) after the entry, which holds for an object the box moves
+// directly and not for one a spawn chain reaches later. lv22's spike row under box uid 1417
+// (id 392, uid 17571 and 18201..18206): the recording has them first moving at 1,755 /
+// 1,766 / 1,774 -- they drop one after another -- and the re-timing pinned all of them to
+// the entry + 3, so five of the seven sank 10-18 ticks early. GD kills the spider on uid
+// 17571 at t=1,813 in its unmoved place; the model had already lowered it and walked on.
+// With this, the recording's entry into a box is estimated ONCE per box, as the earliest
+// first motion (less latency and lag) among the objects only that box moves, and each
+// object keeps its own delay behind it.
+// ON BY DEFAULT since 2026-09-24; --no-touchretimebox restores the per-object
+// latency. kDefTouchRetimeBox is what reset.hpp writes back.
+inline constexpr bool kDefTouchRetimeBox = true;
+inline bool g_touchRetimeBox = kDefTouchRetimeBox;
 // The one touch box whose chain locks something to the player's x, and how long
 // the lock lasts in ticks. A per-BOX quantity rather than a per-object one
 // because what a state has to remember is "how far have I travelled since I
@@ -579,6 +683,14 @@ struct Dynamics {
     // slope would need its line recomputed, and nothing rides one yet.)
     std::vector<float> baseCy, baseSy0, baseSy1;
     std::vector<uint8_t> on;   // toggled in? (0 = the object is not there)
+    // --activators: for an object an activator switches (a pickup or a toggle block), its
+    // on/off is not the recording's -- a recording holds one run's presses -- but its t=0 value
+    // (onInit, the recording's reset snapshot) with every switch that reaches it applied in time
+    // order for THIS group (resolveOn: the boxes by the group's own fire ticks, the x-crossing
+    // Toggles by their fireT). Empty for every other object, for one whose recording has no
+    // snapshot, and for all of them without the flag. Filled by the level loader.
+    std::vector<std::vector<OnEvent>> onEv;
+    std::vector<uint8_t> onInit;
     // ---- touch-trigger control (see TouchTrig, below) ----
     // Which touch triggers move this object and by how much once they have.
     // Zero for every object in lv1-18, so all of this is dead weight there.
@@ -599,6 +711,10 @@ struct Dynamics {
     // that recorded it still sees the right shape at the right offset.
     // Shared by the touch and the autonomous machinery.
     std::vector<int> trigRecFire;
+    // --touchretimebox: per touch bit, the tick the RECORDING entered that box, estimated from
+    // the earliest first motion among the objects only it moves (-1 = none; empty = flag off).
+    // Filled by the loader.
+    std::vector<int> boxRecEntry;
     // ...and how many ticks late that FIRST ROW is (see recordLag). The true
     // start is trigRecFire - recLag, which is the tick the analytic curve and
     // the re-timing shift are both written against.
@@ -687,6 +803,64 @@ struct Dynamics {
 
     size_t size() const { return objs.size(); }
 
+    // ---- caches that change nothing but the time taken ----------------------
+    // applyTriggers runs once per frontier GROUP, and a tick can have many
+    // groups. For most moving objects the placement it computes does not depend
+    // on the group at all: an object no touch box reaches, that is not
+    // formula-driven and not locked to the player, is placed from seek()'s state
+    // for this tick, its own static data and the level-wide autonomous clocks
+    // (AutoTrig::fireT) -- nothing the group carries. Those "pure" objects are
+    // placed once and left alone until one of the three changes. Profiled on a
+    // level with 868 moving objects: applyTriggers was 9.5% of the main thread,
+    // which is the critical path (the workers are idle ~70% of the time).
+    uint64_t seekEpoch = 0;              // bumped by every seek() that rewrites
+    uint64_t pureEpoch = ~0ull;          // what the pure objects were placed for:
+    int pureT = -1;                      //   seek epoch, tick,
+    std::vector<int> pureFire;           //   and every AutoTrig::fireT
+    bool isPure(size_t i) const {
+        return !trigMask[i]
+            && !(i < onEv.size() && !onEv[i].empty())   // --activators: depends on the group
+            && !(i < formula.size() && formula[i])
+            && !(i < autoLockTrig.size() && autoLockTrig[i] >= 0);
+    }
+    // collect() walks one bucket's objects instead of all of them. Built in
+    // seek(), which runs on the main thread between the parallel phases:
+    // collect() is also called from step() on the worker threads, so it must
+    // never build this itself. Until it exists collect() takes the full walk.
+    std::vector<std::vector<uint32_t>> byBucket;
+    size_t byBucketN = (size_t)-1;
+    bool anyUidM1 = false;   // an object --dyndbg's default of -1 would name
+    size_t nNonPure = 0;     // objects a same-tick applyTriggers still places
+    void rebuildBuckets() {
+        byBucket.assign(8, {});
+        for (size_t i = 0; i < objs.size() && i < bucket.size(); ++i)
+            if (bucket[i] < byBucket.size())
+                byBucket[bucket[i]].push_back((uint32_t)i);
+        anyUidM1 = false;
+        for (const Obj& o : objs) anyUidM1 |= (o.uid == -1);
+        nNonPure = 0;
+        for (size_t i = 0; i < objs.size(); ++i) nNonPure += !isPure(i);
+        byBucketN = objs.size();
+    }
+    // The per-object loops of seek() and applyTriggers() split across the
+    // search's pool (g_dynParTasks) in runs of kParRun objects. body(b, e)
+    // handles objects [b, e). Only for a loop whose body writes nothing but its
+    // own object's slots -- then every object is placed by the same arithmetic
+    // whichever thread runs it, and the result is the serial loop's. `work` is
+    // how many objects the call will actually place -- a second group of the
+    // same tick places only the non-pure ones, usually a handful, and the pool
+    // is not woken for a handful. Below kParMin the loop stays on this thread.
+    // 512 against 2,048: no slower on levels with 868 and 1,063 moving objects,
+    // and faster on one with 4,350 (77.5 s against 80.7).
+    static constexpr size_t kParMin = 512, kParRun = 64;
+    template <class F> void forRuns(bool par, size_t work, F&& body) {
+        const size_t n = objs.size();
+        if (!par || !g_dynParTasks || work < kParMin) { body((size_t)0, n); return; }
+        g_dynParTasks((n + kParRun - 1) / kParRun, [&](size_t k) {
+            body(k * kParRun, std::min(n, (k + 1) * kParRun));
+        });
+    }
+
     // Place the trigger-controlled objects for a frontier group whose states
     // have touched the triggers in `mask`, `fireHi` being the latest tick any of
     // them fired (-1 = none).
@@ -736,7 +910,35 @@ struct Dynamics {
     void applyTriggers(TouchMask mask, int fireHi, const uint16_t* fireB,
                        float lockOff, int t, double px = 0.0) {
         if (!anyTrig && !anyAuto) return;
-        for (size_t i = 0; i < objs.size(); ++i) {
+        // Skip the pure objects when they are already placed for exactly this
+        // (seek epoch, tick, autonomous clocks). Never with a print flag on: those
+        // print per call, and skipping would change what they say.
+        const bool quiet = g_dynDbg == -1 && g_shiftDbgUid < 0 && !g_shiftStat
+                           && !(g_rotCompute && !g_rotSpec.empty());
+        bool samePure = quiet && pureEpoch == seekEpoch && pureT == t
+                        && pureFire.size() == g_autoTrig.size();
+        for (size_t k = 0; samePure && k < g_autoTrig.size(); ++k)
+            samePure = (pureFire[k] == g_autoTrig[k].fireT);
+        if (!samePure) {
+            pureEpoch = seekEpoch;
+            pureT = t;
+            pureFire.resize(g_autoTrig.size());
+            for (size_t k = 0; k < g_autoTrig.size(); ++k)
+                pureFire[k] = g_autoTrig[k].fireT;
+        }
+        // With no print flag on, the only thing an object's placement writes
+        // outside its own slots is AutoTrig::lockLastX (the lockToPlayerX
+        // branch), and nothing but that branch reads it. So the objects that
+        // can take it (autoLockTrig >= 0) are placed afterwards, in index order
+        // on this thread, and every other object is placed in runs across the
+        // pool (forRuns). The rotation branch, which reads another object, runs
+        // only under g_rotCompute, and `quiet` excludes that too.
+        const bool par = quiet && !anyUidM1 && byBucketN == objs.size();
+        auto place = [&](size_t b, size_t e, bool lockPass) {
+        for (size_t i = b; i < e; ++i) {
+            if (samePure && isPure(i)) continue;
+            if (par && lockPass != (i < autoLockTrig.size() && autoLockTrig[i] >= 0))
+                continue;
             const TouchMask m = trigMask[i];
             // FORMULA-DRIVEN OBJECTS LEAVE HERE, before anything reads a
             // sample. `fireHi` cannot serve them: it is the latest box THE
@@ -792,22 +994,37 @@ struct Dynamics {
                 };
                 auto plainAt = [&](int tt, double& ox, double& oy) {
                     ox = 0.0; oy = 0.0;
+                    // A MOVE OF DURATION 0 IS DONE ON ITS OWN TICK: its eased
+                    // fraction is 1, and the `/dur` guard that kept it out of
+                    // the sum dropped the move altogether. SubZero 4002's group
+                    // 87 falls 600 px that way (trigger uid18255 at x=31,899,
+                    // dur 0), so every formula-driven member of it stayed where
+                    // it started: the saw uid16730 was tested at cy=2,303 while
+                    // the recording -- and GD -- have it at 1,703, and the model
+                    // walked through the kill GD makes at t=22,893 (ledger
+                    // 2026-09-23 06:5x). The recording-driven members were right
+                    // all along, which is why this showed up as one object
+                    // disagreeing with its own group.
                     if (fireB)
                         for (const AutoPart& p : touchParts[i]) {
-                            if (p.tmode || p.dur <= 0.0) continue;
+                            if (p.tmode) continue;
                             if (!((m & mask) & touchBit(p.trig))) continue;
                             const int f = (int)fireB[p.trig];
                             const int te = std::min(tt, stopTick(p.mover));
                             if (te <= f) continue;
-                            const double e = gdEase(p.ease, p.erate,
-                                                    (double)(te - (f + 1)) / p.dur);
+                            const double e = p.dur > 0.0
+                                ? gdEase(p.ease, p.erate,
+                                         (double)(te - (f + 1)) / p.dur)
+                                : 1.0;
                             ox += p.dx * e; oy += p.dy * e;
                         }
-                    if (ft0 >= 0 && autoDur[i] > 0.0) {
+                    if (ft0 >= 0) {
                         const int te = std::min(tt, stopTick(g_autoTrig[(size_t)aa0].uid));
                         if (te >= ft0) {
-                            const double e = gdEase(autoEase[i], autoErate[i],
-                                                    (double)(te - ft0) / autoDur[i]);
+                            const double e = autoDur[i] > 0.0
+                                ? gdEase(autoEase[i], autoErate[i],
+                                         (double)(te - ft0) / autoDur[i])
+                                : 1.0;
                             ox += autoDx[i] * e; oy += autoDy[i] * e;
                         }
                     }
@@ -852,9 +1069,13 @@ struct Dynamics {
                 auto offsetAt = [&](int tt, double& ox, double& oy) {
                     if (perBox) { targetAt(tt, ox, oy); return; }
                     ox = 0.0; oy = 0.0;
-                    if (fb >= 0 && tt > fb && trigDur[i] > 0.0) {
-                        const double e = gdEase(trigEase[i], trigErate[i],
-                                                (double)(tt - (fb + 1)) / trigDur[i]);
+                    // dur 0 = done on its own tick (the superposition arm below
+                    // already reads it that way); see the note in plainAt
+                    if (fb >= 0 && tt > fb) {
+                        const double e = trigDur[i] > 0.0
+                            ? gdEase(trigEase[i], trigErate[i],
+                                     (double)(tt - (fb + 1)) / trigDur[i])
+                            : 1.0;
                         ox += trigDx[i] * e; oy += trigDy[i] * e;
                     }
                     // NO +1 on this side. The two ticks mean different things:
@@ -865,15 +1086,24 @@ struct Dynamics {
                     // the same by setting `lat = 0` for the autonomous case and
                     // 5 for the touch case. With a spurious +1 lv19's door sits
                     // 0.0615 px above the recording at t=20,601.
-                    if (ft0 >= 0 && tt >= ft0 && autoDur[i] > 0.0) {
-                        const double e = gdEase(autoEase[i], autoErate[i],
-                                                (double)(tt - ft0) / autoDur[i]);
+                    if (ft0 >= 0 && tt >= ft0) {
+                        const double e = autoDur[i] > 0.0
+                            ? gdEase(autoEase[i], autoErate[i],
+                                     (double)(tt - ft0) / autoDur[i])
+                            : 1.0;
                         ox += autoDx[i] * e; oy += autoDy[i] * e;
                     }
                 };
                 double fx = 0.0, fy = 0.0, px1 = 0.0, py1 = 0.0;
                 offsetAt(t, fx, fy);
                 offsetAt(t - 1, px1, py1);
+                if (g_dynDbg == objs[i].uid)
+                    std::printf("formdbg t=%d uid=%d perBox=%d fb=%d ft0=%d "
+                                "autoDur=%.2f autoDy=%.1f trigDur=%.2f fy=%.3f "
+                                "base=%.3f -> %.3f\n",
+                                t, objs[i].uid, perBox ? 1 : 0, fb, ft0,
+                                autoDur[i], autoDy[i], trigDur[i], fy,
+                                (double)s0.cy, (double)s0.cy + fy);
                 const double ncy = (double)s0.cy + fy;
                 // ...and the face's PER-TICK motion, from the same closed form.
                 // Without it the object teleports as far as anything standing
@@ -903,7 +1133,7 @@ struct Dynamics {
                 // objects the formula cannot fully describe belong.
                 const bool locked = (g_lockBox >= 0 && i < touchLock.size()
                                      && touchLock[i] > 0.0
-                                     && ((mask >> g_lockBox) & 1u));
+                                     && mask.test(g_lockBox));
                 if (locked) objs[i].cx = (double)s0.cx + fx + (double)lockOff;
                 objs[i].cy = ncy;
                 // --dyndbg <uid> follows one object; --dyndbg -3 prints EVERY
@@ -943,7 +1173,7 @@ struct Dynamics {
             // as "reads the recording on its own clock".
             int shiftUsed = 0;
             if (m) {
-                fired = (mask & m) != 0;
+                fired = (mask & m).any();
                 anchor = fireHi; recAnchor = trigRecFire[i];
                 fdx = trigDx[i]; fdy = trigDy[i];
                 fdur = trigDur[i]; lat = 5;
@@ -1020,10 +1250,17 @@ struct Dynamics {
                         && !(i < recAuto.size() && recAuto[i])
                         && !(i < autoReach.size() && autoReach[i])
                         && !(g_recPhase & m)) {
-                        int fb = -1;
+                        int fb = -1, fbBox = -1;
                         for (int b = 0; b < kTouchBits; ++b)
-                            if ((m & mask) & touchBit(b))
-                                fb = std::max(fb, (int)fireB[b]);
+                            if (((m & mask) & touchBit(b)) && (int)fireB[b] > fb) {
+                                fb = (int)fireB[b];
+                                fbBox = b;
+                            }
+                        // --touchretimebox: the object's own delay behind the box's
+                        // recorded entry, carried over to this state's entry.
+                        const int boxEntry =
+                            (fbBox >= 0 && (size_t)fbBox < boxRecEntry.size())
+                                ? boxRecEntry[(size_t)fbBox] : -1;
                         // The `- 1` is not a fudge, and the whole lag is worse.
                         // TRIED AND REVERTED (2026-09-20): adding the whole
                         // recLag here, on the argument that the autonomous
@@ -1040,9 +1277,11 @@ struct Dynamics {
                         // model's clamp for tick t wants the row labelled t+1
                         // -- not a residual to be removed.
                         if (fb >= 0 && (long long)fb >= g_touchRetimeFrom)
-                            anchor = fb + kTouchRetimeLat
-                                + ((i < recLag.size())
-                                       ? std::max(0, recLag[i] - 1) : 0);
+                            anchor = (boxEntry >= 0)
+                                ? fb + (trigRecFire[i] - boxEntry)
+                                : fb + kTouchRetimeLat
+                                      + ((i < recLag.size())
+                                             ? std::max(0, recLag[i] - 1) : 0);
                     }
                 }
             } else {
@@ -1117,7 +1356,7 @@ struct Dynamics {
                     // boxes the wider mask exists to carry.
                     const TouchMask touched = mask & m;
                     for (int b = 0; b < kTouchBits; ++b)
-                        if (((touched >> b) & 1u)
+                        if (touched.test(b)
                             && std::fabs((double)g_touchBoxU[b]
                                          - (double)objs[i].cx) < 400.0) {
                             nearBox = true;
@@ -1170,7 +1409,7 @@ struct Dynamics {
                         int delay = 0;
                         for (const AutoPart& p : touchParts[i]) {
                             if (p.dy <= 0.f) continue;
-                            if (!((mask >> p.trig) & 1u)) continue;
+                            if (!mask.test(p.trig)) continue;
                             const int F = g_touchFireT[p.trig & (kTouchBits - 1)];
                             if (F < 0 || t <= F) continue;
                             if (std::fabs((double)g_touchBoxU[p.trig & (kTouchBits - 1)]
@@ -1183,7 +1422,7 @@ struct Dynamics {
                     // --shiftdbg <uid>: print this uid's re-timing once. An
                     // instrument for the suspicion that the descent phase of
                     // the t=2776 spike (uid18118) is off from live by tens of
-                    // ticks (docs/HANDOFF.md, last section)
+                    // ticks.
                     if (g_shiftDbgUid >= 0 && objs[i].uid == g_shiftDbgUid
                         && !g_shiftDbgDone) {
                         g_shiftDbgDone = true;
@@ -1220,17 +1459,30 @@ struct Dynamics {
                     const bool leadingGap = m
                                             && trigRecFire[i] >= 0
                                             && tt < trigRecFire[i];
+                    // Only a step a uniform mover can make, per channel. Until
+                    // the newer row's tick every channel stayed within kRecEps
+                    // of the older row (else a row would have been written),
+                    // so an object moving under kRecEps a tick arrives less
+                    // than 2*kRecEps away. A larger step across a gap is an
+                    // object that sat still and then jumped or set off fast,
+                    // and holding the older row stays within kRecEps of it
+                    // the whole time. 4002 platform uid 18238: rows at 20,066
+                    // (y 2,068.5) and 20,711 (1,468.5) are a 600 px instant
+                    // Move, which this spread over 645 ticks -- the model's
+                    // platform hung 81 px above GD's and crushed the player.
                     if (lo + 1 < sm.size() && !leadingGap) {
                         const DynSample& n = sm[lo + 1];
                         const int span = n.t - s.t;
                         if (span > 0 && tt > s.t) {
                             const double u = (double)(tt - s.t) / (double)span;
-                            cx = (float)((double)s.cx
-                                         + ((double)n.cx - (double)s.cx) * u);
-                            cy = (float)((double)s.cy
-                                         + ((double)n.cy - (double)s.cy) * u);
-                            rotv = (float)((double)s.rot
-                                           + ((double)n.rot - (double)s.rot) * u);
+                            const auto lerp = [u](float a, float b) {
+                                const double d = (double)b - (double)a;
+                                return std::fabs(d) < 2.0 * kRecEps
+                                           ? (float)((double)a + d * u) : a;
+                            };
+                            cx = lerp(s.cx, n.cx);
+                            cy = lerp(s.cy, n.cy);
+                            rotv = lerp(s.rot, n.rot);
                         }
                     }
                     // A recording ends where its attempt died, and holding the
@@ -1320,7 +1572,7 @@ struct Dynamics {
                         // GD kills it.
                         for (const AutoPart& p : touchParts[i]) {
                             if (p.dy >= 0.f) continue;
-                            if (!((mask >> p.trig) & 1u)) continue;
+                            if (!mask.test(p.trig)) continue;
                             const int F = g_touchFireT[p.trig & (kTouchBits - 1)];
                             if (F < 0 || t < F + 5) continue;
                             if (std::fabs((double)g_touchBoxU[p.trig & (kTouchBits - 1)]
@@ -1411,7 +1663,7 @@ struct Dynamics {
                         // collision trigger the dump cannot time); the next
                         // iteration's recording carries it.
                         for (const AutoPart& p : touchParts[i]) {
-                            if (!((mask >> p.trig) & 1u)) continue;
+                            if (!mask.test(p.trig)) continue;
                             const int F = g_touchFireT[p.trig & (kTouchBits - 1)];
                             if (F < 0) continue;
                             double u = 1.0;
@@ -1432,6 +1684,13 @@ struct Dynamics {
                         cy += fdy * e;
                     } else {
                         // Superposition: every controller on its own clock.
+                        if (g_dynDbg == objs[i].uid && (t % 40 == 0))
+                            for (const AutoPart& p : autoParts[i])
+                                std::printf("armdbg   part t=%d uid=%d trig=%d "
+                                            "fireT=%d d=(%.1f,%.1f) dur=%.2f\n",
+                                            t, objs[i].uid, p.trig,
+                                            g_autoTrig[(size_t)p.trig].fireT,
+                                            (double)p.dx, (double)p.dy, p.dur);
                         for (const AutoPart& p : autoParts[i]) {
                             const int f = g_autoTrig[(size_t)p.trig].fireT;
                             if (f < 0 || t < f) continue;
@@ -1451,7 +1710,7 @@ struct Dynamics {
                                     recAutoObj ? "recAuto"
                                         : (m || autoParts[i].empty())
                                             ? "collapsed" : "superpos",
-                                    (unsigned)m, autoParts[i].size(),
+                                    (unsigned)m.word(0), autoParts[i].size(),
                                     (int)recAutoObj, anchor, cy);
                     if (g_dynDbg == objs[i].uid && t == 11720)
                         for (const AutoPart& p : autoParts[i])
@@ -1599,11 +1858,15 @@ struct Dynamics {
                     onv = v;
                 }
             }
+            // --activators: this object's on/off is its switches', not the recording's.
+            if (i < onEv.size() && !onEv[i].empty())
+                onv = resolveOn(onInit[i] != 0, onEv[i].data(), onEv[i].size(), mask, fireB, t)
+                          ? 1 : 0;
             on[i] = onv;
             if (g_dynDbg == objs[i].uid)
                 std::printf("dyntrig t=%d uid=%d fired=%d m=%08x cx=%.3f "
                             "cy=%.3f hw=%.1f hh=%.1f on=%d\n",
-                            t, objs[i].uid, (int)fired, (unsigned)m, cx, cy,
+                            t, objs[i].uid, (int)fired, (unsigned)m.word(0), cx, cy,
                             hw, hh, (int)onv);
             // --shiftstat: `shiftstat:` once per object the first time it is
             // placed (this is the DENOMINATOR -- the objects a collision
@@ -1642,6 +1905,10 @@ struct Dynamics {
                 objs[i].sy1 = (double)baseSy1[i] + dy;
             }
         }
+        };
+        forRuns(par, samePure ? nNonPure : objs.size(),
+                [&](size_t b, size_t e) { place(b, e, false); });
+        if (par) place(0, objs.size(), true);
     }
 
     // Put every object where it was at tick t. Cursors move forward with the
@@ -1673,6 +1940,10 @@ struct Dynamics {
     // predicate, not of the row: see the two-gate contact shape.
     void seek(int t) {
         if (objs.empty() || t == lastT) return;
+        // Every object is about to be rewritten, so whatever applyTriggers placed
+        // is stale from here on (see pureEpoch).
+        ++seekEpoch;
+        if (byBucketN != objs.size()) rebuildBuckets();
         const bool back = (t < lastT);
         // dcy is PER-TICK surface motion, so the position-difference form is
         // only meaningful when this seek advanced exactly one tick. The FIRST
@@ -1685,7 +1956,10 @@ struct Dynamics {
         const bool step1 = !back && (t == lastT + 1);
         lastStep1 = step1;
         lastT = t;
-        for (size_t i = 0; i < objs.size(); ++i) {
+        // Each object reads its own recording and writes its own slots, so the
+        // loop splits (forRuns) -- unless --dyndbg could print from it.
+        forRuns(g_dynDbg == -1 && !anyUidM1, objs.size(), [&](size_t b, size_t e) {
+        for (size_t i = b; i < e; ++i) {
             const auto& sm = samples[i];
             if (sm.empty()) continue;
             size_t c = back ? 0 : cur[i];
@@ -1741,10 +2015,11 @@ struct Dynamics {
             }
             if (g_dynDbg == objs[i].uid)
                 std::printf("dynseek t=%d uid=%d cur=%zu/%zu cy=%.3f "
-                            "(sample t=%d)\n",
+                            "(sample t=%d) at=%p\n",
                             t, objs[i].uid, c, sm.size(), (double)objs[i].cy,
-                            s.t);
+                            s.t, (const void*)&objs[i]);
         }
+        });
     }
     // A MOVING object that is also being TURNED. The recording's hw/hh are half
     // the axis-aligned BOUND, which for a turned box is not the shape at all --
@@ -1879,10 +2154,22 @@ struct Dynamics {
         }
         std::fill(cur.begin(), cur.end(), (size_t)0);
         lastT = -1;
+        ++seekEpoch;
     }
 
     void collect(uint8_t b, double x0, double x1,
                  std::vector<const Obj*>& out) const {
+        // Same objects, same order, fewer visits (see byBucket). --dyndbg prints
+        // one line per object of every bucket, so it keeps the full walk.
+        if (g_dynDbg < 0 && byBucketN == objs.size() && b < byBucket.size()) {
+            for (const uint32_t i : byBucket[b]) {
+                if (!on[i]) continue;
+                const Obj& o = objs[i];
+                if (o.cx + o.hw < x0 || o.cx - o.hw > x1) continue;
+                out.push_back(&o);
+            }
+            return;
+        }
         for (size_t i = 0; i < objs.size(); ++i) {
             const Obj& o = objs[i];
             if (g_dynDbg >= 0 && o.uid == g_dynDbg)

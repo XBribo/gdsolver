@@ -20,7 +20,7 @@ lv20's spike id667 rot -63):
 
 Four straight lines = not a rotated rectangle. Looking at a single point would
 have been misread as "the OBB matches" (and it was misread exactly that way
-once; docs/findings.md 2026-08-09).
+once, on 2026-08-09).
 
 Practice:
 
@@ -234,7 +234,7 @@ def main(argv=None) -> int:
                        help="a rig .lvl to drive instead of an official level. "
                             "Copied into the worker's data root")
         s.add_argument("--plan", default="",
-                       help="the input列 to replay before the injection. A rig "
+                       help="the input sequence to replay before the injection. A rig "
                             "usually needs none (the injection makes the state)")
         s.add_argument("--tick", type=int, required=True)
         s.add_argument("--dx", type=float, default=1.29825,

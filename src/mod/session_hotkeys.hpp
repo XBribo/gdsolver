@@ -176,6 +176,39 @@ inline bool renderingOn() {
     return !(g_started && !g_sessionOver && g_cfg.skipRender && !g_realtimeOverride);
 }
 
+// A section solve keeps the screen off while it runs, and the visibility pass with it. Its search
+// moves the players back and forth through a world it does not put back -- psnap restores the
+// players, not the objects the level moves -- and in a solve started from the panel the
+// visibility pass kept walking that world, since the panel's session does not skip it the way a
+// worker's (skiprender=1) does. The screen broke, the replay after the rung drew nothing but the
+// player, and GD's own retry then crashed in resetLevelVariables (user report, 2026-09-25). So
+// the handoff turns rendering and the visibility pass off (repair.hpp; the pass is the
+// updateVisibility hook), which is how every worker's search has always run, and the rung's end
+// lifts the hold after the reset that starts the spliced plan's replay (hooks_gamelayer). A
+// screen that was on comes back the way the render key brings it back: another reset at the next
+// frame boundary, then rendering (g_visResetPending). The render key is ignored meanwhile.
+// A worker's screen was never on (skiprender, not g_renderOff, keeps it dark), so there the hold
+// changes nothing: g_renderOff goes back as it was and no reset is asked for.
+// -1 = no hold in force.
+inline int g_secRenderWas = -1;          // g_renderOff when the hold began (0/1)
+inline bool g_secScreenWasOn = false;    // ...and whether anything was being drawn then
+inline void secRenderHold() {
+    if (g_secRenderWas >= 0) return;
+    g_secScreenWasOn = renderingOn();
+    g_secRenderWas = g_renderOff ? 1 : 0;
+    g_renderOff = true;
+    log::info("secsolve: screen and visibility off until the section solve ends (screen was {})",
+              g_secScreenWasOn ? "on" : "off");
+}
+inline void secRenderRelease() {
+    if (g_secRenderWas < 0) return;
+    g_renderOff = g_secRenderWas != 0;
+    g_secRenderWas = -1;
+    if (g_secScreenWasOn) g_visResetPending = true;
+    log::info("secsolve: hold lifted after the reset (screen {})",
+              g_secScreenWasOn ? "back after one more reset" : "stays as it was");
+}
+
 // Exactly what happens when the render key is pressed once: rendering on <-> off, and nothing
 // else. It used to be one key that cycled rendering AND the speed together, so "fast but
 // visible" and "slow but blind" were both unreachable; the speed is on the arrow keys now.
@@ -185,6 +218,12 @@ inline bool renderingOn() {
 // call this function, so they follow the key wherever it goes.
 inline void renderTogglePress() {
         const bool hasFast = g_cfg.fastdt > 0;
+        if (g_secRenderWas >= 0) {
+            // A section solve holds the screen off (secRenderHold); the key waits for its end.
+            log::info("hotkey: F5 ignored - a section solve is running, the screen comes back "
+                      "when it ends");
+            return;
+        }
         if (renderingOn()) {
             // Screen off. With a fast loop configured, hand the frames back to it as well --
             // stopping the drawing is the whole reason to do that.

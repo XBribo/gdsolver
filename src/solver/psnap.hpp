@@ -575,13 +575,28 @@ struct Touch {
     // re-creates them, they must not be carried). cfg `secsnapobj=1`.
     GameObject* objectSnappedTo = nullptr;
     GameObject* collidedObject = nullptr;
+    // Player 2's, when the snapshot had one (see partner below).
+    std::shared_ptr<Touch> second;
 };
 
 // cfg `secsnapobj=1`: also carry the two pointers above
 inline bool g_snapCollideObj = false;
 
-inline void captureTouch(PlayerObject* p, Touch& out) {
-    if (!p) return;
+// THE SECOND PLAYER travels with the first. Every snapshot below used to be of player 1 alone, so
+// a search through a dual section restored p1 and left p2 wherever the last branch had taken it:
+// branch after branch p2 ran on ahead, and every branch "died" when p2 did. Measured on official
+// lv16 with coins (cfg dpsecauto, a rung window from 800 to 5,600 ticks before its dual ball
+// section): every window, wherever it began, was exhausted within ~100 ticks of the dual portal,
+// the branches killed by p2 150-2,200 px ahead of p1 (`killer: who=p2`, obj=NULL or an object
+// p1 had not reached), while the plan the rung was fired from flew on past that point.
+// Captured whenever the layer has a player 2 (GD makes one with every level); outside a dual
+// section GD does not move it, and putting back what was taken changes nothing.
+inline PlayerObject* partner(PlayerObject* p, GJBaseGameLayer* l) {
+    return (l && p && p == l->m_player1 && l->m_player2 && l->m_player2 != p) ? l->m_player2
+                                                                            : nullptr;
+}
+
+inline void captureTouchOne(PlayerObject* p, Touch& out) {
     out.touchedRings = p->m_touchedRings;
     out.ringRelatedSet = p->m_ringRelatedSet;
     out.jumpPadRelated = p->m_jumpPadRelated;
@@ -590,8 +605,7 @@ inline void captureTouch(PlayerObject* p, Touch& out) {
     out.collidedObject = p->m_collidedObject;
 }
 
-inline void restoreTouch(PlayerObject* p, const Touch& in) {
-    if (!p) return;
+inline void restoreTouchOne(PlayerObject* p, const Touch& in) {
     p->m_touchedRings = in.touchedRings;
     p->m_ringRelatedSet = in.ringRelatedSet;
     p->m_jumpPadRelated = in.jumpPadRelated;
@@ -602,12 +616,157 @@ inline void restoreTouch(PlayerObject* p, const Touch& in) {
     }
 }
 
+inline void captureTouch(PlayerObject* p, Touch& out, GJBaseGameLayer* l = nullptr) {
+    if (!p) return;
+    captureTouchOne(p, out);
+    out.second.reset();
+    if (auto* p2 = partner(p, l)) {
+        out.second = std::make_shared<Touch>();
+        captureTouchOne(p2, *out.second);
+    }
+}
+
+inline void restoreTouch(PlayerObject* p, const Touch& in, GJBaseGameLayer* l = nullptr) {
+    if (!p) return;
+    restoreTouchOne(p, in);
+    if (auto* p2 = partner(p, l); p2 && in.second) restoreTouchOne(p2, *in.second);
+}
+
 inline void captureState(GJBaseGameLayer* l, GJGameState& out) {
     if (l) out = l->m_gameState;
 }
 
 inline void restoreState(GJBaseGameLayer* l, const GJGameState& in) {
     if (l) l->m_gameState = in;
+}
+
+// OBJECT-SIDE ACTIVATION: what GD's own checkpoint carries and the player snapshot did not.
+// PlayLayer::saveActiveSaveObjects (win 0x3b89f0) walks the vector at PlayLayer+0x3808 and,
+// for each object whose hasBeenActivated() (vtable +0x568) is true, saves the bytes at +0x5b4
+// and +0x5b5 -- EnhancedGameObject::m_activatedByPlayer1/2 -- as a SavedActiveObjectState. A
+// checkpoint restore resets every object and puts those back. psnap resets nothing, so once
+// one branch had taken a portal, pad or ring, every branch expanded after it found that object
+// already used. Measured on a custom level from a head at t=23,928: under psnap the plan's own
+// rollout missed the gravity portal GD takes at t=23,971, which the checkpoint path reproduces,
+// and a window the checkpoint path solves (t=24,328, depth 454) came back EXHAUSTED at depth
+// 403; carrying the flags, psnap solves it to the same state as the checkpoint path.
+// NOT ONLY GD's LIST. The objects that list holds survive a checkpoint restore; everything
+// else is simply reset by resetLevel -- rings among them (a respawn gives the orbs back). psnap
+// resets neither, so it carries every EnhancedGameObject in reach (the class that declares the
+// two flags).
+// Only the objects within the section's reach are carried: a node costs a byte per object in
+// reach, not the whole level. cfg `secsnapact=0` turns it off for A/B.
+inline bool g_snapAct = true;
+inline std::vector<EnhancedGameObject*> g_actObjs;
+// What the carry costs and what it carried, for the `secsnapact:` line at the end of a
+// search: calls, time spent in them, and which objects were ever seen activated by each player
+// in a captured node (the P2 column is the dual sections' half).
+inline long long g_actCaptures = 0, g_actRestores = 0;
+inline double g_actCapUs = 0.0, g_actRestUs = 0.0;
+inline std::vector<uint8_t> g_actSeen;
+
+inline void buildActWindow(GJBaseGameLayer* l, double x0, double x1) {
+    g_actObjs.clear();
+    g_actSeen.clear();
+    g_actCaptures = g_actRestores = 0;
+    g_actCapUs = g_actRestUs = 0.0;
+    if (!g_snapAct || !l || !l->m_objects) return;
+    for (unsigned i = 0; i < l->m_objects->count(); ++i) {
+        auto* o = static_cast<GameObject*>(l->m_objects->objectAtIndex(i));
+        if (!o) continue;
+        const double x = o->getPositionX();
+        if (x < x0 || x > x1) continue;
+        if (auto* e = typeinfo_cast<EnhancedGameObject*>(o)) g_actObjs.push_back(e);
+    }
+    g_actSeen.assign(g_actObjs.size(), 0);
+}
+
+// The activation bytes AND their 64-bit signature, in one pass. The signature is what makes two
+// nodes with the same player state but a different set of used objects two different states
+// (secsolve's dedupe key and the cap's buckets, cfg `secactkey`): the future of "ring A already
+// taken" is not the future of "ring A still there", and a key without it kept whichever came
+// first. FNV-1a over the bytes in window order, so WHICH object differs
+// changes the signature, not only how many.
+inline uint64_t actSignature(const std::vector<uint8_t>& v) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint8_t b : v) { h ^= b; h *= 1099511628211ull; }
+    return h;
+}
+
+inline uint64_t captureActSig(std::vector<uint8_t>& out) {
+    const auto t0 = std::chrono::steady_clock::now();
+    out.resize(g_actObjs.size());
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < g_actObjs.size(); ++i) {
+        const auto* e = g_actObjs[i];
+        out[i] = (uint8_t)((e->m_activatedByPlayer1 ? 1 : 0) | (e->m_activatedByPlayer2 ? 2 : 0));
+        g_actSeen[i] |= out[i];
+        h ^= out[i];
+        h *= 1099511628211ull;
+    }
+    ++g_actCaptures;
+    g_actCapUs += std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t0).count();
+    return h;
+}
+
+inline void captureAct(std::vector<uint8_t>& out) { (void)captureActSig(out); }
+
+// cfg `secactkey=0`: keep carrying the flags but leave them out of the key and the buckets.
+inline bool g_actKey = true;
+inline constexpr uint64_t kActKeyMul = 0xC2B2AE3D27D4EB4Full;
+
+// Self-check at the head of a search: two activation vectors that differ in exactly one
+// object must give two signatures and two keys, and differing at the first or at the last
+// object must not coincide either. Returns 1 when all hold, 0 when not, -1 with nothing in
+// reach to test.
+inline int actKeySelfCheck(const std::vector<uint8_t>& base, long long playerKey) {
+    if (base.empty()) return -1;
+    std::vector<uint8_t> a = base, b = base;
+    a.front() ^= 1;
+    b.back() ^= 2;
+    const uint64_t s0 = actSignature(base), sa = actSignature(a), sb = actSignature(b);
+    const long long k0 = playerKey ^ (long long)(s0 * kActKeyMul);
+    const long long ka = playerKey ^ (long long)(sa * kActKeyMul);
+    const long long kb = playerKey ^ (long long)(sb * kActKeyMul);
+    const bool ok = s0 != sa && s0 != sb && (base.size() == 1 || sa != sb)
+                    && k0 != ka && k0 != kb;
+    return ok ? 1 : 0;
+}
+
+inline void restoreAct(const std::vector<uint8_t>& in) {
+    if (in.size() != g_actObjs.size()) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < g_actObjs.size(); ++i) {
+        g_actObjs[i]->m_activatedByPlayer1 = (in[i] & 1) != 0;
+        g_actObjs[i]->m_activatedByPlayer2 = (in[i] & 2) != 0;
+    }
+    ++g_actRestores;
+    g_actRestUs += std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+
+// Of the objects a node has used (any bit set in `want`), how many the live game has lost (a
+// bit set in `want` and clear on the object now). Reads only: the `secorigin:` line counts it
+// where a cross-check replay starts, to show whether its origin's world is the node's.
+inline std::pair<long long, long long> originUsedLost(const std::vector<uint8_t>& want) {
+    if (want.size() != g_actObjs.size()) return {0, 0};
+    long long used = 0, lost = 0;
+    for (size_t i = 0; i < g_actObjs.size(); ++i) {
+        if (!want[i]) continue;
+        ++used;
+        const uint8_t now = (uint8_t)((g_actObjs[i]->m_activatedByPlayer1 ? 1 : 0)
+                                      | (g_actObjs[i]->m_activatedByPlayer2 ? 2 : 0));
+        if (want[i] & ~now) ++lost;
+    }
+    return {used, lost};
+}
+
+// Objects ever seen activated by player 1 / player 2 in a captured node.
+inline int actSeenCount(uint8_t bit) {
+    int n = 0;
+    for (uint8_t s : g_actSeen) n += (s & bit) ? 1 : 0;
+    return n;
 }
 
 inline void captureEM(GJBaseGameLayer* l, gd::vector<PulseEffectAction>& out) {
@@ -623,18 +782,51 @@ inline void restoreEM(GJBaseGameLayer* l,
         em->m_pulseEffectVector = in;
 }
 
+// Where GD's physics will start the player from on the next update. Not always the node's
+// position: while a mirror transition runs (layer+0x41c strictly between 0 and 1),
+// GJBaseGameLayer::update (0x237850 in 2.2081) ends by storing the position in m_position
+// (player+0xa90, unless player+0xa2a is set) and then moving the NODE to its screen-flipped place
+// for drawing, x + t * (winWidth / zoom - 2 * (x - cameraX)); the next update starts by putting the
+// node back from m_position. A section search steps with the whole update (secStep), so a node read
+// between two steps is the drawing position. Captured as the player's place, it went into physics
+// on restore: on a custom level (2026-09-26), from the tick the player touches the mirror portal at x=13,095,
+// psnap's x ran 0.7, 1.7, 2.7 ... px a tick ahead of GD's own run and every window died short of
+// the wall. Outside a transition the two are the same point, so nothing else moves.
+static_assert(offsetof(PlayerObject, m_position) == 0xa90, "PlayerObject::m_position moved");
+inline cocos2d::CCPoint physPosition(PlayerObject* p, GJBaseGameLayer* l) {
+    if (p && l) {
+        const auto* lb = reinterpret_cast<const uint8_t*>(l);
+        const float t = *reinterpret_cast<const float*>(lb + 0x41c);
+        const bool stored = reinterpret_cast<const uint8_t*>(p)[0xa2a] == 0;
+        if (t > 0.f && t < 1.f && stored) return p->m_position;
+    }
+    return p ? p->getPosition() : cocos2d::CCPoint{};
+}
+
+// One player's bytes and its node extras (x, y, rotation), at dst.
+inline void capturePlayer(PlayerObject* p, uint8_t* dst, GJBaseGameLayer* l = nullptr) {
+    std::memcpy(dst, (const void*)p, sizeof(PlayerObject));
+    const cocos2d::CCPoint at = physPosition(p, l);
+    const float ex[3] = {at.x, at.y, p->getRotation()};
+    std::memcpy(dst + sizeof(PlayerObject), ex, kExtra);
+}
+
+// Layout: player 1, its extras, the layer members, then player 2 and its extras when the layer
+// has one (partner). restore() reads the same layout back under the same condition.
 inline void capture(PlayerObject* p, GJBaseGameLayer* l,
                     std::vector<uint8_t>& out) {
     observe(p);
-    out.resize(sizeof(PlayerObject) + kExtra + layerBytes());
-    std::memcpy(out.data(), (const void*)p, sizeof(PlayerObject));
-    const float ex[3] = {p->getPositionX(), p->getPositionY(), p->getRotation()};
-    std::memcpy(out.data() + sizeof(PlayerObject), ex, kExtra);
-    size_t o = sizeof(PlayerObject) + kExtra;
+    PlayerObject* p2 = partner(p, l);
+    if (p2) observe(p2);
+    const size_t one = sizeof(PlayerObject) + kExtra;
+    out.resize(one + layerBytes() + (p2 ? one : 0));
+    capturePlayer(p, out.data(), l);
+    size_t o = one;
     for (auto& m : layerRestoreList()) {
         std::memcpy(out.data() + o, (const uint8_t*)l + m.off, m.size);
         o += m.size;
     }
+    if (p2) capturePlayer(p2, out.data() + o, l);
 }
 
 // Injection of the raw snapshot (the old warp's `injectBytes` itself).
@@ -644,7 +836,8 @@ inline void capture(PlayerObject* p, GJBaseGameLayer* l,
 // Writes back only the whitelisted range. NOT A SINGLE POINTER MOVES, so
 // alternately restoring snapshots taken at different times lets no stale
 // pointer in.
-inline void restore(PlayerObject* p, GJBaseGameLayer* l, const uint8_t* bytes) {
+// One player's whitelisted bytes and extras back from src (see capturePlayer).
+inline void restorePlayer(PlayerObject* p, const uint8_t* bytes) {
     const auto& m = mask();
     uint8_t* dst = (uint8_t*)p;
     size_t i = 0;
@@ -664,10 +857,19 @@ inline void restore(PlayerObject* p, GJBaseGameLayer* l, const uint8_t* bytes) {
         p->setPosition({ex[0], ex[1]});
         p->setRotation(ex[2]);
     }
+}
+
+inline void restore(PlayerObject* p, GJBaseGameLayer* l, const uint8_t* bytes) {
+    restorePlayer(p, bytes);
     size_t o = sizeof(PlayerObject) + kExtra;
     for (auto& m : layerRestoreList()) {
         std::memcpy((uint8_t*)l + m.off, bytes + o, m.size);
         o += m.size;
+    }
+    PlayerObject* p2 = partner(p, l);
+    if (p2) {
+        restorePlayer(p2, bytes + o);
+        if (!g_keepSnapPos && !g_skipExtras) p2->m_position = p2->getPosition();
     }
     // In fast mode m_position is "the value at the start of the update batch"
     // and is 0-3 substeps stale. GD re-adopts it as the physics position in the

@@ -40,7 +40,7 @@ namespace dp {
 // travel direction and gravity do. lv22 has 20 of these (no other level in the
 // suite has any, so all of this is inert there).
 //
-// Measured on lv22 with the reference replay (findings.md 2026-08-13):
+// Measured on lv22 with the reference replay (2026-08-13):
 //   - `rot` is the ABSOLUTE screen angle, not a delta. Eight of lv22's twenty
 //     are rot=0, i.e. "turn it back".
 //   - travel = R(-rot) * xhat:  0 -> +X,  90 -> -Y,  180 -> -X,  270 -> +Y.
@@ -163,7 +163,7 @@ inline thread_local int g_tcBranchP1 = 0;
 // parent state's y (--touchprey=parent), is a tick too early: the cross of
 // "this tick's x" with "last tick's y" fired lv20's uid5625 on a position the
 // player never occupied, moving a saw 113.7 px onto a lane GD leaves open.
-// On since 2026-09-21 (audit AUD-20260921-12); always on since the flag
+// On since 2026-09-21; always on since the flag
 // clean-up, which removed --touchprey.
 // --rotpretap: the same tick order for a 2900. GD fires a rotation
 // in the collision pass, BEFORE the tick's button, so the trigger's
@@ -175,7 +175,7 @@ inline thread_local int g_tcBranchP1 = 0;
 // 1 to world x=2,926.5, read |dv| = 783 > kRotPerpWin, dropped the rotation and
 // planned on in a frame GD had left. applyRotation already restores the pre-tap
 // y once a rotation has fired (its re-tap); this makes the DECISION use it too.
-// ON by default since 2026-09-21 (audit AUD-20260921-20), as ONE unit with
+// ON by default since 2026-09-21, as ONE unit with
 // --spiderstrip: this alone still left a wrong landing, the pair made the
 // target plan match the game for 400 ticks. Both always on since the flag
 // clean-up.
@@ -193,7 +193,7 @@ inline thread_local int g_tcBranchP1 = 0;
 // the spider at 226.5 where GD, which never looks behind, lands at 316.5.
 // Forward travel at normal size only: reverse travel and the mini are not
 // measured, and keep the old window.
-// ON by default since 2026-09-21 (audit AUD-20260921-20), paired with
+// ON by default since 2026-09-21, paired with
 // --rotpretap (see there).
 // --ceilpush (default off): seat a body that overlaps a ceiling ramp's rect at
 // GD's ceiling seat even where the ramp window has dropped the ramp. See the
@@ -217,7 +217,7 @@ inline bool g_ceilPush = false;
 // this is NOT a one-object change and it moves kills in BOTH directions -- a
 // slope GD calls ceiling is currently judged as floor, which empties one
 // interval and fills the other.
-// ON by default since 2026-09-21 (audit AUD-20260921-12). The enumeration came
+// ON by default since 2026-09-21. The enumeration came
 // back with one row changed -- lv21's t=14,999 over-kill, the same rule and the
 // same direction as lv20's -- and nothing moved the other way over 22 whole-run
 // replays. deathref 41/47 -> 42/47 with nothing lost, cold 22/22. Always on
@@ -248,7 +248,7 @@ inline bool g_latGap = false;
 // uid at the same place. Gates: the replay suite moves 38 of 1,116 traces with the reference
 // tracking unchanged, a cold run clears 22/22 for +8 on lv20 and +1 on lv17, deathref keeps
 // 41/47 with no reference lost, and refaudit adds no over-kill (lv19 improves from 153
-// differing rows to 3). Audit AUD-20260920-06.
+// differing rows to 3).
 constexpr double kWaveSlopeDescendDy = 1.0;
 // ...and past the high end the kill is flat at objMaxY + half - 1.0 (both directions).
 // The downhill +1.0 is the source's tolerance xmm10 = (m_slopeUphill == 0), x4 while
@@ -433,11 +433,20 @@ inline const char* const kAnchorKeys[] = {"owns", "touch", "portal", "portal2",
 // `owns=hist` -> the per-body history values that --start does not carry, as
 // ONE versioned value: `hist=<version>|<count>|name:value,name:value`. The
 // version and the count are checked, and a name this build does not know is
-// refused like an unknown key (AUD-20260919-07: every new history value goes
+// refused like an unknown key (every new history value goes
 // through this one transport, never another positional --start field).
 // Version 1 knows pressSpent and pressSpent2 (GD's +0x986 negated, per body).
 inline bool g_ownsHist = false;
 inline const char* const kHistNames[] = {"pressSpent", "pressSpent2"};
+// Version 2 adds `freeMode`: GD's [layer+0x311], the Free Mode byte each mode
+// portal copies in and checkCollisions reads before it clamps anything to the
+// band (see kBandFreeKnown in bands.hpp). A version carries every name it knows,
+// so a version-1 payload is still complete and leaves the byte unknown.
+// nullptr pads the shorter version.
+inline std::array<const char*, 3> histNamesFor(int version) {
+    if (version == 2) return {"pressSpent", "pressSpent2", "freeMode"};
+    return {kHistNames[0], kHistNames[1], nullptr};
+}
 // Which subsystems this payload claims. The lock and the rotation queue keep
 // their own seeding until someone measures a reason to move them.
 inline bool g_ownsTouch = false;

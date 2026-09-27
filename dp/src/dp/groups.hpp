@@ -23,10 +23,46 @@ namespace dp {
 // fills in, and beyond THAT every object holds its last known rect.
 using GroupTimeline = std::unordered_map<int, std::vector<DynSample>>;
 
+// A file's bytes, read in one go. The in-process caches (here, triggers.hpp and cli.hpp) reuse a
+// parse only when the file holds the same bytes as the one it came from, and read the file on every
+// call to find out; read a character at a time (istreambuf_iterator) that read alone was most of a
+// call's preparation on a custom level's 85 MB recording. False when the file cannot be opened.
+inline bool readFileBytes(const std::string& path, std::string& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    in.seekg(0, std::ios::end);
+    const std::streamoff n = in.tellg();
+    if (n < 0) return false;
+    in.seekg(0, std::ios::beg);
+    out.resize((size_t)n);
+    if (n > 0 && !in.read(&out[0], n)) return false;
+    return true;
+}
+
 // The uid the level loader gives an object's hazard twin (DynSample::env; the base is in
 // object.hpp, where the kill counter reads it).
 inline int envTwinUid(int uid) { return kEnvTwinUidBase + uid; }
-inline GroupTimeline loadGroupTimeline(const std::string& path) {
+// `endOut`, when the file carries the trailer the recorder writes (`end,<tick>`),
+// comes back as the tick the RUN reached. That is what the overlay below has to
+// use as the newer recording's reach: its last ROW stops as soon as nothing
+// moves, and the ticks between that and the end of the run are covered by the
+// run just as much (SubZero 4002, measured 2026-09-23). -1 = an older
+// recording without the trailer, where the last row is all there is.
+// The recordings' t=0 on/off (their `init,` lines), by uid, for the objects an activator
+// switches (--activators; the loader reads it). Every recording of a level carries the same
+// snapshot -- it is taken right after the game's reset, before anything the run did -- so the
+// first one that has it is enough. Empty when none does.
+inline std::unordered_map<int, uint8_t> g_groupInit;
+
+// `initOut`, when given, receives the `init,<uid>,<on>` lines: each tracked object's on/off as
+// the game's reset left it, before the first update (the mod's grouptrace::snapshotInit) -- the
+// t=0 an object's switches (OnEvent) are applied to. A recording made before those lines existed
+// leaves it empty. Without `initOut` the lines are skipped, as they always were.
+inline GroupTimeline loadGroupTimeline(const std::string& path,
+                                       long long* endOut = nullptr,
+                                       std::unordered_map<int, uint8_t>* initOut = nullptr) {
+    if (endOut) *endOut = -1;
+    if (initOut) initOut->clear();
     GroupTimeline g;
     std::ifstream in(path);
     if (!in) {
@@ -45,6 +81,16 @@ inline GroupTimeline loadGroupTimeline(const std::string& path) {
         // used to mean). `env` is written only on the rows that have it (the box
         // GD's random numbers can put the object in, DynSample::env), always
         // after a `rot`.
+        if (line.rfind("end,", 0) == 0) {
+            if (endOut) *endOut = std::atoll(line.c_str() + 4);
+            continue;
+        }
+        if (line.rfind("init,", 0) == 0) {
+            int u = 0, o = 1;
+            if (initOut && std::sscanf(line.c_str() + 5, "%d,%d", &u, &o) == 2)
+                (*initOut)[u] = o ? 1 : 0;
+            continue;
+        }
         const int n = std::sscanf(line.c_str(), "%d,%d,%f,%f,%f,%f,%d,%f,%d", &t,
                                   &uid, &cx, &cy, &w, &h, &on, &rot, &env);
         if (n < 6) continue;
@@ -106,7 +152,7 @@ constexpr double kBootAlignTol = 0.05;        // px, mean |dcx| + |dcy|
 // For the report only: *moving says the object was scored at all, *bestErr is
 // the best mean error found and *nFit how many shifts came under the tolerance
 // (the nearest of them is the one taken; more than one would be a periodic
-// motion matching itself, which is not yet a reason to refuse -- AUD-26).
+// motion matching itself, which is not yet a reason to refuse).
 inline int bootAlignShift(const std::vector<DynSample>& live,
                           const std::vector<DynSample>& boot, int cover,
                           bool* moving = nullptr, double* bestErrOut = nullptr,
@@ -154,7 +200,7 @@ inline int bootAlignShift(const std::vector<DynSample>& live,
 // holds for one tick before the recordings under it take over. The producer
 // says so, not dp: the mod appends the flag only when it passes the live
 // recording, which it writes only after a replay died (harvestGroups), and that
-// file is always the last overlay. AUD-20260919-05 asked for the hold to be tied
+// file is always the last overlay. The hold was asked to be tied
 // to a death-terminated recording rather than applied to every overlay, which is
 // what --groupholdend does.
 //
@@ -170,16 +216,23 @@ inline int bootAlignShift(const std::vector<DynSample>& live,
 inline bool g_groupHoldDeath = false;
 
 // `over` wins for every tick it covers; `base` supplies the rest. `deathEnd`
-// says `over` ended on a death (--groupholddeath).
+// says `over` ended on a death (--groupholddeath). `report`, when given, receives the lines this
+// prints instead of stdout (cli.hpp's layer cache replays them on a hit).
 inline void overlayGroupTimeline(GroupTimeline& base, const GroupTimeline& over,
-                                 bool deathEnd = false) {
+                                 bool deathEnd = false, long long overEnd = -1,
+                                 std::string* report = nullptr) {
     // How far the overriding recording actually reaches. One number for the
     // whole file, not per object: an object that simply did not move inside the
     // covered window has one sample and must NOT be treated as uncovered.
+    // `overEnd` (the recorder's own trailer) is the tick its RUN reached, which
+    // is past the last row whenever the level went quiet before the run ended --
+    // and those quiet ticks are covered too. Without it the older recording's
+    // rows for them win (4002 t=22,677, measured 2026-09-23).
     int cover = -1;
     for (const auto& kv : over)
         if (!kv.second.empty()) cover = std::max(cover, kv.second.back().t);
     if (cover < 0) return;
+    if (overEnd > cover) cover = (int)overEnd;
     int nRetimed = 0, sLo = 0, sHi = 0;
     int nMoving = 0, nNoFit = 0, nMulti = 0, mostFits = 0, nHeld = 0;
     double worstJoin = 0.0;
@@ -217,15 +270,23 @@ inline void overlayGroupTimeline(GroupTimeline& base, const GroupTimeline& over,
                   [](const DynSample& a, const DynSample& b) { return a.t < b.t; });
         base[kv.first] = std::move(merged);
     }
-    std::printf("groups: overlay covers t<=%d\n", cover);
-    std::printf("groups: the bootstrap joined %d moving object(s) at a shift "
-                "of %d..%d ticks; %d moving at the seam, %d with no fitting "
-                "shift, worst fitting error %.4f px, %d with more than one "
-                "fitting shift (at most %d)\n", nRetimed, sLo, sHi, nMoving,
-                nNoFit, worstJoin, nMulti, mostFits);
-    if (deathEnd)
-        std::printf("groups: --groupholddeath: the last recording ended on a death at "
-                    "t=%d; %d object(s) hold its last row one tick\n", cover, nHeld);
+    char b[512];
+    std::string lines;
+    std::snprintf(b, sizeof b, "groups: overlay covers t<=%d\n", cover);
+    lines += b;
+    std::snprintf(b, sizeof b, "groups: the bootstrap joined %d moving object(s) at a shift "
+                  "of %d..%d ticks; %d moving at the seam, %d with no fitting "
+                  "shift, worst fitting error %.4f px, %d with more than one "
+                  "fitting shift (at most %d)\n", nRetimed, sLo, sHi, nMoving,
+                  nNoFit, worstJoin, nMulti, mostFits);
+    lines += b;
+    if (deathEnd) {
+        std::snprintf(b, sizeof b, "groups: --groupholddeath: the last recording ended on a "
+                      "death at t=%d; %d object(s) hold its last row one tick\n", cover, nHeld);
+        lines += b;
+    }
+    if (report) *report += lines;
+    else std::fputs(lines.c_str(), stdout);
 }
 
 }  // namespace dp

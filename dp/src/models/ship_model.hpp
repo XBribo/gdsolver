@@ -43,7 +43,7 @@ public:
         // ship (zero input, sp0.9) went from +0.069 to +0.103/tick and matched
         // lv7 t=5,793...
         // THE SIGN BELOW (gravityFlipped ? -s : +s) IS CORRECT. Do not touch it.
-        // Details are in the 2026-08-20 entry of docs/findings.md.
+        // (measured 2026-08-20)
         // [2026-08-21] The flipped side has its own measured table
         // (accelSwitchVyFlipForSpeed). Its default equals -accelSwitchVy, so
         // unmeasured speeds are unchanged.

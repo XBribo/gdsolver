@@ -88,7 +88,7 @@ inline bool check(PlayerObject* p, long long tick) {
 
 } // namespace speedgate
 
-// Session management for the on-screen control panel. A path that fully resets the session
+// Session management for the play menu. A path that fully resets the session
 // state and starts manually, so the UI can start any number of times
 
 }  // namespace p1

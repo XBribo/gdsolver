@@ -1,6 +1,6 @@
 #pragma once
 // On-screen HUD that stays visible while rendering is skipped.
-#include "mod/ui_panel.hpp"
+#include "mod/level_slice.hpp"
 
 using namespace p1;
 
@@ -242,9 +242,17 @@ inline void fillSessionHud(cocos2d::CCLabelBMFont* hud) {
     if (auto* pl = PlayLayer::get()) len = pl->m_levelLength;
     char coinLine[64] = "";
     if (g_cfg.coinMode) {
+        // Either witness, per coin: the coarse load-position test never counts a coin a Move
+        // carries away (SubZero 4002's third, dropped 600 px), so alone it read 0/3 while GD was
+        // taking it; GD's own call (coingd:) can be suppressed on a later attempt by its
+        // collected-coin dictionary (hooks_playlayer.cpp).
         size_t got = 0;
-        for (auto pu : solver::g_coinPickupTick) if (pu >= 0) ++got;
-        snprintf(coinLine, sizeof(coinLine), "coins %zu/%zu\n", got, solver::g_coins.size());
+        for (size_t i = 0; i < solver::g_coins.size(); ++i)
+            if ((i < solver::g_coinGdTick.size() && solver::g_coinGdTick[i] >= 0)
+                || (i < solver::g_coinPickupTick.size() && solver::g_coinPickupTick[i] >= 0))
+                ++got;
+        snprintf(coinLine, sizeof(coinLine), "coins %zu/%zu this attempt\n", got,
+                 solver::g_coins.size());
     }
     float px = 0.f;
     if (auto* pl = PlayLayer::get()) if (pl->m_player1) px = pl->m_player1->getPositionX();

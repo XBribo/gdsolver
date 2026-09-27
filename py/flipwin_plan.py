@@ -1,6 +1,6 @@
 """What each flip-window rung should show, and how to tell the arms apart.
 
-brief-004b has to put back two arms of the bonk gate at once -- the 1859 arming
+This has to put back two arms of the bonk gate at once -- the 1859 arming
 arm and the flip-grace arm -- and the reason 005 came apart was that a bonk
 seen in the wild cannot say which arm produced it. The rigs (mklevel
 flipwin_cube[_mini][_armed]) are built as a 2x2: delay across the window,
@@ -21,7 +21,7 @@ import argparse
 import json
 from pathlib import Path
 
-# The window brief-004b is testing, in ticks. 0.1 s at 240 Hz is 24; the
+# The window under test here, in ticks. 0.1 s at 240 Hz is 24; the
 # conversion GD actually performs may round the other way, and which of 24 or
 # 25 it is is one of the things the ladder is for -- so both are marked.
 WINDOW = (24, 25)

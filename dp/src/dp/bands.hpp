@@ -4,7 +4,7 @@
 namespace dp {
 
 // ...and the whole thing turned out to be ONE function in GD, read straight out
-// of the exe (docs/findings-ceiling.md). `GJBaseGameLayer::checkCollisions`
+// of the exe. `GJBaseGameLayer::checkCollisions`
 // clamps to getMinPortalY()/getMaxPortalY() +- 15*vsize, and the band those
 // return is written by `animateInDualGroundNew` when a mode portal is passed:
 //
@@ -40,7 +40,7 @@ inline double bandHeightFor(int portalType) {
 // ...and the same while the player is a dual. updateDualGround only skips the
 // call when H == 270 AND the mode is neither spider nor dual, so in a dual even
 // a CUBE updates the band, and the ball's 240 reads as 270. Measured on lv16
-// with the ceilprobe build's pmin/pmax columns (docs/findings-ceiling.md):
+// with the ceilprobe build's pmin/pmax columns:
 //   cube in dual  [360,630] = H 270   ship in dual [330,630] = H 300
 //   ufo  in dual  [390,690] = H 300   ball in dual [390,660] = H 270
 inline double bandHeightDual(int mode) {
@@ -233,7 +233,23 @@ inline bool g_slopeRelDbg = false;
 // 0's name" look identical. That is exactly the ambiguity an earlier f2 = 0
 // reading could not resolve, and why Reach (every step) is kept beside Call
 // (every fixup lookup): the first is the denominator of the second.
-inline long long g_frameRevReach[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+//
+// ONE ROW PER THREAD, summed where it is read (frameRevReach). Every thread of
+// the search's pool steps states, and a single shared array was a cache line
+// they all wrote on every step -- and, a plain `long long`, one that lost
+// increments to the race. `g_threadSlot` is the row: 0 for whoever calls
+// cliMain, 1.. for the pool's workers (ThreadPool sets it as each one starts).
+// A row is exactly one cache line. Past kThreadSlots threads rows are shared
+// again, which is where the old array always was.
+inline thread_local int g_threadSlot = 0;
+inline constexpr int kThreadSlots = 64;
+struct alignas(64) FrameRevRow { long long n[4][2]; };
+inline FrameRevRow g_frameRevReach[kThreadSlots] = {};
+inline long long frameRevReach(int f, int r) {
+    long long sum = 0;
+    for (const FrameRevRow& row : g_frameRevReach) sum += row.n[f][r];
+    return sum;
+}
 // --fxwatch <t>: why a fixup did or did not fire on the replayed state at one
 // step (fixup.hpp fxDescribe fills it, the replay's per-tick line prints it).
 // Declared here rather than in fixup.hpp for the same reason as the counters
@@ -262,6 +278,11 @@ inline long long g_frameRevHit[4][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
 // `-0.2500`, manufacturing the very roundness that was supposed to be the
 // finding. Do not narrow these back.
 inline bool g_dcyDbg = false;
+// --supdbg: every solid the cube's support scan looks at, with the gap and the x
+// test that decide it. Written for 4002 t=22,768, where the player stood on a
+// platform GD has at y=1,648.5 and the model had at 2,248.5: printing the scan is
+// what showed the object was in the wrong PLACE rather than the rule being wrong.
+inline bool g_supDbg = false;
 inline bool g_bandDbg = false;   // --banddbg: one line per wave tick near the band ceiling
 // --spddbg: one line per SPEED PORTAL CANDIDATE per tick, naming the gate that
 // rejected it. The three gates (x overlap / oriented hit / y gap) each `continue`
@@ -310,6 +331,32 @@ inline bool g_rotLast = false;
 // dump that predates the column keeps the old behaviour exactly.
 // (Set from the objrects HEADER, by name -- see loadLevelFrom.)
 inline bool g_freeModeCol = false;
+// [2026-09-22] ...AND FREE MODE IS WHAT DECIDES WHETHER THE BAND IS A WALL.
+// checkCollisions (0x2139b8) tests [layer+0x311] before anything else: set, and
+// no mode is clamped to the band at all; clear, and the six flying modes are
+// clamped to getMin/MaxPortalY whatever branch those took (the only other gate
+// is the teleport byte, State::tpSkip). [layer+0x311] is the Free Mode byte
+// playerWillSwitchMode (0x212ef0) copies from EVERY mode portal it takes --
+// lv22's seventeen mode changes all leave GD's byte equal to their portal's
+// `free` column, cube and robot portals included.
+// The band being "on the 30 grid" was a stand-in for this, and a leaky one: a
+// zoom divides a portal band's height too (branch B is centre -+ 0.5*H/zoom),
+// so SubZero 4003's spider band sits at 1354.5/1651.5 = 270/0.9091 high, off the
+// grid, and GD lands the spider on its floor while the grid test dropped it.
+// Measured on GD's replays with the dump's `freemode` column (27046c9): flying
+// ticks outside the band -- lv9 0 of 11,299 with the byte clear, lv22 0 of 2,052
+// clear and 570 of 5,575 set, 4003 0 of 5,732 clear.
+// Carried in State::bandBranch bits 2-3. Bit 2 says the value is KNOWN: set at
+// the level's start (the byte is clear after resetLevel) and by every mode
+// portal, or handed over by an anchor's hist payload (version 2). An anchor
+// that does not carry it leaves it unknown, and then the grid test stands --
+// the old behaviour exactly, which is what the anchored suites were built on.
+constexpr uint8_t kBandFreeKnown = 4;
+constexpr uint8_t kBandFree = 8;
+inline bool bandIsWall(uint8_t branch, bool legacyGridTest) {
+    if (branch & kBandFreeKnown) return (branch & kBandFree) == 0;
+    return legacyGridTest;
+}
 // The same for the trigger queue's admission gate: PlayLayer::addObject only
 // enqueues a trigger when it is neither touch- nor spawn-triggered, so those
 // never fire on an x crossing. Two of lv22's twenty zoom triggers are in that

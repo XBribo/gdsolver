@@ -9,13 +9,17 @@ namespace dp {
 class ThreadPool {
 public:
     explicit ThreadPool(int n) {
-        for (int i = 0; i < n; ++i) ths_.emplace_back([this] { worker(); });
+        // Each worker counts into its own row of the per-thread tallies
+        // (g_threadSlot); the thread that owns the pool keeps row 0.
+        for (int i = 0; i < n; ++i)
+            ths_.emplace_back([this, i] { g_threadSlot = i + 1; worker(); });
     }
     ~ThreadPool() {
         {
             std::lock_guard<std::mutex> lk(m_);
             stop_ = true;
             ++gen_;
+            genSpin_.store(gen_, std::memory_order_release);
         }
         cvStart_.notify_all();
         for (auto& t : ths_) t.join();
@@ -38,7 +42,13 @@ public:
 private:
     void dispatch(size_t count, const std::function<void(size_t)>& fn,
                   size_t chunk) {
-        if (ths_.empty() || count == 0) {
+        // A job no bigger than one chunk per thread is not worth waking anyone
+        // for: the wake-up and the wait cost more than the work. Profiled on a
+        // level with 868 moving objects, the workers sat idle ~70% of the run
+        // while the frontier was split into small groups, each dispatched on its own. Every
+        // index still runs exactly once and writes only its own slot, so the
+        // result is the same whichever thread runs it.
+        if (ths_.empty() || count == 0 || (chunk > 1 && count <= chunk)) {
             for (size_t i = 0; i < count; ++i) fn(i);
             return;
         }
@@ -50,6 +60,7 @@ private:
             next_.store(0, std::memory_order_relaxed);
             done_ = 0;
             ++gen_;
+            genSpin_.store(gen_, std::memory_order_release);
         }
         cvStart_.notify_all();
         runChunks();          // the caller is a worker too
@@ -68,6 +79,16 @@ private:
     void worker() {
         size_t seen = 0;
         for (;;) {
+            // Spin briefly before sleeping: the next group's job usually comes
+            // within microseconds, and a kernel wake-up per group was most of
+            // what the idle time was made of. Purely a matter of who waits how.
+            {
+                const auto until = std::chrono::steady_clock::now()
+                                   + std::chrono::microseconds(50);
+                while (genSpin_.load(std::memory_order_acquire) == seen
+                       && std::chrono::steady_clock::now() < until)
+                    std::this_thread::yield();
+            }
             std::unique_lock<std::mutex> lk(m_);
             cvStart_.wait(lk, [this, &seen] { return gen_ != seen; });
             seen = gen_;
@@ -90,11 +111,24 @@ private:
     size_t count_ = 0;
     std::atomic<size_t> next_{0};
     size_t gen_ = 0;
+    std::atomic<size_t> genSpin_{0};   // gen_, readable without the lock (spin only)
     size_t done_ = 0;
     bool stop_ = false;
 };
 
 inline size_t g_aliveCap = 16000;  // per-layer stride cap (keeps RAM sane)
+// --capmap x0:c0,x1:c1,...: the alive cap as a step function of the frontier's
+// leading x (the previous layer's, which is what exists when the cap is applied).
+// From x_i on the cap is c_i; before the first entry it is --cap. Empty = --cap
+// everywhere, i.e. the search without the flag. A search restriction, not physics:
+// every plan it can emit is one the model steps exactly as before.
+inline std::vector<std::pair<double, size_t>> g_capMap;
+inline size_t capAtX(double x) {
+    size_t c = g_aliveCap;
+    for (const auto& e : g_capMap)
+        if (x >= e.first) c = e.second;
+    return c;
+}
 // --memstat: extended per-report diagnostics. Off by default -- walking the
 // arena is O(arena) per report and only the memory work needs the numbers.
 inline bool g_memStat = false;

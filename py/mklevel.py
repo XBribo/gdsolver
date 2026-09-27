@@ -2899,10 +2899,9 @@ def build_slopeup() -> str:
     stop it dead with vy kept, and pass 1 dies -- which then exhausts the xmap, so
     the last nine units all got the same press tick. That last part is how it was
     caught: `ahead` goes up while `press_t` goes DOWN.
-    The underside is not unmeasured anyway --
-    notes/measure-slope-underside-gate-2026-09-05.md has the gate, including that
-    the 5.0 threshold is hitGround's and floor-only, so the underside has no vy
-    test at all. Read that before building anything here.
+    The underside is not unmeasured anyway -- the gate has already been measured
+    separately, including that the 5.0 threshold is hitGround's and floor-only,
+    so the underside has no vy test at all.
 
     Original intent, left for whoever tries again:
 
@@ -3151,7 +3150,7 @@ def build_holdjump(mode: str, mini: bool = False, speed: int = 0) -> str:
     rather than by a portal -- no portal tick, no size change, nothing else that
     could account for a jump.
 
-    The question it exists for (brief-022): the CUBE re-jumps on a button that is
+    The question it exists for: the CUBE re-jumps on a button that is
     merely HELD, and the model now mirrors GD's m_jumpBuffered to say so. For the
     ROBOT the disassembly says it cannot -- updateJump's robot arm needs
     [player+0x986] as well as m_jumpBuffered (0x38ba3c..0x38ba51) and clears
@@ -3300,7 +3299,7 @@ TRIG_ROTATE = 1346
 K_CENTER, K_DEGREES, K_TIMES360, K_LOCKROT = 71, 68, 69, 70
 
 
-# ---- brief-013: the same saws in the OTHER flag world (2026-09-02) ---------
+# ---- The same saws in the OTHER flag world (2026-09-02) ---------
 # WHY. hazardHit sends a circle hazard down branch B (the player's rect plus
 # corner discs) wherever sawRectHalfB has a measurement, and down branch A
 # (circle against circle) only where it has none. ALL of that measurement --
@@ -3340,7 +3339,7 @@ KA39_STATIONS = [
      "of 2.968 where GD's is still 4.00. The axis boundary tells them apart, "
      "1.03 px. 31x23 is also not a multiple of 30, so this one station also "
      "separates the two pivot conventions -- getRealPosition against the rect "
-     "centre -- which is the other thing brief-013 asks a rig to settle"),
+     "centre -- which is the other thing this rig is meant to settle"),
     (918, 4000, 0.0, 0,
      "r=24, larger than every mode's half, so B's corner arcs DO reach and the "
      "branches straddle: A is wider on the axis and narrower on the diagonal. "
@@ -3412,7 +3411,7 @@ def _ka39_rig(mode: str, mini: bool, spin: bool) -> str:
     return ";".join(parts) + ";"
 
 
-# ---- brief-004b: the flip window, with the LAUNCH taken off the flip -------
+# ---- The flip window, with the LAUNCH taken off the flip -------
 # WHY A NEW RIG AT ALL. The probe this replaces could not be built: a blue pad
 # leaves the player upside-down and injecting it back onto the same pad does not
 # re-fire it (GD keeps the contact as spent), so "upright again, and recently
@@ -3436,7 +3435,7 @@ def _ka39_rig(mode: str, mini: bool, spin: bool) -> str:
 # Ordered by increasing delay, so a single natural run walks the ladder and, if
 # the window is real, dies at the first rung outside it: the death x names the
 # boundary without any bisection at all.
-FLIP_ARM_ID = 1859          # the ceiling arm (GameObjectType 40, brief-005)
+FLIP_ARM_ID = 1859          # the ceiling arm (GameObjectType 40)
 FLIPWIN_PITCH = 1600.0      # between rungs; nothing of one reaches the next
 # TWO PORTAL BOXES MUST NOT OVERLAP. A gravity portal is 25 wide, so the player
 # (30 wide) is inside both at once for any separation under 55 px, and while it
@@ -3539,7 +3538,7 @@ def build_flipwin(mode: str = "cube", mini: bool = False,
 def build_cpride() -> str:
     """A floor that RISES while the player stands on it, for checkpoint work.
 
-    brief-018's hole 4 is that obj+0x4d0/0x4d4 -- the position the rotation
+    The open question here is that obj+0x4d0/0x4d4 -- the position the rotation
     pass snaps at the head of a tick, and the source of the speed a surface
     carries its rider at -- is saved into m_vectorSavedObjectStateRef but not
     written back on a restore. Whether that matters was never measured, and it
@@ -3604,7 +3603,7 @@ def build_cpriderot() -> str:
 def build_cprot() -> str:
     """A rotate AND a move in flight on the SAME group, for checkpoint work.
 
-    brief-018's 9b asks whether a mid-flight action survives a checkpoint
+    The question here is whether a mid-flight action survives a checkpoint
     restore. Two Moves on separate groups already came back exact; the classes
     still untested are a Rotate and two actions on one group, and this rig is
     both at once -- which is also the shape lv21 and lv22 are full of.
@@ -3643,7 +3642,7 @@ def build_cprot() -> str:
 
 
 def build_expease() -> str:
-    """Where do GD's Exponential easings actually STOP? (brief-015)
+    """Where do GD's Exponential easings actually STOP?
 
     Three blocks, one per easing, all given the SAME offset by their own Move
     trigger, all firing at the same x. Reading the three terminals against each
@@ -4157,7 +4156,7 @@ def build_slopeland4() -> str:
 
     slopeland3 pinned m=-0.5 and cube and swept only K (the ride ticks up to the
     crossing), which produced the gate "descent >= pH*sqrt(1+m^2)". But THE
-    CORPUS CONTRADICTS IT (findings 2026-08-19 night 3: the clamping cases
+    CORPUS CONTRADICTS IT (measured 2026-08-19: the clamping cases
     8.07/14.53/28.55 and the pass-through cases 8.88/12.98/19.37/38.7 perfectly
     interleave by descent).
     This rig is 3 values of |m| x 6 values of K x 2 ramps, so |m| can be swept
@@ -4549,8 +4548,8 @@ def recttop_unit(x: float, mode: str, m: float, mini: bool, n_down: int
     ramp and seats there (descent 0). From then on it crosses rTop exactly once
     per ramp, so one unit yields n_down CROSSING SAMPLES. The point is that the
     ramp index (its own ramp, or one past a seam) is what varies -- since the
-    descent has been ruled out as the discriminator (findings 2026-08-19
-    night 3), this is the next candidate.
+    descent has been ruled out as the discriminator (measured 2026-08-19),
+    this is the next candidate.
     """
     objs: list[str] = []
     oidU, rotU, fxU, fyU, wU, hU = RAMP[1.0]      # the climb is always |m|=1 (30x30)
@@ -5917,7 +5916,130 @@ def build_coingate8() -> str:
     return build_coingate()
 
 
+# ---- Coins behind something entered FIRST (route rigs, 2026-09-26) ------------
+# Not calibration rigs: small levels whose coins each need a box or a key entered
+# before they can be taken, some of them far before, so that what the loop does
+# about a coin's prerequisite can be measured without a real level's model
+# divergences or its weight in the way. The prerequisites are read by the mod's
+# own census (src/solver/route.hpp); nothing here is handed to the solver.
+# SYNTHETIC: every object below is placed by this file (data/rigs/route1.lvl and route2.lvl are its
+# output). They are not copies or excerpts of any published level; the only thing borrowed is the
+# key object's id and property set, which an official level (SubZero) uses.
+KEY_OBJ = 1275          # SubZero 4002's key (uid 6166): 36=1, 51 target, 382=1, 56=1
+K_TOUCH = 11            # "touch triggered" (build_coingate variant 7)
+
+
+def build_route1() -> str:
+    u"""Three coins on one cube floor at 1x.
+
+      A  x=600   a plain coin on the floor line -- the control
+      C  x=2400  a coin in group 11, switched OFF at the start and ON by a
+                 touch-triggered Toggle at (2250, 165): a LOCAL box, one jump
+                 before the coin, above the floor line (any jump reaches it, the
+                 floor line passes 30 px under it)
+      B  x=3250  a coin at y=255 over a platform in group 10 (blocks at y=150,
+                 x=3100..3400), switched OFF at the start and ON by the KEY at
+                 (1400, 185) -- 1,850 px earlier, on a raised platform (blocks
+                 at y=150, x=1110..1710) reached only by a jump from a step
+                 block at x=1000. The floor line passes under both raised
+                 platforms (15 px clear). Without the platform at x=3250 the
+                 coin is out of reach (a jump from the step at x=2990 tops out
+                 about 55 px short); with it, a jump from the platform reaches it.
+
+    Heights (world): floor top 90, a cube on it at 105; a jump rises about 65
+    (the first cut assumed 72 and put C's box out of reach -- the DP dropped
+    every state at the box's far edge); a step block tops at 120; the raised
+    platforms are 135..165.
+    """
+    objs: list[str] = []
+    # coins
+    objs.append(obj(COIN_USER, 600.0, GROUND_TOP + 15.0))
+    objs.append(_coin_in_group(2400.0, GROUND_TOP + 15.0, 11))
+    objs.append(_coin_in_group(3250.0, 255.0, 12))   # the coin itself is not switched
+    # C: off at the start, on by a touch box
+    objs.append(obj(TRIG_TOGGLE, -29.0, 300.0, extra={K_TARGET: "11", K_ACTIVATE: "0"}))
+    objs.append(obj(TRIG_TOGGLE, 2250.0, 165.0, extra={K_TARGET: "11", K_ACTIVATE: "1",
+                                                      K_TOUCH: "1"}))
+    # B: the platform under the coin, off at the start
+    objs.append(obj(TRIG_TOGGLE, -29.0, 330.0, extra={K_TARGET: "10", K_ACTIVATE: "0"}))
+    x = 3100.0
+    while x <= 3400.0:
+        objs.append(obj(BLOCK, x, 150.0, extra={K_GROUPS: "10"}))
+        x += GRID
+    objs.append(obj(BLOCK, 2990.0, GROUND_TOP + 15.0))        # the step up to it
+    # B's key, on the raised platform far before, and the step up to that
+    objs.append(obj(BLOCK, 1000.0, GROUND_TOP + 15.0))
+    x = 1110.0
+    while x <= 1710.0:
+        objs.append(obj(BLOCK, x, 150.0))
+        x += GRID
+    objs.append(obj(KEY_OBJ, 1400.0, 185.0, extra={36: "1", K_TARGET: "10", 382: "1",
+                                                  K_ACTIVATE: "1"}))
+    for x0, kind in ((600.0, "plain"), (2400.0, "local_box"), (3250.0, "far_key")):
+        UNITS.append({"x0": x0 - 300.0, "x1": x0 + 300.0, "coin_x": x0, "id": COIN_USER,
+                      "kind": kind})
+    # Floor LAST = larger uids (build_ramps' lesson).
+    objs += floor_run(0, 4200.0)
+    return header() + ";" + ";".join(objs) + ";"
+
+
+def _raised(x0: float, x1: float, group: str | None = None) -> list[str]:
+    """A raised platform (blocks centred at y=150: 135..165) the floor line passes under."""
+    out, x = [], x0
+    while x <= x1:
+        out.append(obj(BLOCK, x, 150.0, extra={K_GROUPS: group} if group else None))
+        x += GRID
+    return out
+
+
+def build_route2() -> str:
+    u"""A CHAIN: coin B needs key K2, and K2's ledge needs key K1 -- 5,600 px of floor
+    between K1 and the coin, with a local box and a plain coin on the way.
+
+      A   x=600    plain coin, the control
+      K1  x=1400   key on raised platform R1 (x=1110..1710, from the step at x=1000);
+                   switches ON group 11 = the step P0 at x=3500
+      K2  x=3700   key on raised platform R2 (x=3610..4210); the only way up is the
+                   step P0, off from the start -- without K1 the floor line passes
+                   under R2; switches ON group 10 = the platform P1 under coin B
+      C   x=5200   coin in group 12, off from the start, on by a touch box at
+                   (5050, 165) -- local, one jump before it
+      B   x=7000   coin at y=255 over P1 (x=6850..7150, group 10, off from the
+                   start); the step up to it at x=6740 is always there
+    Heights as in route1. Nothing here is handed to the solver: the mod's census
+    reads the chain off the objects (src/solver/route.hpp).
+    """
+    objs: list[str] = []
+    objs.append(obj(COIN_USER, 600.0, GROUND_TOP + 15.0))
+    objs.append(_coin_in_group(5200.0, GROUND_TOP + 15.0, 12))
+    objs.append(_coin_in_group(7000.0, 255.0, 13))
+    for g, yy in (("10", 300.0), ("11", 330.0), ("12", 360.0)):
+        objs.append(obj(TRIG_TOGGLE, -29.0, yy, extra={K_TARGET: g, K_ACTIVATE: "0"}))
+    # K1 and its ledge
+    objs.append(obj(BLOCK, 1000.0, GROUND_TOP + 15.0))
+    objs += _raised(1110.0, 1710.0)
+    objs.append(obj(KEY_OBJ, 1400.0, 185.0, extra={36: "1", K_TARGET: "11", 382: "1",
+                                                  K_ACTIVATE: "1"}))
+    # K2, its ledge and the step only K1 brings
+    objs.append(obj(BLOCK, 3500.0, GROUND_TOP + 15.0, extra={K_GROUPS: "11"}))
+    objs += _raised(3610.0, 4210.0)
+    objs.append(obj(KEY_OBJ, 3700.0, 185.0, extra={36: "1", K_TARGET: "10", 382: "1",
+                                                  K_ACTIVATE: "1"}))
+    # C's local box
+    objs.append(obj(TRIG_TOGGLE, 5050.0, 165.0, extra={K_TARGET: "12", K_ACTIVATE: "1",
+                                                      K_TOUCH: "1"}))
+    # B: the step and the platform K2 brings
+    objs.append(obj(BLOCK, 6740.0, GROUND_TOP + 15.0))
+    objs += _raised(6850.0, 7150.0, "10")
+    for x0, kind in ((600.0, "plain"), (5200.0, "local_box"), (7000.0, "chain_k1_k2")):
+        UNITS.append({"x0": x0 - 300.0, "x1": x0 + 300.0, "coin_x": x0, "id": COIN_USER,
+                      "kind": kind})
+    objs += floor_run(0, 7800.0)
+    return header() + ";" + ";".join(objs) + ";"
+
+
 BUILDERS = {"probe": build_probe, "slopes": build_slopes,
+            "route1": build_route1, "route2": build_route2,
             "coincal": build_coincal,
             "coingate": build_coingate, "coingate2": build_coingate2,
             "coingate3": build_coingate3, "coingate4": build_coingate4,
@@ -5936,7 +6058,7 @@ BUILDERS = {"probe": build_probe, "slopes": build_slopes,
             "sawcal_wave_mini": lambda: build_sawcal_mode("wave", True),
             "sawcal_ship_mini": lambda: build_sawcal_mode("ship", True),
             "sawcal_cube_mini": lambda: build_sawcal_mode("cube", True),
-            # brief-2026-09-15. The lethal boundary of a SPIKED ramp, which no
+            # The lethal boundary of a SPIKED ramp, which no
             # rig has ever put a player against (calib_slopeflags carries the
             # two ids but rides nothing). Both ids in every file: 366 is |m| = 1
             # and 367 is |m| = 0.5, which is what separates a vertical offset
@@ -5969,7 +6091,7 @@ BUILDERS = {"probe": build_probe, "slopes": build_slopes,
             "sawcalmv_spider": lambda: build_sawcal_moved("spider"),
             "sawcalmv_ship_mini": lambda: build_sawcal_moved("ship", True),
             "sawcalmv_cube_mini": lambda: build_sawcal_moved("cube", True),
-            # brief-013. Generate each of these TWICE, with and without
+            # Generate each of these TWICE, with and without
             # --ka39; the pair is the experiment and one arm alone says
             # nothing (see the KA39_STATIONS note).
             "sawcal39_cube": lambda: _ka39_rig("cube", False, False),
@@ -5980,7 +6102,7 @@ BUILDERS = {"probe": build_probe, "slopes": build_slopes,
             "sawcal39_spider_mini": lambda: _ka39_rig("spider", True, False),
             "sawrot39_cube": lambda: _ka39_rig("cube", False, True),
             "sawrot39_spider": lambda: _ka39_rig("spider", False, True),
-            # brief-004b. Generate each with and without the 1859s: the pair
+            # Generate each with and without the 1859s: the pair
             # is what separates the flip-grace arm from the arming arm.
             "flipwin_cube": lambda: build_flipwin("cube"),
             "flipwin_cube_armed": lambda: build_flipwin("cube", armed=True),

@@ -24,8 +24,9 @@ import argparse
 import re
 from pathlib import Path
 
-BRO = Path(r"C:\GD\build\_deps\bindings-src\bindings\2.2081\GeometryDash.bro")
-OUT = Path(r"C:\GD\src\po_members.inc")
+REPO = Path(__file__).resolve().parents[1]
+BRO = REPO / "build" / "_deps" / "bindings-src" / "bindings" / "2.2081" / "GeometryDash.bro"
+OUT = REPO / "src" / "po_members.inc"
 
 # Only types confirmed unable to contain a pointer. Anything not here is OPAQUE.
 SCALAR_TYPES = {

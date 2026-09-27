@@ -92,8 +92,10 @@ inline void logVisitCrashSwallowed() {
                   s_count);
 }
 
-// Mode of the on-screen panel. The panel itself is in ui_panel.hpp; the mode lives here because
-// both loadConfig (cfg `uimode=`) and the session setup, which come earlier in the chain, need it.
+// Mode chosen on the play menu, the popup a level's play button opens (hooks_playmenu.cpp). The
+// mode lives here because both loadConfig (cfg `uimode=`, which presets it for the session setup;
+// the menu opens on what the level has stored) and the session setup, which come earlier in the
+// chain, need it.
 //
 // The numbering is append-only: `uimode=1` has meant Replay since before Solve existed.
 inline constexpr int UI_MODE_NORMAL = 0;   // the game as it is; the mod only watches
@@ -110,11 +112,17 @@ inline const char* uiModeName(int m) {
 }
 
 inline int g_uiMode = UI_MODE_NORMAL;
-// ...and the panel's second switch, shown only in Replay and Solve: whether that session is about
+// ...and the menu's second switch, shown only in Replay and Solve: whether that session is about
 // the level's coins. Solve then routes for every coin as well as the end (cfg coinroute), and
 // Replay plays the coin solution rather than the plain one. The two kinds of solution are kept in
 // separate files (Config::coinFiles), so neither mode overwrites the other's.
 inline bool g_uiCoins = false;
+// The level the menu's Start was pressed for. PlayLayer::init starts a session only for this
+// level, and disarms it whatever it decides: the choice is made per play, not left standing.
+// A standing mode is what the old corner panel had, and there it was visible; a menu that has
+// closed is not, so a Solve left armed would start on the next level entered by any path the
+// menu does not hook. Held by address, never dereferenced -- it is only compared.
+inline const void* g_uiArmedLevel = nullptr;
 
 // F8: temporarily toggle between fast mode and realtime (spectating hotkey)
 inline bool g_realtimeOverride = false;

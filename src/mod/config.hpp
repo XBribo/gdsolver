@@ -64,6 +64,15 @@ struct Config {
     // The generator is py/mklevel.py; the measured table of placeable objects is
     // py/objpalette.py.
     std::string levelFile;
+    // levelfiletype=main: build that level as a MAIN (official) level rather than an editor
+    // one. Measured 2026-09-22: in an editor-type level GD loads none of the secret coins
+    // (id 142) -- the coin rig in py/mklevel.py placed 22 and kept none, and six official
+    // spin-off levels with three each came up `pois: ... 0 coins` -- while the same kind of
+    // level built as a main level loads all three and credits them (coingd 3/3). User coins
+    // (id 1329) load either way: calib_coincal.lvl gives `3 coins` and the same pickup ticks
+    // as editor and as main. Off by default: a rig is an editor level, and nothing that
+    // already runs changes.
+    bool levelFileMain = false;
     int maxAttempts = 1;
     float delaySec = 2.f;
     bool quitWhenDone = true;
@@ -80,6 +89,12 @@ struct Config {
     bool progressBlock = true;
     float fastdt = 0;   // >0: fast mode. dt passed per update call (e.g. 1.0 = 240 ticks)
     int fastloops = 1;  // in fast mode, number of update calls per rendered frame
+    // cfg `framebudgetms`: in fast mode, also end the frame's batch once this much wall time has
+    // gone (0 = off: the batch is always `fastloops` calls, as it was). A batch is 7,200 ticks,
+    // which is 0.4 s on lv1 and 8-18 s on a custom level (400-900 ticks/s), long enough for
+    // Windows to call the game "not responding". Only the panel's solve turns it on
+    // (uiConfigureSession); an autorun session keeps the fixed batch unless asked.
+    double frameBudgetMs = 0.0;
     bool skipRender = false; // skip rendering of the game layer in fast mode
     bool noTrace = false;    // stop trace/dump writes (for speed-first runs)
     // cfg `dpselftest=1`: build the objrects table in memory, hand it to the solver core that
@@ -145,6 +160,212 @@ struct Config {
     // budget), while an actually-unsolvable wall still gives up in well under a minute of extra
     // wall clock rather than running unbounded.
     int dpMaxIters = 200;
+    // cfg `dptopstop=K` (0 = off): the same report, reached when the search has spent K rounds at
+    // its largest capacity (the last of kCapTiers) without getting deeper. Without it such a run
+    // is stopped by the harness' wall clock, and a round at that size is the slowest there is
+    // (SubZero 4002 spent 4,410 s on 20 of them and got nowhere). K is derived rather than
+    // chosen: over 129 SubZero cold logs, all 18 visits to the top tier that got deeper did so
+    // within 8 rounds -- nine of them on the way to clearing the level -- so K <= 8 would have
+    // cut one of those. Of the 28 visits that never got deeper, four stayed 12 to 60 rounds.
+    // A round count since the last new depth was measured too and rejected: 4003 has cleared 76
+    // rounds after its last new depth, which leaves no useful N.
+    int dpTopStop = 0;
+    // cfg `dpcaptiers=0` (1 = on, the default): escalate() skips the capacity tiers (kCapTiers in
+    // repair.hpp), so the restart from the start comes next and runs at the base setting instead
+    // of inheriting the top tier's 40,000 states for the whole level. Asked because, over the
+    // spinoff cold logs (2026-09-26), a restart at the top tier cost 16,263 s in 125 runs for one
+    // real step forward, the escalation job itself returned no plan 159 times in 170, and a
+    // model-only first plan from t=0 never needed more than 2,000 on official lv1-22 (lv20-22 stop
+    // at the same tick at 40,000). The tiers did carry SubZero 4003 and two custom levels to the
+    // end in runs without a section solve -- which is what an A/B with this off has to answer.
+    int dpCapTiers = 1;
+    // cfg `dpsectierfirst=1` (0 = off, the default): when the ladder finds no anchor, the wall goes
+    // to a section solve before the capacity is raised (escalate() in repair.hpp) -- one window per
+    // escalation, each further back, as autoFire draws them -- and only a wall none of those
+    // windows crossed goes on to the next tier. The user's order (2026-09-26): a full frontier is
+    // usually a divergence, so the game's own search goes first, and more states only after it.
+    int dpSecTierFirst = 0;
+    // cfg `dpsecmaxback=N` (0 = no limit, the default): no section-solve window begins more than N
+    // ticks before its wall (repair.hpp autoWindow, where the measurement is); a wall whose next
+    // window would is done, and with dpsectierfirst the capacity tier comes next.
+    int dpSecMaxBack = 0;
+    // cfg `dpwalkgates=1`: the single-trajectory walks fire the item gates the search's step does
+    // (dp --walkgates) -- the witness resim inside every search, and the fixup recorder's replay,
+    // which under coinroute also takes --coins and --items so it has the gate tables and the same
+    // item givers the search reads. Off: the replay stays as it was, with no coin arguments.
+    // ON BY DEFAULT (`dpwalkgates=0` turns it off). Without coinroute
+    // it only adds --walkgates, which dp now defaults to anyway and which is inert without --coins.
+    bool dpWalkGates = true;
+    // cfg `coinmissrev=1` (off): the coinroute attempt cut (hooks_gamelayer.cpp) skips the coins
+    // dp's search does not call missed when passed (Outcome::coinNoPrune -- something past them
+    // turns the player round). Without it the cut ends the attempt on the way out past a coin the
+    // plan collects on the way back.
+    bool coinMissRev = false;
+    // cfg `coinmissmove` (on; 0 = off): the same cut leaves a coin alone while a Move that carries it
+    // (solver::g_coinMoveX, not spawn-fired) still lies ahead of the player, and for good once past
+    // it when the search also does not call the coin missed (a reverser beyond it). Narrower than
+    // coinmissrev, which spares every coin with any reverser past it and so loses the signal for
+    // coins that are never revisited (SubZero 4002's first two).
+    bool coinMissMove = true;    // ON BY DEFAULT with the SubZero coin set (0 = off)
+    // cfg `groupsretime` (on; 0 = off): the live moving-geometry recording (harvestGroups) is replaced by
+    // a SHALLOWER replay's when the two replays' player x parted before that replay died. The
+    // recording is indexed by tick, and a route that skips a speed portal reaches the same x
+    // hundreds of ticks later, so the deepest record is out of phase for it from where they part.
+    // Measured on SubZero 4002: the two-coin route missed the 3x portal at x=11,655 and arrived
+    // 1,901 ticks late; the kept record was the coin-less route's, and the model killed a line GD
+    // flies on a spike that the record had already moved 107 px up.
+    bool groupsRetime = true;    // ON BY DEFAULT with the SubZero coin set (0 = off)
+    // cfg `coinmisspost` (on; 0 = off): a clear refused for a missing coin (hooks_playlayer.cpp) is filed
+    // as a coin miss at the attempt's CLOSEST APPROACH to the first coin it missed, instead of as a
+    // death at the finish line. On a level that turns or reverses, the attempt cut never fires
+    // (passing a coin says nothing there), so the refused clear is the only miss the loop hears --
+    // and filed at the goal it sends the ladder thousands of ticks away from the coin.
+    bool coinMissPost = true;    // ON BY DEFAULT with the SubZero coin set (0 = off)
+    // cfg `coinoverdepth` (on; 0 = off; with coinmisspost): an attempt that has every coin the deepest
+    // plan had, and has taken in the game a coin the deepest plan missed, is progress whatever tick
+    // it died on. coinmisspost ranks the deepest plan at its closest approach to that coin, which is
+    // a tick on ITS route; the new attempt's death is a tick on another, so the two ticks do not
+    // compare. Measured on SubZero 4002 (4619661, 2026-09-26): a section solve took coin 3 (GD
+    // credited it at t=21,334), the flight died at t=21,477, and the loop rewound onto the coin-less
+    // plan ranked at t=21,552 -- the only three-coin plan of the run, thrown away for 75 ticks.
+    bool coinOverDepth = true;   // ON BY DEFAULT with the SubZero coin set (0 = off)
+    // cfg `coinapproachoff` (on; 0 = off): a coin's closest approach (coinmisspost's rank) is also taken
+    // over the ticks its group was switched off, and the later of that and the on-only approach is
+    // the one used. SubZero 4003 (2026-09-26): the third coin's group is off from t~10,274 on every
+    // attempt; the failing route passed it at 102 px at t=13,557 but was ranked at t~9,650, 1,336 px
+    // away, where no repair reaches it -- and the route GD credited it to took it at t=13,707.
+    bool coinApproachOff = true; // ON BY DEFAULT with the SubZero coin set (0 = off)
+    // cfg `routeprereq` (off; 1 = on; only a coin session builds the census): a coin that needs
+    // something entered first (solver/route.hpp: the
+    // touch box, key or toggle block whose chain switches the coin, or a platform/orb near it, on)
+    // is ranked, in an attempt that has not switched that on, at the attempt's closest approach to
+    // the BOX rather than to the coin (coinmisspost's rank), and the search anchored before the box
+    // is told to enter it (--needtrig-uid). SubZero 4002's second coin: its platforms come on only
+    // from the key 4,314 px before it, and every repair went to the coin. Until a coin is engaged
+    // (the fallback below) nothing reads the census, so the loop and the DP argv are the old ones.
+    // OFF BY DEFAULT: with the SubZero coin set on, SubZero 4001's coin-on cold took 33 rounds with
+    // it on and with it off (four runs, one last [fp]), and over the official 22 it never engaged
+    // either way. It stays for what the chain rig route2 shows: on, 9 rounds; off, no anchor past
+    // the second key.
+    bool routePrereq = false;
+    // cfg `routeprereqafter=N` (10): ...and only for a coin the loop has not got by itself -- N
+    // rounds after its miss was filed without GD crediting it, or when the ladder has run out of
+    // anchors (escalate), whichever comes first. 0 = from the filing on. The model's own repairs at
+    // the coin come first: on trunk 2a20c92 SubZero 4002's second coin fell to them 8 rounds after
+    // the filing, and going to the key at once cost the run its clock (2 of 2 runs).
+    int routePrereqAfter = 10;
+    // cfg `dpsecauto` (on; 0 = off): the loop fires a section solve as a rung (see secrung in session.hpp)
+    // by itself, at the deepest wall, when one of the signals below says point fixes are not
+    // getting it across. As many rungs per wall as it takes, each from further back -- 200, 400,
+    // 800 ticks, then 800 more each time -- until one from the level's first tick has failed too
+    // (repair.hpp autoWindow). The first window: from the head of the fixups recorded
+    // at the wall (or 200 ticks before the death if there are none) to dpsecmargin ticks past
+    // the death -- measured on four walls of lv4003 under an older model: a window that ends
+    // before the death does not cross a death
+    // the model cannot see, and one that starts 100 ticks before it is already too late.
+    // Unless the session sets secsnap/secverifyevery itself, the rung searches with the player
+    // snapshot and a cross-check every 20 layers (see autoFire).
+    // The thresholds have no settled value yet (the search is still being made faster), so
+    // both are 0 = off unless the session names them; the pinned-out signal needs none.
+    // On by default since 2026-09-25, with dpsecrent, dpsecreuse and dpsecchain: the rung is the
+    // loop's last line -- it searches the game itself -- and since 1c2de49 it also works in dual
+    // sections (official lv16 with coins, cap ladder and grid off: timeout -> 43 rounds; a custom
+    // level with the ladder: 37 rounds, where every laddered run had timed out).
+    bool dpSecAuto = true;
+    int dpSecStall = 0;     // cfg `dpsecstall`: rounds spent at the deepest wall (the same wall
+                            // until the deepest death moves kAutoCreep ticks, repair.hpp)
+    int dpSecNoRec = 0;     // cfg `dpsecnorec`: deaths there in a row the recorder wrote nothing for
+    int dpSecMargin = 54;   // cfg `dpsecmargin`: how long past the death (ticks) the rung's
+                            // answer has to stay alive -- about the 70 px the measured
+                            // windows ended past it, at normal speed
+    int dpSecCap = 100;     // cfg `dpseccap`: the search's frontier cap
+    // cfg `dpsecchain` (on; 0 = off; needs dpsecauto): a wall right behind the pin -- the splice died
+    // within kAutoCreep ticks of its end, which leaves the ladder nothing to plan with -- doubles
+    // the next window's margin, and doubles it again for each such wall in a row (up to 8x).
+    // Coin-off SubZero lv4001 with dpsecauto: 43 rungs, 30 of them 2-9 ticks past the last pin,
+    // each window 254 deep and each advancing ~57 ticks -- 10,922 layers searched for 3,732 ticks.
+    bool dpSecChain = true;
+    // cfg `dpsecchainspan`: how far past the pin (ticks) a wall still counts as right behind it.
+    // 30 is the wall's own identity (kAutoCreep); on lv4003's wave, with the fitted prices and
+    // the leaf from the middle, the walls came 10-90 ticks past each pin, so most links of a
+    // 13-rung chain reset the margin instead of doubling it.
+    int dpSecChainSpan = 30;
+    // cfg `dpsecpinback` (-1 = off): with dpsecauto, a wall less than 100 ticks past the pin starts its window this
+    // many ticks before the pin rather than 200 before the death. On SubZero 4003 (81179e8) 28 of
+    // 52 rungs were such walls, each re-searching 100-190 ticks the previous splice had already
+    // crossed in the game, at depths 254-416: 183 of the 277 s the rungs searched. Walls 100+ past
+    // the pin start at the pin already and ran 159-238 deep. Not at the pin itself: many of those
+    // walls are 10-30 ticks past it, where the state the splice left may already be lost.
+    // 60 by default: 4003 762 -> 653 s (82 -> 77 rounds, rungs 53 -> 48, search 296 -> 213 s,
+    // every rung still solved on its first try); 4001 and 4002 never have such a wall, [fp] identical.
+    int dpSecPinBack = 60;
+    // cfg `dplearnresets` (-1 = no limit, the old behaviour): how many times one wall (one value of
+    // the best death) may send the ladder back to its shallowest rung because a round recorded
+    // fixups. On a custom level, x=29,779: a ship ring GD fires a tick before the model re-fired in the
+    // model after every re-anchor, so each round wrote one record one tick later and reset the
+    // ladder -- 13 rounds in a row, the backoff never past 96, while the route needed the anchor
+    // 105-119 ticks back (repair.hpp, the reset). 1 = the first lesson at a wall reopens it.
+    // Off by default (-1): the stall it was written for was not reproduced in a cold run, so
+    // there is no consumer yet whose wall is shown to be this reset repeating. On official lv16
+    // a cap of 1 took 21 rounds to 19, which alone does not justify changing the default.
+    int dpLearnResets = -1;
+    // cfg `secdriftwhere=1` (diagnostic): at each psnap cross-check, print where the node that
+    // drifted most first left its own ancestors (`secdrift:` line).
+    bool secDriftWhere = false;
+    // cfg `dpsecstateprice` / `dpseccallprice`: what dpsecrent charges a DP search, per carried
+    // state and per call, in microseconds (repair.hpp workDpState).
+    double dpSecStatePrice = 1.75;
+    double dpSecCallPrice = 950000.0;
+    // cfg `dpsecsolved` (off, needs dpsecauto): a plan that claimed the goal dying at the deepest
+    // wall is a signal of its own -- the model got to the end and one stretch of it is wrong, so
+    // that stretch goes to a section solve at once instead of after the rounds a stall needs.
+    // The death's fixup recorder still runs first (the window's entry is where its records start).
+    // Expected to lose where one repair round crosses the wall, which is most walls (coin-off
+    // SubZero, dpsecauto off: 16 of 20 walls on 4001 and 13 of 24 on 4002 took one round, at
+    // 6.7 and 15.8 s a round, against a rung of about 12.5 s search plus its replays).
+    bool dpSecSolved = false;
+    // cfg `dpsecreuse` (on; 0 = off): the rest of the plan a rung was fired from stays the rejoin target
+    // of the search after the splice (g_rjKeepTarget in repair.hpp), so the next plan can come
+    // back onto it and keep its inputs. Not pasted after the window: see the rung in
+    // hooks_gamelayer for what that did.
+    bool dpSecReuse = true;
+    // cfg `dpsecrent` (on; 0 = off; needs dpsecauto): fire when the work the loop has spent at the
+    // deepest wall -- the rounds that failed to pass it: their searches' states, the recorder's
+    // replayed ticks, the ticks flown -- reaches what a rung is expected to cost (the mean of this
+    // run's rungs so far, or `dpsecrungprior` seconds' worth before the first). Counted, never
+    // timed: the same run must fire at the same rounds on a busy machine (repair.hpp kWork*).
+    // The rent-or-buy rule: it never pays more than twice what the better of "keep repairing" and
+    // "solve the section" would have, and the boundary comes from the run's own costs instead of
+    // a count. Why a count is wrong: a round at the end of 4001 costs a median 3.5 s (the model
+    // plans only what is left), one on 4002 16 s, and a rung about 17 s on either.
+    bool dpSecRent = true;
+    int dpSecRungPrior = 15;
+    // cfg `dpseccoinrung` (on; 0 = off; with dpsecauto, under coinroute): the rung's wall is the COIN WALL --
+    // the last cut for a coin, on the plan that was cut there -- until GD credits that coin, and the
+    // search there must take it (repair.hpp g_coinWall). Off, the rung goes to
+    // the deepest death as before.
+    bool dpSecCoinRung = true;   // ON BY DEFAULT with the SubZero coin set (0 = off)
+    // cfg `dpendtrigclear` (on; 0 = off): a clear GD raises short of the end portal is accepted when
+    // an End trigger (id 3600) fired in that attempt -- such a level finishes wherever the trigger
+    // fires. On by the user's ruling (2026-09-24, "an End trigger is a clear").
+    bool dpEndTrigClear = true;
+    // cfg `slice` (on; 0 = off): a solve whose level has at least `slicemin` objects the run
+    // cannot depend on is solved on a copy without them, and the plan that clears the copy is
+    // verified on the level itself before it is filed (mod/level_slice.hpp, solver/slice.hpp).
+    bool slice = true;
+    // cfg `slicemin=<n>`: how many objects the cut has to remove for the copy to be used. What
+    // the default (10,000) rests on is at kSliceMinDefault (level_slice.hpp).
+    int sliceMin = -1;   // -1 = kSliceMinDefault
+    // cfg `sliceaddbacks=<n>`: how many times a plan that did not hold on the level itself may
+    // put objects back into the copy around where the two parted before the solve moves to the
+    // level itself.
+    int sliceAddBacks = 2;
+    // cfg `slicecount=1`: print what the cut would remove and end the session without solving
+    // (a census of levels against the threshold).
+    bool sliceCount = false;
+    // cfg `slicenoposition=1`: the cut drops the decorations kept for being read as a position
+    // too -- wrong on purpose, to exercise the verification on the level and the add-back.
+    bool sliceNoPosition = false;
     // `dpseedplan=<path>`: skip the FIRST leveldp call and install this plan file instead, then
     // let the game verify it for real and search onward from wherever it actually lands. Empty
     // (the default) is a normal cold solve. See JobSeedPlan's note in repair.hpp for why this
@@ -190,7 +411,6 @@ struct Config {
     // lv20 pays 6 iterations and 7% for what lv16 gains 40 and 38% on; across the three dual
     // levels -- the only ones this can reach -- it is 2,205 s -> 1,975 s. lv20's heavy solves
     // (>= 10 s) move 806 -> 817 s, i.e. the extra iterations there are the cheap kind.
-    // GDSOLVER_LAB/oneoff/py/p2_gap_list.py reads the remaining gaps out of a run's log.
     // Always on since the flag clean-up. (the off arm, which A/B-ed the records back out, is gone.)
     // cfg `dpbandtrack`: hand the search the CAMERA's recorded flight band
     // (--bandtrack). On since 81f2a09; off is how that commit's remaining half is
@@ -215,9 +435,9 @@ struct Config {
     // entry, strictest first (rotSeedFor in repair.hpp) -- and 4 = S, the game's own
     // consumption loop replayed over the recording (rotseed::seedSim). Refused, and named, when a
     // cfg `dparg=--rotqueue` already turns the queue on for every call.
-    // On since AUD-20260921-21 (at A), paired with dpRotQToggle below: the queue
+    // On by default (at A), paired with dpRotQToggle below: the queue
     // without the toggle rule fires rotations the game only consumes (lv22 uid5809),
-    // so the two go on and off together. S since AUD-20260921-22, with dpTouchSeedNow:
+    // so the two go on and off together. On by default (at S) too, with dpTouchSeedNow:
     // on lv22 every anchored call's seed is derivable (122 of 122 against 46 of 157 at
     // A) -- derivable from S's rule, not independently checked in the game.
     // `dprotseed=A dptouchseednow=0` is the previous default, `dprotseed=0
@@ -254,6 +474,42 @@ struct Config {
     // model learns from flights the loop would never have made -- so two runs with it on are the
     // comparison, not one with and one without.
     bool dpCheck = false;
+    // cfg `dpcheckobs` (with dpcheck): watch only. A flight the game kills neither cancels the
+    // search nor teaches the model; the job's first such death is kept (later checkpoints are
+    // passed unflown), and once the job's plan is installed and flown the loop prints whether
+    // that plan shared the flight's inputs up to the death and died on the same tick
+    // (`[checkobs]` lines) -- how often work begun on a flight's death while the search still
+    // ran would have been the very work the loop does after it. Changes no decision.
+    bool dpCheckObs = false;
+    // cfg `dpcheckfirst` (with dpcheck): fly checkpoints during the FIRST solve only, and when one
+    // dies, stop that solve and hand the flight's own plan over as the first plan -- the loop flies
+    // it, it dies on the same tick, and the rounds go on as usual. The whole-level first solve is
+    // the loop's single largest waste on a level the model gets wrong early (coin-off SubZero,
+    // dpcheckobs: 4001's died at t=2,450, known 2.6 s into a 59 s search; 4002's at t=1,101, 4.8 s
+    // into 135 s), while flying the short step searches cost more in waiting than it saved.
+    bool dpCheckFirst = false;
+    // cfg `dpcontenthorizon` (0 = off): where the loop would plan the whole level, plan only to
+    // the first object newer than 1.7 past the anchor, plus one step (repair.hpp horizonFor).
+    // 1 = every such plan, 2 = the first solve only (the default: official lv16-22 1,841 ->
+    // 1,557 s with lv19/21 slower and lv17-19 in more rounds, SubZero 4001 239 -> 180 s and 4002
+    // 501 -> 398 s; one run each).
+    int dpContentHorizon = 2;
+    // cfg `dpcapladder` (0 = off): pass --capladder <n> to the base searches (not the capacity
+    // tiers), so each one starts at cap n and raises it only around where it runs out of states
+    // (dp/cli.hpp cliMain). 125 by default together with dpinputgrid=2: official 22/22 in 116
+    // rounds against 181 without either (one Windows cold run each), and every added death at a
+    // place the plain run never died at. Of eight cleared custom levels it loses one, whose
+    // route then crosses the dual section (x~11,500-12,500) where the model and the game disagree:
+    // 61-148 fixups recorded there per run against 9, and game deaths with p1 exact and p2 160 px
+    // away.
+    int dpCapLadder = 125;
+    // cfg `dpinputgrid` (1 = off): pass --inputgrid <n> to the searches, so the button changes only
+    // on every n-th tick; repair.hpp baseArgs lifts it again once the loop escalates to a
+    // capacity tier or restarts. 2 by default, measured with dpcapladder above.
+    int dpInputGrid = 2;
+    // cfg `dpphaseprof` (print only): time every call into dp (`dpcall:`) and pass --phaseprof to
+    // the searches (`phaseprof: ... prep=`) -- repair.hpp timedSolve.
+    bool dpPhaseProf = false;
     // cfg `dpwatchfired=<uid>[,<uid>...]`: the dump's `firedw` column carries each listed
     // object's +0x28e byte (the flag checkSpawnObjects tests before it calls triggerObject)
     // on every tick. Empty by default, and then the column reads "-". Print only.
@@ -261,13 +517,27 @@ struct Config {
     // cfg `dprotqtoggle=1`: pass --rotqtoggle to the anchored solves and the fixup resims,
     // with --touchseed naming the touch Toggles the attempt had already entered by t0 (a
     // geometric test on its own recorded positions -- GD's touch recorder never sees a
-    // touch Toggle). On by default with dpRotSeed (AUD-20260921-21); `dprotqtoggle=0`
+    // touch Toggle). On by default with dpRotSeed; `dprotqtoggle=0`
     // turns it off.
     bool dpRotQToggle = true;
+    // cfg `dpspentpad` (on by default since 2026-09-26; `dpspentpad=0` turns it off): pass dp's --spentpad to the anchored
+    // solves and the fixup resims -- the pads GD had latched by t0 in this attempt (padseed,
+    // recorded where GD sets the latch, activatedByPlayer). GD fires a pad once per attempt;
+    // the model's State::usedPad starts empty at an anchor, so a pad fired and stepped off
+    // before t0 comes back live and the anchored model fires it again. On an old custom level,
+    // t=6,960: pad uid 2158 fired at ~6,922, the loop's anchor at 6,944 re-fired it at 6,960
+    // (the kitref replay parts from GD there; with --spentpad 2158 it follows GD to its death).
+    // The pads come from the attempt the anchor row belongs to (anchors::seeds, banked with the
+    // rows), not from the live recorder the next attempt's reset clears.
+    bool dpSpentPad = true;
+    // (cfg `dpspentorb` is gone: dp --spentorb, the rings this attempt fired before t0, is passed
+    // to the anchored solves and the fixup resims always since 2026-09-26. Without it an anchored
+    // model re-fires a ring GD spent just before t0 -- an old custom level, six kitref
+    // episodes anchored at 2,561 in a field of stacked rings. See spentOrbArg in repair.hpp.)
     // cfg `dptouchseednow`: --touchseed tests the recorded row's own y only, which is
     // dp's markTouched under the default --touchprey=button. Off (`dptouchseednow=0`), it
     // also accepts the previous row's y, the older --touchprey=parent reading
-    // (touchSeedArg in repair.hpp). On since AUD-20260921-22, with dpRotSeed = S.
+    // (touchSeedArg in repair.hpp). On by default, with dpRotSeed = S.
     bool dpTouchSeedNow = true;
     // Always on since the 0.2.0 flag clean-up, and no longer cfg keys:
     //   * anchored calls pass --touchentered, the touch boxes the attempt's recorded positions
@@ -345,7 +615,8 @@ struct Config {
     bool portalPayload = false;
     // Seed an anchored solve's history values that --start does not carry
     // (dp's --anchor-state owns=hist; version 1 = the press latch ->
-    // State::pressSpent). On by default since 2026-09-19, together with the two
+    // State::pressSpent, version 2 adds the Free Mode byte -> State::bandBranch).
+    // On by default since 2026-09-19, together with the two
     // rules that read the latch (--shipheldflap / --wavespentgate): with the
     // payload off they would read the latch's default after an anchor. A cold
     // run carried it on every call that has --start (421 of 421). Always on since the flag clean-up.
@@ -387,7 +658,7 @@ struct Config {
     int practiceAt = -1;     // turn practice mode ON at this tick
     int checkpointAt = -1;   // create a checkpoint at this tick
     int restoreAt = -1;      // restore at this tick (once only)
-    // cfg `snapat=t1,t2,...`: brief-017 part B. Take a checkpoint at EVERY tick
+    // cfg `snapat=t1,t2,...`: take a checkpoint at EVERY tick
     // in the list during one replay of a verified solution, so that a section
     // run can start from any window's entry without replaying the level again.
     // The trajectory the veto boxes are translated through is not a new output:
@@ -395,9 +666,9 @@ struct Config {
     std::vector<int> snapAt;
     // cfg `snapverify=N`: after the last window has gone by, restore each
     // snapshot and run N ticks, comparing against what this same pass did from
-    // the head. brief-017 part B wants this on every snapshot -- it is the
+    // the head. This is wanted on every snapshot -- it is the
     // acceptance that a section's entry is faithful, and it doubles as the
-    // regression detector for brief-018's five holes.
+    // regression detector for five known holes.
     int snapVerify = 0;
     // cfg `robodbg=t0,t1`: per-substep state over a tick range, from both the
     // plain replay and the section search (they share processCommands).
@@ -493,7 +764,9 @@ struct Config {
 
 inline Config g_cfg;
 inline bool g_started = false;
-inline bool g_uiSession = false; // this session was started from the on-screen panel
+// This session was started from the play menu (hooks_playmenu.cpp). Comments across the mod
+// call it a "panel" session, after the corner panel the menu replaced.
+inline bool g_uiSession = false;
 
 // ---- the level suite (autorun.cfg `levels=1,2,...`) ------------------------
 //
@@ -518,7 +791,7 @@ namespace suite {
 inline std::vector<int> g_levels;   // in the order they will be solved
 inline size_t g_at = 0;             // index of the one running now
 // The session has ended and the next level is waiting for the scene to be clear enough to
-// enter (see SuiteKeeper in ui_panel.hpp -- a level cannot be entered mid-transition).
+// enter (see SuiteKeeper in level_entry.hpp -- a level cannot be entered mid-transition).
 inline bool g_advance = false;
 inline int g_waited = 0;            // resident-poll ticks since the session ended
 inline int g_settle = 0;            // ...and ticks since the scene became enterable
@@ -526,6 +799,16 @@ inline int g_settle = 0;            // ...and ticks since the scene became enter
 inline bool active() { return !g_levels.empty(); }
 inline bool hasNext() { return active() && g_at + 1 < g_levels.size(); }
 inline int current() { return g_at < g_levels.size() ? g_levels[g_at] : 0; }
+
+// cfg `leveldir=<dir>` (default empty = off): a suite level whose ID is not one of the 22 main
+// levels is read from `<dir>/<id>.lvl` -- a raw level string, as `levelfile=` takes -- so levels
+// that exist only as files can be solved in one game too. Only that directory is read: an ID with
+// no file there refuses the suite rather than falling back to a saved or online level of that ID.
+// Main levels 1-22 are still entered by ID. With a directory set the IDs must be strictly
+// ascending, which fixes the order and refuses a duplicate. Checked once, at the first level
+// (level_entry.hpp suiteLevelSource). Kept here, not in Config, for the same reason as g_levels.
+inline std::string g_levelDir;
+inline bool g_levelDirChecked = false;
 
 }  // namespace suite
 // On the session's first resetLevel, turn practice mode OFF and wipe all checkpoints. If the
@@ -719,6 +1002,9 @@ inline bool g_pauseAtXFired = false;
 // as garbage deaths at t=660/1,837 on a prefix that had verified clean dozens of times). Set
 // there, consumed at the frame boundary next to dpsolve::poll().
 inline bool g_stallResetPending = false;
+// How many update calls the fast loop's last batch made (cfg framebudgetms cuts batches short;
+// the effect sweep advances by what actually ran).
+inline int g_lastBatchCalls = 0;
 // Whether to show the top-left HUD (cfg `hud=0` hides it). The player ends up behind the HUD
 // text, so hide it when filming
 inline bool g_hudOn = true;
@@ -878,6 +1164,8 @@ inline long long g_soundWhileSolving = 0;
 // that makes a sound with an EMPTY passed-tally is a sound that never went through the hooks at
 // all, and only the refused count can tell that apart from "the hooks are not being called".
 inline long long g_soundBlockedWhileSolving = 0;
+// Song seeks skipped while a section search ran (the FMODAudioEngine hook in hooks_system.cpp).
+inline long long g_secSongSeeksSkipped = 0;
 // Times the silence had to be imposed again on something already sounding (audio::sync).
 inline long long g_silenceReasserts = 0;
 // Reproduce retry (cfg `retryafter=<seconds>`). The retry button is really PlayLayer::resetLevel(),

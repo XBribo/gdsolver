@@ -8,6 +8,7 @@
 // includes frames.hpp and state.hpp and nothing includes reset.hpp except
 // cli.hpp, so there is no cycle.
 #include "dp/refwatch.hpp"
+#include "dp/search_census.hpp"
 
 namespace dp {
 
@@ -56,6 +57,13 @@ namespace dp {
 //     belongs to the call in flight, not to the one that finished; cliMain re-opens it at the
 //     search. (g_outcome IS reset, by cliMain itself, and for the opposite reason: a stale
 //     verdict must never be readable as this call's answer.)
+//
+// NOT STATE EITHER: the tables kept across calls on purpose (cli.hpp LevelTextCache,
+// GroupLayersCache with its g_groupLayersGen; triggers.hpp TrigRowsCache, GroupMembersCache). Each
+// is handed out only when the bytes it was made from are the same bytes, so a hit is what parsing
+// them again would give. The ladder's level cache (cli.hpp LadderLevelCache, g_ladder) lives for
+// one ladder: cliMain empties it when the ladder ends, and this runs between that ladder's
+// attempts, which is exactly what it must survive.
 //
 // WHEN ADDING A GLOBAL TO dp/, ADD IT HERE. The guard against forgetting is seqcall: run the
 // same arguments alone and after a loaded call and diff the plan.
@@ -118,7 +126,7 @@ inline void resetInvocationState() {
     g_resimUid = -1;
     g_resimObjX = 0.f;
     g_resimObjY = 0.f;
-    g_resimTrig = 0;
+    g_resimTrig = TouchMask{};
     g_resimFrame = -1;
     g_halfNow = 0;
     g_noSlopeSeat = false;
@@ -151,7 +159,7 @@ inline void resetInvocationState() {
     g_ufoCeil = 0.0;
 
     // dynamics.hpp
-    g_recPhase = 0;
+    g_recPhase = TouchMask{};
     g_autoTrig.clear();
     g_rotated.clear();
     g_rotSpec.clear();
@@ -162,6 +170,10 @@ inline void resetInvocationState() {
     g_touchEnteredT.clear();
     g_dynDbg = -1;
     g_formulaDriven = 0;
+    // The rotation router's counts (`rotplace:` prints them). The loader only adds to them, so
+    // in-process every call printed the sum over all the calls before it.
+    g_rotSeen = 0;
+    g_rotRouted = 0;
     // ...and three flags the audit had been carrying as known defects. Two are
     // diagnostics, but g_rotSplit is not: it is declared TRUE and --no-rotsplit
     // (cli.hpp:152) turns it off with nothing to turn it back on, so ONE call
@@ -190,7 +202,8 @@ inline void resetInvocationState() {
     g_fixupCallRotSeen = 0;
     for (int i = 0; i < 4; ++i)
         for (int j = 0; j < 2; ++j)
-            g_frameRevReach[i][j] = g_frameRevCall[i][j] = g_frameRevHit[i][j] = 0;
+            g_frameRevCall[i][j] = g_frameRevHit[i][j] = 0;
+    for (FrameRevRow& row : g_frameRevReach) row = FrameRevRow{};
 
     // frames.hpp
     g_rotTrig.clear();
@@ -218,7 +231,7 @@ inline void resetInvocationState() {
     g_touchStops.clear();
     g_ceilPush = false;
     g_latGap = false;
-    g_bonkArm = false;
+    g_gpHandoff.clear();
     g_vetoPhys = false;
     g_verdictInfo = false;
     g_resimPX = 0.f;
@@ -294,6 +307,9 @@ inline void resetInvocationState() {
     g_cubeYq = 2.0;
     g_cubeVq = 10.0;
     g_dualFreeQ = 0.125;
+    g_heldKeyRead = kDefHeldKeyRead;
+    g_keyXq = kDefKeyXq;
+    g_keyXqFly = kDefKeyXq;
 
     // speed.hpp
     kSupportTol = 0.01;
@@ -305,6 +321,22 @@ inline void resetInvocationState() {
     g_fixRobotJump = 0;
     g_dynamicLevelHeight = 0;
     g_maxPlayY = 1e18;
+    g_goalSpare = kDefGoalSpare;
+    g_upsideCoyote = 1;
+    g_rawValues = kRawValuesDefault;
+    g_portalUnpin = kPortalUnpinDefault;
+    g_hazEndpoint = kHazEndpointDefault;
+    g_portalPress = kPortalPressDefault;
+    g_padTable = kPadTableDefault;
+    g_flyRingNested = 0;
+    g_heldAll = 0;
+    g_solidOrdDbgT0 = g_solidOrdDbgT1 = -1;
+    g_spentOrb.clear();
+    g_heldCellCap = 0;
+    g_heldCellTwins = 0;
+    g_histStatOn = false;
+    g_histStatPath.clear();
+    g_goalX = 1e18;
     g_offBoardMargin = 0.0;
     g_shiftDbgUid = -1;
     g_shiftDbgDone = false;
@@ -317,6 +349,7 @@ inline void resetInvocationState() {
 
     // thread_pool.hpp
     g_aliveCap = 16000;
+    g_capMap.clear();
     g_memStat = false;
     g_phaseProf = false;
     // progress.hpp's checkpoint channel is NOT reset here: its `enabled`/`cancel` belong to the
@@ -333,12 +366,15 @@ inline void resetInvocationState() {
 
     // triggers.hpp
     g_touch.clear();
+    g_touchFollowObjs = nullptr;   // pointed into the last call's Level
     // ...and the per-box move length derived from it. Built beside g_touch in
     // cliMain, so it is cleared beside g_touch here: left behind, the next
     // level in a one-session run keys its states against the PREVIOUS level's
     // box durations, and a leak of exactly that shape lived under a green
     // 22/22 for months.
     g_touchMoveTicks.clear();
+    g_pressWin.clear();   // same reason: built beside g_touch, keyed by the next level otherwise
+    g_actMask = TouchMask{};
     for (auto& f : g_touchFrame) f.clear();
     // kTouchBits, not 32: the array is std::array<int, kTouchBits>, so a cap of
     // 32 left slots 32.. holding the previous level's fire ticks in a
@@ -358,6 +394,14 @@ inline void resetInvocationState() {
     // carried would be a sum over calls wearing one call's name.
     g_keyCensus = false;
     for (int b = 0; b < kTouchBits; ++b) g_keyCount[b].store(0);
+    // ...and the search census and the twin skip (search_census.hpp). Their tallies live in
+    // cliMain; only the switches are global.
+    g_searchCensus = 0;
+    g_twinSkip = kDefTwinSkip;
+    g_twinAudit = false;
+    g_minPulse = 0;
+    g_inputGrid = 0;
+    g_gridMap.clear();
     // ...and the per-coin closest approach, for the same reason: a second solve
     // in one process would otherwise report the first one's nearest miss.
     for (int i = 0; i < 8; ++i) {
@@ -375,16 +419,26 @@ inline void resetInvocationState() {
     // solve in a process publishes the FIRST level's coverage -- and the
     // UNCOVERED label would name boxes belonging to another level. The
     // declaration says "zero before it runs"; this is what makes that true on
-    // the second call (audit AUD-20260920-11).
+    // the second call.
     g_trigTotal = g_trigRelevantN = g_trigKept = g_trigDroppedRelevant = 0;
     g_trigDroppedBehind = g_trigDroppedAhead = 0;
     g_trigMaxKeptX = 0.0;
-    g_trigReported = 0;
+    g_trigReported = TouchMask{};
     g_bandPath.clear();
     g_bands.clear();
-    g_needTrig = 0;
+    g_needTrig = TouchMask{};
+    g_needTrigUids.clear();
     g_needUnseen = false;
-    g_needSkip = 0;
+    g_activators = kDefActivators;
+    g_coinPick = kDefCoinPick;
+    g_airPress = kDefAirPress;
+    g_refAdopt = false;
+    g_spawnRoots = kDefSpawnRoots;
+    g_offMoves = kDefOffMoves;
+    g_refAdoptT = -1;
+    g_refAdoptFields.clear();
+    g_groupInit.clear();
+    g_needSkip = TouchMask{};
     g_obbAll = true;
     g_touchFromAnchor = false;
     g_trigDump = false;
@@ -394,6 +448,12 @@ inline void resetInvocationState() {
     g_trigWinNear = -1e18;
     g_spawnRemap = true;
     g_touchRetimeFrom = 0;
+    g_touchRetimeBox = kDefTouchRetimeBox;
+    g_itemsNoBlock = kDefItemsNoBlock;
+    g_walkGates = kDefWalkGates;
+    g_fbForceBox = -1;
+    g_fbForceTick = 0;
+    g_replayOn = false;
     g_flyHazAfterSolid = false;
     g_fgArmLive = false;
     // ...and the fireB tally. The three counters only ever `++` (cli.hpp:2748,
@@ -437,3 +497,4 @@ inline void resetInvocationState() {
 
 }  // namespace dp
 
+#include "dp/defaults_profile.gen.hpp"

@@ -40,8 +40,8 @@ COIN_COMPLETE = "coin: level complete"
 #
 # 95, matching the guard the MOD applies before it will save a solution
 # (hooks_playlayer.cpp, the refusing-a-clear branch), and for the same measured
-# reasons: the false clear that guard was written for said 4.85% (level
-# 140155559, levelComplete at x=2,458 of 19,570), and lv22 -- whose final cube
+# reasons: the false clear that guard was written for said 4.85% (a custom
+# level, levelComplete at x=2,458 of 19,570), and lv22 -- whose final cube
 # section RETREATS from x=22,375 to 21,853, so a genuine completion sits 2,232px
 # "short of" the end portal at 24,085 -- says 96.1. This used to be 99.0 against
 # a "mid-level false clear is ~97.9" that has no surviving case anywhere in the

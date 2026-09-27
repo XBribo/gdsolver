@@ -1,3 +1,58 @@
+# v0.3.0
+
+ * **The spin-off levels.** Beyond the 22 main levels, the 17 official levels of
+   Meltdown, World and SubZero (with The Challenge) are now part of what a release
+   claims: all 17 clear cold, and the six that have coins — Meltdown's three and
+   SubZero's three — clear with every coin, each counted by the game itself. Their
+   results are in the README. The suite reads them from level files (cfg
+   `leveldir`), which are not distributed here.
+ * **The section solver is part of the loop.** When the loop has spent at a wall
+   as much as a section solve costs, or has run out of anchors, it starts one
+   itself: the level is replayed to a practice checkpoint before the wall, the
+   game is searched directly from there, and a plan the game reproduces is
+   spliced back and pinned, and the loop carries on. A section whose prefix does
+   not replay the same way twice is given up after two tries. A restore no longer
+   gets slower as a search goes on, and a search's memory follows its live
+   frontier. See [docs/SECTION_SOLVE.md](docs/SECTION_SOLVE.md).
+ * **Coin search.** A clear refused for a missing coin is filed at the attempt's
+   closest approach to that coin rather than at the finish, and ranked there
+   until a route passes it; a plan that takes a coin the deepest plan missed
+   counts as progress; section solves go to the coin wall and must take the coin;
+   and a replay that skipped a speed portal is no longer planned against another
+   route's moving geometry. The loop also works out what a coin needs first — the
+   key, touch box or switch whose chain turns it on — and can route through it
+   (cfg `routeprereq`, off by default). See [docs/COINS.md](docs/COINS.md).
+ * **Level slicing.** A level with at least 10,000 objects its run cannot depend
+   on is solved on a copy without them, and every plan that clears the copy is
+   flown on the level itself before it is filed; where the two part, the objects
+   around that point go back into the copy. Coin runs are not sliced (the copy
+   credits no secret coin). See [docs/LEVEL_SLICE.md](docs/LEVEL_SLICE.md).
+ * **The play menu.** A level's play button opens a menu — Normal, Replay, Solve
+   and a Coins switch — in place of the panel. It opens on Replay when a solution
+   is stored (with Coins set when the coin solution is) and on Solve otherwise.
+ * **Leaving a level stops its solve.** A solve left mid-search used to run on in
+   the background, and the next level's solve waited behind it while the overlay
+   showed the old search's progress. The section solver's settings no longer
+   carry from one level to the next either.
+ * **Measured model corrections**, among them: a grown body standing on two or
+   more supports is lifted on the grow tick; an upside-down cube keeps a moment of
+   ground walking off a ledge where the level keeps the old gravity behaviour, as
+   the game does; pads and rings a run has already fired are not fired again after
+   a re-anchor; the id-1859 arm is read where it rides the player; and an
+   autonomous Move whose group is switched off when the player reaches it does not
+   fire.
+ * **Custom levels** have a page of their own
+   ([docs/CUSTOM_LEVELS.md](docs/CUSTOM_LEVELS.md)): what random samples of rated
+   levels showed by the version they were built with, the kinds of level that
+   usually solve, and the gimmicks the model does not cover. The rule is to clear
+   what the game lets the loop clear; they are still not a supported set.
+ * **Regression and release tooling.** A cold run's manifest now records every
+   cfg value the mod held and the core's built-in defaults, and
+   `cold_manifest.py` compares two runs (refusing any difference not named) and
+   checks a run against the expected settings before it is blessed. New
+   calibration tests pin the grow lift and the upside-down ledge against the
+   game's own rows.
+
 # v0.2.0
 
  * **Coins.** A **Coins** switch on the panel makes the goal the end of the level

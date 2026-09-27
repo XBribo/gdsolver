@@ -4,20 +4,31 @@ What the mod puts on screen while it solves or replays, and the keys that drive
 it. For what the iteration map's marks *mean*, see [ITERMAP.md](ITERMAP.md); for
 how the loop works, [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## The panel
+## The play menu
 
-A small panel appears on the screens a level is started from — the main-level wheel, and any
-individual level's own page, so custom levels included. It switches between three modes:
+Pressing a level's play button — on the main-level wheel, or on any individual level's own
+page, so custom levels included — opens a menu before the level starts. It offers three modes:
 **Normal** (the game as it is), **Replay** (replay a stored solution for the level), and
-**Solve** (solve the level in-process). Level selection itself is the game's own, so any level
-can be picked. The panel is on those screens and nowhere else: everywhere else it would just
-sit on top of the menu underneath it.
+**Solve** (solve the level in-process), and under Replay and Solve a **Coins** switch, greyed out
+on a level that has no coins. Replay is refused on the spot, with the reason, when the level has
+no stored solution of that kind. **Start** (or `Enter`) starts the level in the chosen mode,
+`1` / `2` / `3` pick a mode, and closing the menu starts nothing. Level selection itself is the
+game's own, so any level can be picked. A platformer level gets no menu: the solver does not play
+platformer mode, so its play button just plays it.
+
+The choice is made per play. The menu opens on Replay when a solution for the level is stored (with Coins ticked when the coin solution is), and on Solve when none is. Turning the mod setting **Choose
+the mode on Play** off removes the menu, and the play button then just plays the level.
 
 **It runs fast, dark and silent until it has something to show.** Candidate replays mostly
 die and each one at normal speed would cost the length of the song, so the screen goes to the
 fast loop and stays there. When a candidate finally clears, the level restarts and the solution is
 played through properly — at 1x, with the artwork and the music. That is the run worth watching,
-and it is the only one you are shown. (`F5` overrides this in either direction.)
+and it is the only one you are shown. (`F5` overrides this in either direction, except while a
+section solve runs: its search moves the world back and forth through geometry it does not put
+back, so the screen stays off until it ends — see [SECTION_SOLVE.md](SECTION_SOLVE.md).)
+
+**Leaving a level ends its solve.** Quitting mid-solve (`F9` or the pause menu) stops the search
+that level started on its next layer, and the next level you pick starts from a clean slate.
 
 ## The overlay
 
