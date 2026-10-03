@@ -1335,6 +1335,8 @@ inline void endSession(const std::string& why) {
     // is over, and while it runs it holds the job slot that the next level's Solve queues behind
     // (dpsolve::start).
     dpbridge::cancelSearch(true);
+    // A timeout from this session must not reset the level after the session has ended.
+    g_stallResetPending = false;
     g_sessionOver = true;
     writeResult("session_end: " + why);
     flushAll();

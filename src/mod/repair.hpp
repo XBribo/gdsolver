@@ -38,6 +38,7 @@
 //   * lookahead DOUBLING. This loop runs the inverse -- the whole level, shortened to
 //     kHorizonShort under stall -- which covers the same ground from the other end.
 #include "mod/session.hpp"
+#include "solver/attempt_end.hpp"
 
 namespace p1 {
 
@@ -255,9 +256,8 @@ inline void slopeTrace(GJBaseGameLayer* l, long long t) {
     writeResult(b);
 }
 
-// Called at the end of every physics tick while an in-process solve session is open. Kept off
-// the dump's `noTrace` switch on purpose: this is not a diagnostic, it is what the next
-// iteration re-anchors on.
+// Called at the post-input, pre-physics command boundary, labelled S(input tick + 1).
+// Kept off `noTrace`: this is the state the next repair iteration re-anchors on.
 inline void record(GJBaseGameLayer* l, long long t) {
     if (!l || !l->m_player1 || t < 0) return;
     if (t > 400000) return;    // a runaway attempt must not eat memory instead of ending
@@ -753,7 +753,7 @@ struct CkObs {
     bool compared = false, same = false;
 };
 inline CkObs g_ckObs;
-inline size_t g_ckObsSkipped = 0;   // checkpoints passed unflown after the first death
+inline size_t g_ckObsSkipped = 0;   // checkpoints passed without a flight
 // Worker thread only: the recorder is running on a checkpoint death, not on the loop's own. Keeps
 // the loop's per-iteration side effects (the kill-only veto credit) out of it.
 inline bool g_ckInner = false;
@@ -780,6 +780,7 @@ inline int g_followSolved = 0;            // regressions followed on a solved br
 inline long long g_followPeak = -1;
 inline int g_followForced = 0;            // ...and on the forced (portal) route -- see the grace
 inline long long g_lastDeath = -1;
+inline bool g_lastDeathNoCollision = false;   // timeouts and deferred resets are not p1 collisions
 inline float g_lastDeathX = 0.f;      // ...and where (the void-attempt repeat scoring)
 // cfg coinroute: the attempt was ENDED at a coin GD had not credited (hooks_gamelayer.cpp), not
 // killed by the level. Set just before that destroyPlayer, consumed by onDeath. Such a death
@@ -5529,7 +5530,10 @@ inline void spawn(int kind, long long arg, const char* phase) {
                 // (see the g_lastDeathCoinMiss gate in fixupPass).
                 // The PHYSICAL death: under cfg coinmisspost a death can be ranked at a coin it
                 // passed (g_lastDeath), but what GD and the model disagree about is where it died.
-                recordFixups(g_lastDeathPhys >= 0 ? g_lastDeathPhys : g_lastDeath);
+                if (!g_lastDeathNoCollision)
+                    recordFixups(g_lastDeathPhys >= 0 ? g_lastDeathPhys : g_lastDeath);
+                else
+                    writeResult("dpsolve:   attempt end without collision evidence - no synthetic collision fixups recorded");
                 // ...and what it learns there reopens the ladder only when the death IS where the
                 // ladder climbs from. A death cfg coinmisspost ranked at a missed coin was learnt
                 // from past that coin, which says nothing new about the anchors before it -- and
@@ -6012,6 +6016,7 @@ inline void start(GJBaseGameLayer* l) {
     g_reqFrom = -1;
     g_reqUntil = -1;
     g_lastDeath = -1;
+    g_lastDeathNoCollision = false;
     g_coinMissPending = false;
     g_lastDeathCoinMiss = false;
     g_coinMissPostPending = false;
@@ -6469,13 +6474,20 @@ inline void ckTick(long long t) {
 
 // A death while a job is out. Only a flight's death means anything; everything else is ignored,
 // as it always was.
-inline void ckOnDeath(long long dt, float deathX) {
+inline void ckOnDeath(long long dt, float deathX, bool noCollision = false) {
     if (!g_cfg.dpCheck || !g_ckFlying) return;
     g_ckFlying = false;
     g_paused = true;
     char b[256];
     if (dpbridge::checkCall() != g_ckCall) {
         writeResult("dpsolve:   [check] died on a checkpoint whose call has returned - ignored");
+        return;
+    }
+    if (noCollision) {
+        ++g_ckObsSkipped;
+        writeResult("dpsolve:   [check] attempt end without collision evidence - checkpoint skipped, not a collision refutation");
+        if (!dpbridge::passCheckpoint(g_ckCall, g_ckIndex))
+            writeResult("dpsolve:   [check] a skipped checkpoint was refused by the search");
         return;
     }
     bool deaf = false;
@@ -7028,7 +7040,10 @@ inline void fileCoinMissEarly(long long dt) {
     }
 }
 
-inline void onDeath(long long dt, float deathX) {
+inline void onDeath(long long dt, float deathX,
+                    solver::AttemptEndKind kind = solver::AttemptEndKind::Collision) {
+    const auto endPolicy = solver::attemptEndPolicy(kind);
+    const bool noCollision = !endPolicy.learnCollision;
     // Consumed first, whichever way this returns, so a coin miss cannot leak into a later death.
     const bool coinMissPost = g_coinMissPostPending;
     g_coinMissPostPending = false;
@@ -7058,7 +7073,7 @@ inline void onDeath(long long dt, float deathX) {
     // still. The one that can happen is a checkpoint flight's (cfg `dpcheck`), and ckOnDeath
     // decides what that one means.
     if (g_running.load()) {
-        ckOnDeath(dt, deathX);
+        ckOnDeath(dt, deathX, noCollision);
         return;
     }
     // The plan that cleared a slice, dying on the level itself: the slice decides whether the
@@ -7160,7 +7175,7 @@ inline void onDeath(long long dt, float deathX) {
             deathX = offX;
         }
     }
-    bool wasWedged = false;
+    bool wasWedged = !endPolicy.creditProgress;
     // ...and a WEDGED run is credited where it stopped moving, for the same reason. The stall
     // guard (hooks_gamelayer) ends an attempt whose player has not moved for 30,000 ticks, so
     // the death: line arrives with a tick inflated by the whole idle stretch -- and the loop
@@ -7190,7 +7205,9 @@ inline void onDeath(long long dt, float deathX) {
             while (k > 1) {
                 const AnchorRow* rk = anchors::row(k - 1);
                 if (!rk || std::fabs(rk->x - rd->x) > 0.5f
-                    || std::fabs(rk->y - rd->y) > 0.5f)
+                    || std::fabs(rk->y - rd->y) > 0.5f
+                    || rk->dual != rd->dual
+                    || (rd->dual && std::fabs(rk->y2 - rd->y2) > 0.5f))
                     break;
                 --k;
             }
@@ -7207,11 +7224,8 @@ inline void onDeath(long long dt, float deathX) {
         }
         anchors::g_src = savedSrc;
     }
-    // An attempt that had to be forced over (the moving zombie: alive, advancing nowhere
-    // meaningful, never completing -- the overlong guard ends it at 40k ticks) is
-    // wedge-class for every purpose: never ranks, counts toward the veto, re-arms the
-    // portal hint. No legitimate attempt exceeds ~22k ticks on these levels.
-    if (dt > 30000) wasWedged = true;
+    // Only a guard-forced end is wedge-class; a reset-confirmed p2 failure may credit progress.
+    // Long custom levels can also have genuine deaths beyond 30k ticks.
     // The HUD's iteration block is fed by the external driver through hud.txt. There is no
     // driver here, so the loop fills the same fields itself -- otherwise the panel's Solve mode
     // sits on "iter 0 starting" for the whole run
@@ -7608,6 +7622,7 @@ inline void onDeath(long long dt, float deathX) {
         }
     }
     g_lastDeath = dt;
+    g_lastDeathNoCollision = noCollision;
     g_lastDeathX = deathX;
     // Only a ranked death differs; every other keeps whatever dt became above (the off-board and
     // wedge credits move it too, and the recorder has always read the moved one).

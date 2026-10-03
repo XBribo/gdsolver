@@ -1339,7 +1339,7 @@ class $modify(GJBaseGameLayer) {
         // Both this and the poll below can reset the level, and a reset in the middle of a
         // section search replaces the world that search is expanding into -- so both wait for
         // it. Nothing is lost by waiting: a search ends its own session.
-        if (g_stallResetPending && !secsolve::inFlight()) {
+        if (g_stallResetPending && !secsolve::inFlight() && !dpsolve::g_running.load()) {
             g_stallResetPending = false;
             if (auto* pl = PlayLayer::get()) {
                 writeResult("stall: resetLevel at the frame boundary");
@@ -5563,6 +5563,7 @@ class $modify(GJBaseGameLayer) {
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        solver::CommandStateScope commandState(g_tick);
         ++g_pcCalls;   // sole direct indicator that physics runs (goes to the heartbeat)
         // Tick counter: this substep executes as number g_tick
         // Input injection: call handleButton directly before the target tick's substep
@@ -6202,7 +6203,8 @@ class $modify(GJBaseGameLayer) {
         // fired at 40,001 inside it and killed whichever branch was being stepped.
         if (g_started && !g_sessionOver && m_player1 && !m_player1->m_isDead
             && !g_cfg.noDeath && !secsolve::g_active) {
-            static float s_stallX = 0.f, s_stallY = 0.f;
+            static float s_stallX = 0.f, s_stallY = 0.f, s_stallX2 = 0.f, s_stallY2 = 0.f;
+            static bool s_stallDual = false;
             static long long s_stallSince = -1;
             // The END-ZONE pin is not a stall: GD locks the player at the end wall
             // while the scheduler-driven completion sequence plays, and under the fast
@@ -6234,26 +6236,36 @@ class $modify(GJBaseGameLayer) {
             // ...and an attempt that simply never ends. The MOVING form of the zombie
             // glitch bobs on a platform at 100%% forever -- no stillness, no death, no
             // completion -- and the fast loop pumped 1.7M ticks through one before
-            // anything noticed. No legitimate attempt on these levels exceeds ~22k
-            // ticks, so 40k is pure pathology.
+            // anything noticed. Custom levels can legitimately exceed 40k ticks, so
+            // the bound must also cover this session's whole-level planning range.
             static int s_overFired = -1;   // once per attempt -- this runs per TICK, and
                                            // unlatched it wrote 1,800 lines per frame
-            if (g_tick > 40000 && s_overFired != g_attempt && !endzoneGrace) {
+            const long long tickLimit = solver::attemptTickLimit(
+                g_cfg.dpSolve ? dpsolve::g_horizonFull : 0);
+            // Attempt numbers restart in a new session; the timeout latch must restart too.
+            if (g_tick <= tickLimit) s_overFired = -1;
+            if (g_tick > tickLimit && s_overFired != g_attempt && !endzoneGrace) {
                 s_overFired = g_attempt;
                 char ob2[160];
                 snprintf(ob2, sizeof(ob2), "stall: attempt=%d has run %lld ticks without "
-                         "ending - forcing it over", g_attempt, (long long)g_tick);
+                         "ending (limit=%lld) - forcing it over", g_attempt,
+                         (long long)g_tick, tickLimit);
                 writeResult(ob2);
                 if (auto* pl = PlayLayer::get()) {
-                    pl->destroyPlayer(m_player1, m_player1);
-                    g_stallResetPending = true;
+                    forceAttemptEnd(pl, "timeout");
                 }
             }
+            if (g_stallResetPending) return;   // no more physics on the attempt just handed off
             const float px = m_player1->getPositionX();
             const float py = m_player1->getPositionY();
+            const bool dual = m_gameState.m_isDualMode && m_player2;
+            const float px2 = dual ? m_player2->getPositionX() : 0.f;
+            const float py2 = dual ? m_player2->getPositionY() : 0.f;
             if (s_stallSince < 0 || px != s_stallX || py != s_stallY
+                || dual != s_stallDual || px2 != s_stallX2 || py2 != s_stallY2
                 || g_tick < s_stallSince) {
-                s_stallX = px; s_stallY = py; s_stallSince = g_tick;
+                s_stallX = px; s_stallY = py; s_stallX2 = px2; s_stallY2 = py2;
+                s_stallDual = dual; s_stallSince = g_tick;
             } else if ((g_tick - s_stallSince >= 3000 && !endzoneGrace)
                        || (endzoneHung && g_tick - s_stallSince >= 300)) {
                 char sb[256];
@@ -6264,7 +6276,7 @@ class $modify(GJBaseGameLayer) {
                 writeResult(sb);
                 s_stallSince = -1;
                 if (auto* pl = PlayLayer::get()) {
-                    pl->destroyPlayer(m_player1, m_player1);
+                    forceAttemptEnd(pl, "stillness");
                     // ...and destroyPlayer alone is NOT a guarantee, so a reset is
                     // forced as well. In the glitch state this guard exists for,
                     // the level believes itself finished and GD's destroy books the
@@ -6277,8 +6289,8 @@ class $modify(GJBaseGameLayer) {
                     // on the fresh attempt with a stale input cursor -- measured as
                     // garbage deaths at t=660/1,837 on a prefix that had verified
                     // clean dozens of times, each one feeding false fixups.
-                    g_stallResetPending = true;
                 }
+                if (g_stallResetPending) return;
             }
         }
         // Measure the "uncontrollable boundary" of the end zone (cfg `endtrace=1`).
@@ -6509,16 +6521,17 @@ class $modify(GJBaseGameLayer) {
                 break;
             }
         }
-        // End-of-tick record of what a re-anchor would need (Stage C). Same instant as the dump
-        // row below and for the same reason -- the state has to be settled -- but deliberately
-        // NOT behind `notrace`: the dump is a diagnostic, this is what the next iteration of the
-        // repair loop resumes the search from.
+        // Command-boundary record, after input but BEFORE native motion/collisions (2.2081
+        // GJBaseGameLayer::update, RVA 0x237850). Its state label is input tick + 1; the physical
+        // endpoint reached after this hook returns is one state later. Keep this sampling phase:
+        // moving it before input would change the pending press/buffer inherited by a repair.
+        // NOT behind `notrace`: this is what the next repair iteration resumes from.
         // Not inside a section search (see tEff): its rows would land on the ticks just past the
         // section head, one per step of every node, growing the buffer by tens of thousands of
         // rows per search. The attempt the rung starts afterwards clears them (onAttemptStart),
         // so the ladder never read them, but every step paid for them.
         if (g_started && !g_sessionOver && g_cfg.dpSolve && m_player1 && !secsolve::g_active)
-            anchors::record(this, g_tick);
+            anchors::record(this, solver::g_commandStateTick);
         // cfg `areatrace`: the listed objects' positions at this same instant (see g_areaT0).
         // The pointers are looked up again whenever the object array changes (a new level in
         // a one-session run) or the window starts.
@@ -6591,7 +6604,7 @@ class $modify(GJBaseGameLayer) {
                             + " v=" + std::to_string(mp));
             }
         }
-        // End-of-tick state dump (after the player's physics is settled). Not inside a section
+        // Same post-input, pre-physics command boundary as anchors above. Not inside a section
         // search: one row per step of every node, on ticks that are not the level's (see tEff).
         if (g_started && !g_sessionOver && !secsolve::g_active
             && !g_cfg.noTrace && g_dump.is_open() && m_player1) {

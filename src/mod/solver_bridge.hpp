@@ -5,6 +5,7 @@
 // OUTSIDE namespace p1, unlike the solver/ headers below: dp_bridge.cpp defines these symbols
 // at global scope (it cannot see p1 -- it is the one TU with no mod headers in it)
 #include "mod/dp_bridge.hpp"
+#include "solver/attempt_end.hpp"
 
 namespace p1 {
 
