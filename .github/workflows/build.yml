@@ -1,5 +1,7 @@
 # Windows, and Android as an experiment (docs/ANDROID.md). The Android job may fail while the
-# port is under way and never decides the run; only the Windows package is attached to a release.
+# port is under way and never decides the run; only the Windows package is attached to a release,
+# and only to a full one: the Android build is published by hand as a separate pre-release, and a
+# pre-release gets no Windows package (it would sit beside, or overwrite, the Android one).
 # The other platforms in Geode's example workflow cannot build this.
 #
 # The point of building here rather than locally is that the binary attached to a release can be
@@ -46,7 +48,7 @@ jobs:
       # The file is named after the mod id, so it is matched rather than spelled out -- the id
       # changed once already and took four hardcoded copies of the old name with it.
       - name: Attach it to the release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' && !github.event.release.prerelease
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
