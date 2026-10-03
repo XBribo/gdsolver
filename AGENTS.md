@@ -18,7 +18,7 @@ mcp/      MCP server: ask the running game questions interactively
 data/     solutions (tracked) and per-run working files (not tracked)
 data/rigs calibration levels (.lvl / .units.json / .plan.txt)
 docs/     architecture, the section solver, coins, the level slice,
-          custom levels, watching a run
+          custom levels, watching a run, results, Android (experimental)
 tools/    repo utilities (e.g. check_code_only_diff.py)
 ```
 
@@ -49,9 +49,12 @@ python py/dev.py                                   # build, deploy, launch GD
 3. **Behaviour-preserving changes must be proven, not asserted.** The acceptance
    criteria: byte-identical solver output on the replay/cold suite (`python
    py/quick_regress.py`, a couple of minutes, no worker), and for a change that
-   reaches the loop, `python py/cold_regress.py` — the same `[fp]` lines per level
-   as the baseline (`data/cold_baseline.json`, or `data/cold_baseline_coins.json`
-   for a coin run), which fixes the iteration count too. A change meant to alter
+   reaches the loop, `python py/cold_regress.py` against the baseline
+   (`data/cold_baseline.json`, or `data/cold_baseline_coins.json` for a coin run):
+   every level clears, with its coins in a coin run, and the record line reads
+   `none`. The script prints each level's iteration count against the baseline's;
+   it stores the last `[fp]` line but does not compare it, so a release compares
+   each level's `[fp]` lines with the baseline run's separately. A change meant to alter
    behaviour is not judged by iteration counts: they are reported, and the
    baseline is re-blessed from a reviewed one-session run (`--adopt`). **Check
    which binary you are measuring**: `quick_regress` drives

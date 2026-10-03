@@ -70,8 +70,15 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import cold_manifest
+import run_guard
 from gdtas.paths import BUILD_MOD, DATA
 from gdtas.worker import run_session, snapshot_mod
+
+# The runner's own limits inside a launch (py/run_guard.py). main() and other runners that
+# call one() / one_session() set these; 0 turns a limit off. LEVEL_DEADLINE_S is the
+# seconds one level may hold the game; MEM_FLOOR_MB the available physical memory under
+# which the arm is ended.
+GUARD = {"level_deadline_s": 0.0, "mem_floor_mb": 0.0}
 
 BASELINE = DATA / "cold_baseline.json"
 
@@ -90,7 +97,11 @@ ITER_MARGIN, ITER_FLOOR, ITER_UNKNOWN = 3, 30, 60
 
 CFG = ["enabled=1", "attempts=1000000", "quitwhendone=1", "blockinput=1",
        "cbs=0", "cos=1", "fastdt=0.0166667", "fastloops=1800", "skiprender=1",
-       "music=mute", "servemode=0", "dpsolve=1"]
+       "music=mute", "servemode=0", "dpsolve=1",
+       # This is the research/cold harness, so it asks the mod for the per-attempt band/
+       # groups/recorder-input copies explicitly (off by default -- a player's Solve should
+       # not accumulate them).
+       "capture=1"]
 
 # A from-the-start anchored solve on lv22 legitimately burns 20+ minutes of pure
 # DP with no result.txt growth (measured 2026-08-26, five cores busy), and 1200
@@ -154,6 +165,10 @@ def _run_meta(a) -> dict:
     import subprocess
     head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
                           cwd=Path(__file__).resolve().parent).stdout.strip()
+    # the build's commit when the package carries its provenance (cold_manifest.start)
+    prov = getattr(a, "build_prov", None)
+    if prov:
+        head = prov["commit"]
     return {"head": head, "mod": str(a.mod),
             "mod_sha256": hashlib.sha256(Path(a.mod).read_bytes()).hexdigest(),
             "cfg": list(a.cfg), "levels": list(a.levels),
@@ -225,14 +240,19 @@ def one(level: int, wid: int, budget: float, extra: list[str],
         out_dir: Path, mod_file: Path = BUILD_MOD) -> dict:
     t0 = time.time()
     wipe(wid)
+    guard = run_guard.LevelGuard(GUARD["level_deadline_s"], GUARD["mem_floor_mb"],
+                                 out_dir / f"guard_lv{level}.jsonl", first_level=level)
     try:
         r = run_session(wid, CFG + extra + [f"level={level}"],
-                        timeout_s=budget, stall_s=STALL_S, mod_file=mod_file)
+                        timeout_s=budget, stall_s=STALL_S, mod_file=mod_file,
+                        progress=guard.progress, guard=guard)
     except Exception as e:                      # noqa: BLE001  a worker that will not start
         return {"lv": level, "cleared": False, "why": f"ERROR {e}",
                 "iters": 0, "deepest_t": -1, "deepest_x": -1.0, "fx": 0,
                 "record": "?", "wall": time.time() - t0, "fp": "",
                 "timeout": False, "died_plan": "", "data": ""}
+    if guard.stopped:
+        run_guard.note_stop(out_dir, level, guard.stopped)
     txt = "\n".join(r.lines)
     # The whole session log, next to the results. A stuck level has to be read
     # out of the ladder's own lines, and there is nowhere else they survive.
@@ -244,6 +264,9 @@ def one(level: int, wid: int, budget: float, extra: list[str],
     out = read_result(txt, getattr(r, "timed_out", False))
     out["lv"] = level
     out["wall"] = time.time() - t0
+    if guard.stopped:
+        out["stopped"] = guard.stopped["why"]
+    run_guard.note_walls(out_dir, {level: out["wall"]})
     # wipe() runs at the START of a run, so the loser's working files are still
     # there when this returns. Naming the directory is the whole handover: the
     # next day's A/B and fixcensus start from it.
@@ -317,14 +340,64 @@ def one_session(levels: list[int], wid: int, budget: float, extra: list[str],
                 out_dir: Path, mod_file: Path = BUILD_MOD) -> list[dict]:
     """Every level in one game. Returns one entry per REQUESTED level, so a suite
     that ends early (a crash, the wall clock) reports the levels it never reached
-    as failures rather than as absences."""
+    as failures rather than as absences.
+
+    The runner's guard (GUARD, py/run_guard.py) can end the game early. A level past
+    its deadline is reported as a TIMEOUT and the suite goes on with the levels after
+    it in a NEW game -- the run is no longer one game from there, which the manifest's
+    `stops` and the result's `stopped` say. Below the memory floor the arm ends: the
+    remaining levels are reported as not reached. The suite's own wall clock still
+    applies to everything as the last resort."""
+    t_end = time.time() + budget
+    remaining = list(levels)
+    results: list[dict] = []
+    n_part = 0
+    while remaining:
+        part, guard = _one_session_pass(remaining, wid, max(60.0, t_end - time.time()),
+                                        extra, out_dir, mod_file, n_part)
+        n_part += 1
+        stop = guard.stopped
+        if stop and guard.level not in remaining:
+            # stopped before the first level marker (the memory floor at start-up)
+            run_guard.note_stop(out_dir, -1, stop)
+            for r in part:
+                r["stopped"] = stop["why"]
+        if not stop or guard.level not in remaining:
+            results += part
+            break
+        run_guard.note_stop(out_dir, guard.level, stop)
+        cut = remaining.index(guard.level)
+        for r in part[:cut + 1]:
+            if r["lv"] == guard.level:
+                r["stopped"] = stop["why"]
+                r["timeout"] = True
+        results += part[:cut + 1]
+        rest = remaining[cut + 1:]
+        if guard.memory_stop or time.time() >= t_end:
+            for lv in rest:
+                results.append({"lv": lv, "cleared": False,
+                                "why": f"not reached ({stop['why']})",
+                                "iters": 0, "deepest_t": -1, "deepest_x": -1.0,
+                                "fx": 0, "record": "none", "wall": 0.0, "fp": ""})
+            break
+        remaining = rest
+    run_guard.note_walls(out_dir, {r["lv"]: r.get("wall", 0.0) for r in results
+                                   if r.get("wall")})
+    return results
+
+
+def _one_session_pass(levels: list[int], wid: int, budget: float, extra: list[str],
+                      out_dir: Path, mod_file: Path = BUILD_MOD, part: int = 0):
+    """One game over `levels`: (one entry per requested level, the guard it ran under)."""
     t0 = time.time()
     wipe(wid)
+    guard = run_guard.LevelGuard(GUARD["level_deadline_s"], GUARD["mem_floor_mb"],
+                                 out_dir / "guard_suite.jsonl", first_level=None)
     levels_arg = "levels=" + ",".join(str(l) for l in levels)
     # Per-level wall clock. The log carries no timestamps of its own, so the
-    # only clock is this side: run_session re-reads the whole result.txt about
-    # once a second and hands it to `progress`, and a level starts at the first
-    # poll its own `suite: level=` marker is visible in.
+    # only clock is this side: run_session reads what result.txt gained about
+    # once a second and hands the complete new lines to `progress`, and a level
+    # starts at the first poll its own `suite: level=` marker arrives in.
     #
     # Resolution is that poll interval widened by however long the write sits
     # in a buffer -- bounded by the ~10s heartbeat the stall detector already
@@ -335,19 +408,22 @@ def one_session(levels: list[int], wid: int, budget: float, extra: list[str],
     def _stamp(txt: str) -> None:
         for m in SUITE_MARK.finditer(txt):
             seen_at.setdefault(int(m.group(1)), time.time() - t0)
+        guard.progress(txt)
 
     try:
         r = run_session(wid, CFG + extra + [levels_arg], timeout_s=budget,
                         stall_s=STALL_S, mod_file=mod_file,
-                        done_marker=SUITE_DONE, progress=_stamp)
+                        done_marker=SUITE_DONE, progress=_stamp, guard=guard)
     except Exception as e:                      # noqa: BLE001  a worker that will not start
         return [{"lv": lv, "cleared": False, "why": f"ERROR {e}", "iters": 0,
                  "deepest_t": -1, "deepest_x": -1.0, "fx": 0, "record": "?",
-                 "wall": time.time() - t0, "fp": ""} for lv in levels]
+                 "wall": time.time() - t0, "fp": ""} for lv in levels], guard
     txt = "\n".join(r.lines)
+    # A suite the guard split runs more than one game; each keeps its own log.
+    suite_log = out_dir / ("coldlog_suite.txt" if part == 0
+                           else f"coldlog_suite_part{part}.txt")
     try:
-        (out_dir / "coldlog_suite.txt").write_text(txt, encoding="utf-8",
-                                                   errors="replace")
+        suite_log.write_text(txt, encoding="utf-8", errors="replace")
     except OSError:
         pass
     timed_out = getattr(r, "timed_out", False)
@@ -393,7 +469,7 @@ def one_session(levels: list[int], wid: int, budget: float, extra: list[str],
         # a single level sitting near the cap.
         out["wall"] = _wall(lv)
         results.append(out)
-    return results
+    return results, guard
 
 
 def read_result(txt: str, timed_out: bool = False) -> dict:
@@ -522,8 +598,9 @@ def report(results: list[dict], base: dict, a) -> int:
             # values that pick the next experiment (user's ruling 2026-09-03:
             # drop it early and go and fix it, rather than waiting it out).
             timeouts.append(r["lv"])
-            print(f"    over its {r.get('wallcap', 0):.0f}s cap after "
-                  f"{r['wall']:.0f}s: deepest x={r['deepest_x']:.0f} "
+            print((f"    stopped by the guard ({r['stopped']}) after " if r.get("stopped")
+                   else f"    over its {r.get('wallcap', 0):.0f}s cap after ")
+                  + f"{r['wall']:.0f}s: deepest x={r['deepest_x']:.0f} "
                   f"t={r['deepest_t']}, {r['fx']} fixups"
                   + (f", last died plan {r['died_plan']}"
                      if r["died_plan"] else ""))
@@ -541,7 +618,8 @@ def report(results: list[dict], base: dict, a) -> int:
         if not r["cleared"]:
             bad.append(f"lv{r['lv']}: "
                        + (f"TIMEOUT after {r['wall']:.0f}s" if r.get("timeout")
-                          else r["why"]))
+                          else r["why"])
+                       + (f" [{r['stopped']}]" if r.get("stopped") else ""))
         if r["record"].startswith("no-audit"):
             # No verdict either way -- say so, and do not add a second failure to
             # a run that is already failing for the reason it was killed.
@@ -668,6 +746,39 @@ def adopt(a) -> int:
     return report(results, load_baseline(coins), a)
 
 
+def add_guard_args(ap) -> None:
+    """The runner's own limits inside a launch (py/run_guard.py). Shared with the
+    private tree's runners, which call one() / one_session() as they are."""
+    ap.add_argument("--level-deadline", type=float, default=None,
+                    help="seconds one level may hold the game before it is stopped as a "
+                         "TIMEOUT (default: the previous run's longest level times "
+                         "--level-deadline-scale, at least --level-deadline-floor, at most "
+                         "the per-level budget; 0 = off)")
+    ap.add_argument("--level-deadline-scale", type=float, default=3.0)
+    ap.add_argument("--level-deadline-floor", type=float, default=600.0)
+    ap.add_argument("--mem-floor-gb", type=float, default=3.0,
+                    help="end the arm when available physical memory falls below this "
+                         "(0 = off)")
+
+
+def setup_guard(a, prev_manifest: Path, cap_s: float) -> dict:
+    """Set GUARD from the parsed arguments and return what was chosen, for the manifest."""
+    if a.level_deadline == 0:
+        deadline, source = 0.0, "off (command line)"
+    else:
+        deadline, source = run_guard.pick_deadline(prev_manifest, a.level_deadline_scale,
+                                                   a.level_deadline_floor, cap_s,
+                                                   a.level_deadline)
+    GUARD["level_deadline_s"] = deadline
+    GUARD["mem_floor_mb"] = max(0.0, a.mem_floor_gb) * 1024.0
+    print(f"  guard: level deadline "
+          + (f"{deadline:.0f}s ({source})" if deadline else "off")
+          + (f", memory floor {a.mem_floor_gb:g} GB" if a.mem_floor_gb > 0 else
+             ", memory floor off"))
+    return {"level_deadline_s": round(deadline, 1), "deadline_source": source,
+            "mem_floor_mb": GUARD["mem_floor_mb"], "cap_s": cap_s}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--levels", nargs="+", type=int,
@@ -682,12 +793,11 @@ def main(argv=None) -> int:
     # Left at None the two arrangements resolve it differently, because they
     # mean different things by "budget": in parallel it IS the per-level clock,
     # while --one-session multiplies it by the level count into one cap for the
-    # whole game (there is no per-level deadline inside a suite -- the only one
-    # is the mod's own dpMaxIters). Passing --budget explicitly overrides both,
-    # so nothing that named a number changes.
-    # If a per-level deadline is ever wanted inside a suite too, the shape is
-    # to hand this same number to the mod as a level deadline rather than to
-    # add a second clock out here.
+    # whole game. Passing --budget explicitly overrides both, so nothing that
+    # named a number changes.
+    # Inside a launch the runner now keeps its own per-level deadline and memory
+    # floor as well (--level-deadline / --mem-floor-gb, py/run_guard.py); the
+    # suite's cap stays as the last resort.
     ap.add_argument("--budget", type=float, default=None,
                     help="wall-clock seconds per level (default 1200 times "
                          "--budget-scale; in --one-session, seconds per level "
@@ -713,6 +823,7 @@ def main(argv=None) -> int:
     ap.add_argument("--adopt", type=Path, default=None,
                     help="adopt the baseline from a saved --one-session run "
                          "(a folder holding coldlog_suite.txt and coldlog_suite.meta.json)")
+    add_guard_args(ap)
     a = ap.parse_args(argv)
     if a.adopt:
         return adopt(a)
@@ -727,6 +838,12 @@ def main(argv=None) -> int:
     # then the meta names one package while the game loads another. Reading the
     # immutable copy for both closes that window (the meta being written after
     # the suite -- the other half of this -- was fixed in e2a1dde).
+    # ...and read the build's provenance BEFORE pinning: it sits beside the package it was
+    # written for (build/provenance.json, copied with an arm's package), not beside the pin.
+    a.build_prov = cold_manifest.read_provenance(a.mod)
+    if a.build_prov:
+        print(f"  built from {a.build_prov['commit'][:12]}"
+              f"{' (dirty)' if a.build_prov.get('dirty') else ''} per its provenance.json")
     pinned, digest = snapshot_mod(a.mod)
     if pinned != a.mod:
         print(f"  pinned as {pinned.name} ({digest})")
@@ -778,11 +895,18 @@ def main(argv=None) -> int:
     if a.bless and not a.one_session:
         print("--bless runs --one-session (the numbers have to come from an "
               "arrangement in which the mod cleans up between levels)")
+    # The level deadline is read from the previous run's manifest, so before start()
+    # replaces it.
+    guard_settings = setup_guard(a, DATA / cold_manifest.NAME,
+                                 (a.budget if a.budget else 3600.0) if one_session_mode
+                                 else (a.budget if a.budget else 1200.0 * a.budget_scale))
     # What this run is, in data/cold_manifest.json beside the logs (py/cold_manifest.py):
     # compare two runs with `cold_manifest.py compare`, not by what their folders are called.
     cold_manifest.start(DATA, mod=a.mod, cfg=CFG + list(a.cfg), levels=list(a.levels),
                         arrangement="one-session" if one_session_mode else "per-level",
-                        resolution=a.resolution, coins=coins)
+                        resolution=a.resolution, coins=coins,
+                        build=getattr(a, "build_prov", None))
+    run_guard.note_guard(DATA, guard_settings)
     logs = {lv: DATA / f"coldlog_lv{lv}.txt" for lv in a.levels}
     # A suite has no per-level clock to set, so its default stays where it was;
     # the parallel arrangement takes the 20-minute cap (times --budget-scale).

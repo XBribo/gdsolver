@@ -205,12 +205,15 @@ def death_suspects(objs: dict, px: float, py: float, half: float,
                     f"half={half:g} (9 for mini)"}
 
 
-def _best_attempt_rows(path: Path) -> dict[int, dict]:
+def best_attempt_rows(path: Path) -> dict[int, dict]:
     """Return only THE ATTEMPT WITH THE MOST ROWS from dump.csv, as tick -> row.
 
     When a run contains several attempts, naively reading all of them makes the same
     tick appear again and again and throws the comparison off. The longest one is
     "the attempt that got furthest in that run".
+
+    Public so a caller comparing many traces against one dump can read it once
+    and hand the rows to diff_trace (`dump_rows`).
     """
     if not path.exists():
         return {}
@@ -254,7 +257,7 @@ def _bump(acc: dict, half: str, quant: str, value: float, tol: float, t: int) ->
 
 def diff_trace(trace_path: Path, dump_path: Path, t0: int = 0,
                t1: int | None = None, tol: float = 0.3,
-               limit: int = 8) -> dict:
+               limit: int = 8, dump_rows: dict[int, dict] | None = None) -> dict:
     """Match the model trace (leveldp's .trace.csv) against the GD dump by tick and
     return a few lines starting from THE FIRST TICK WHERE THEY DISAGREE.
 
@@ -293,6 +296,12 @@ def diff_trace(trace_path: Path, dump_path: Path, t0: int = 0,
     windows are built from p1's x/y/vy alone -- p2 is not constrained by them,
     so a residual on p2y/p2vy is more likely p2 really diverging than a phase
     fact. Nothing here has been shown about p2's phase.
+
+    `dump_rows`: what best_attempt_rows(dump_path) returned, when the caller
+    already has it. quick_regress and fixcensus compare ~1,100 section traces
+    against 22 dumps, and reading the dump again for every section was half of
+    each pool thread's time (measured 2026-09-30). Only read, never written, so
+    one dict can serve every section of a level at once.
     """
     if not trace_path.exists():
         return {"error": f"no {trace_path}"}
@@ -303,7 +312,7 @@ def diff_trace(trace_path: Path, dump_path: Path, t0: int = 0,
                 model[int(rec["tick"])] = rec
             except (KeyError, ValueError, TypeError):
                 continue
-    gd = _best_attempt_rows(dump_path)
+    gd = dump_rows if dump_rows is not None else best_attempt_rows(dump_path)
     if not gd:
         return {"error": f"no readable rows in {dump_path} (nothing run yet?)"}
     common = sorted(set(model) & set(gd))

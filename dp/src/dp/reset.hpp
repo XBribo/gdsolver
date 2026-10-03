@@ -107,7 +107,6 @@ inline void resetInvocationState() {
     g_goalDiv = GoalDiversity{};
 
     // constants.hpp -- the measured values, which --flags override per call
-    g_swingPushTol = false;
     g_hazDbgUid = -1;
     g_hazAabb = false;
     g_inRecon = false;
@@ -129,11 +128,9 @@ inline void resetInvocationState() {
     g_resimTrig = TouchMask{};
     g_resimFrame = -1;
     g_halfNow = 0;
-    g_noSlopeSeat = false;
-    g_ceilRideSlope = false;
-    g_lawSeatOnSlope = false;
     g_pinMinNoSwing = false;
     g_groupHoldEnd = 0;
+    g_groupsEndT = -1;
     g_groupHoldDeath = false;
     g_noPadPlayerRot = false;
     g_noSatRotRaw = false;
@@ -164,6 +161,7 @@ inline void resetInvocationState() {
     g_rotated.clear();
     g_rotSpec.clear();
     g_trigRaw = false;
+    g_xTrack.clear();
     g_lagFitDbg = false;
     g_touchEnteredGiven = false;
     g_touchEntered.clear();
@@ -230,13 +228,19 @@ inline void resetInvocationState() {
     g_tcBranchP1 = 0;
     g_touchStops.clear();
     g_ceilPush = false;
-    g_latGap = false;
+    g_flipLandDbgLeft = 0;
+    g_dualBand = false;
+    g_dualSlide = false;
+    g_anchorRide = true;
+    g_stripVetoOrder = false;
     g_gpHandoff.clear();
     g_vetoPhys = false;
     g_verdictInfo = false;
     g_resimPX = 0.f;
     g_preBtnSet = false;
     g_preBtnY = 0.0;
+    g_ballTapped = false;
+    g_hitGRepel = 0;
     g_startRotChan = -1;
     g_startRotRev = 0;
     g_startRotSpent.clear();
@@ -282,7 +286,6 @@ inline void resetInvocationState() {
     g_deadBands.clear();
     g_forceBoxes.clear();
     g_forceIdsPath.clear();
-    g_forceUnit1x = false;
     g_forceFields.clear();
     g_timeWarps.clear();
     g_zoomTrigs.clear();
@@ -329,6 +332,9 @@ inline void resetInvocationState() {
     g_portalPress = kPortalPressDefault;
     g_padTable = kPadTableDefault;
     g_flyRingNested = 0;
+    g_prePortalUid = -1;
+    g_ballTapNested = 0;
+    g_ballTapLaunch = 0;
     g_heldAll = 0;
     g_solidOrdDbgT0 = g_solidOrdDbgT1 = -1;
     g_spentOrb.clear();
@@ -359,7 +365,15 @@ inline void resetInvocationState() {
     g_memLimitMiB = 6144;
     g_portalDodgeMin = 0.1;
     g_speedDodgeMin = 0.0;
-    g_rotPort = false;
+    g_glitchPortal = 0.0;
+    g_glitchWave = 0.0;
+    g_glitchEmbed = 0.0;
+    g_glitchDeco = false;
+    g_coinWinY = 0.0;
+    g_coinWinVy = 0.0;
+    g_coinWinLen = 0.0;
+    g_ladderX0 = false;
+    g_capEnvelope = false;
     g_rotLast = false;
     g_yBound = 700.0;
     g_yBoundTurned = 1e9;
@@ -397,7 +411,6 @@ inline void resetInvocationState() {
     // ...and the search census and the twin skip (search_census.hpp). Their tallies live in
     // cliMain; only the switches are global.
     g_searchCensus = 0;
-    g_twinSkip = kDefTwinSkip;
     g_twinAudit = false;
     g_minPulse = 0;
     g_inputGrid = 0;
@@ -429,12 +442,8 @@ inline void resetInvocationState() {
     g_needTrig = TouchMask{};
     g_needTrigUids.clear();
     g_needUnseen = false;
-    g_activators = kDefActivators;
-    g_coinPick = kDefCoinPick;
     g_airPress = kDefAirPress;
     g_refAdopt = false;
-    g_spawnRoots = kDefSpawnRoots;
-    g_offMoves = kDefOffMoves;
     g_refAdoptT = -1;
     g_refAdoptFields.clear();
     g_groupInit.clear();
@@ -444,23 +453,22 @@ inline void resetInvocationState() {
     g_trigDump = false;
     g_trigEffect = false;
     g_stopDump = false;
-    g_trigWinSel = false;
     g_trigWinNear = -1e18;
     g_spawnRemap = true;
     g_touchRetimeFrom = 0;
-    g_touchRetimeBox = kDefTouchRetimeBox;
-    g_itemsNoBlock = kDefItemsNoBlock;
-    g_walkGates = kDefWalkGates;
     g_fbForceBox = -1;
     g_fbForceTick = 0;
     g_replayOn = false;
-    g_flyHazAfterSolid = false;
     g_fgArmLive = false;
     // ...and the fireB tally. The three counters only ever `++` (cli.hpp:2748,
     // 2749, 2760) and nothing zeroes them, so the line printed at cli.hpp:3504
     // is the PROCESS's running total presented as this solve's -- a number that
     // grows every call and is read as if it did not.
     g_fireBCheck = false;
+    g_groupFire = false;
+    g_groupXSplit = false;
+    g_groupXSplitLayers = 0;
+    g_groupXSplitMax = 0;
     g_fireBNoTick = 0;
     g_fireBNoBit = 0;
     g_fireBTooEarly = 0;

@@ -181,7 +181,7 @@ phantom-death detection, and — where none of that gets the plan across a wall 
 the section solver of §3.1, which searches the game itself there. All of those
 the loop drives itself.
 
-Two things decide how much each repair costs. **The plan length** (cfg
+Three things decide how much each repair costs. **The plan length** (cfg
 `dpstephorizon`): a replay the game ends within one step
 (3,000 ticks) of its anchor says the model is wrong there, so the next solve plans
 one step and lets the game check it; a replay that outlives its step, or a wall the
@@ -193,7 +193,13 @@ gravity and frame), the search stops there and the plan carries on with the old
 plan's inputs. The game still flies all of it; the rejoin only skips solving again
 what the search would have re-derived. On the 22-level suite in one session the
 suite went from 30 minutes (v0.1.4) to 19; the rejoin alone took it from 1,437 s to
-1,120 s.
+1,120 s. **The flight** (cfg `cpflight`, 600 by default): every flight takes a
+checkpoint every 600 ticks, and a plan whose inputs agree with an earlier attempt's up
+to one of those checkpoints is flown from it instead of from tick 0. What the loop
+records per attempt (the anchor rows, the random seeds, the coin state, the
+moving-geometry recording) is taken over from that attempt up to that tick. A clear
+from a checkpoint is not filed: the plan is flown once more from tick 0, and that
+flight's clear is.
 
 Every run is *cold*: no seeds, no previous solutions, no external inputs. The
 fixups of a run live only in that run.
@@ -209,9 +215,10 @@ deepest verified plan to a practice-mode checkpoint before the wall and searches
 **the game itself** from there, breadth-first over the two inputs, the same shape
 as the DP. A leaf that reaches the goal is replayed plainly from the checkpoint,
 and only one the replay reproduces is spliced into the plan, which the game then
-flies from the start of the level like any other. That is affordable because a
-section makes the question narrow: the entry is fixed, the exit is binary and the
-horizon is a few hundred ticks, so there is no fitness function to choose.
+flies like any other, and files only once it has cleared from the start of the
+level. That is affordable because a section makes the question narrow: the entry
+is fixed, the exit is binary and the horizon is a few hundred ticks, so there is
+no fitness function to choose.
 
 [SECTION_SOLVE.md](SECTION_SOLVE.md) has when a rung starts and where its window
 goes, the handoff, the search, the splice and its pin, what it costs and the kind
@@ -221,7 +228,7 @@ of death it cannot see.
 
 With coins on, the collected set is part of the search state, and the loop can
 also work out what a coin needs to have happened first — a key, a touch box, a
-switch — and route through it (cfg `routeprereq`, off by default):
+switch — and route through it (cfg `routeprereq`, on by default):
 [COINS.md](COINS.md).
 
 A level with at least 10,000 objects its run cannot depend on is solved on a copy
@@ -244,9 +251,11 @@ Acceptance for a change is behavioural identity where identity is claimed: the
 CLI must produce byte-identical plans and traces on a fixed suite
 (`py/quick_regress.py`), and the loop must reproduce the cold-run fingerprint —
 iteration, plan hash, death tick and x, fixup hash. The loop prints those itself
-(cfg `dpfingerprint`), and `py/cold_regress.py` compares those `[fp]` lines per
-level against the baseline, which is adopted from a reviewed one-session run
-(`--adopt`). The iteration count is reported with them but does not fail a run;
+(cfg `dpfingerprint`). `py/cold_regress.py` judges a run on clearing, coins and
+the record line, and prints each level's iteration count against the baseline,
+which is adopted from a reviewed one-session run (`--adopt`); the `[fp]` lines are
+compared with the baseline run's separately — the script stores the last one but
+does not check it. The iteration count does not fail a run;
 the wall clock is not deterministic and is never the criterion.
 
 The two halves of that measure different things, and the section suite does not
@@ -257,6 +266,31 @@ and the search is deepest-first: one rule can close four sections and leave the
 count untouched, or improve the physics and double it by sending the run down a
 different route. Both have been measured on the same change. Read the section
 suite as "did the physics move", never as "is this an improvement".
+
+### 4.1 Defaults, and turning one off
+
+The defaults are the configuration the release's cold runs passed with: every model
+rule and loop behaviour those runs used is on without being asked for, and a player
+has no switch for any of them. For an A/B arm each can still be turned off, in the
+session config (`autorun.cfg`, or `py/cold_regress.py --cfg key=value`) or on the
+solver's command line:
+
+| area | on by default | turned off by |
+|---|---|---|
+| the model's rules (`leveldp`) | every measured ramp, dual, portal and kill rule. The 0.4.0 clean-up removed 276 switches, so most have no off arm; a few older rules keep one | `--no-portalpress`, `--no-portalunpin`, `--no-hazendpoint`, `--no-upsidecoyote`, `--no-padtable`, `--no-airpress`, `--no-anchorride`, `--no-rotsplit`, `--no-obb-all` |
+| the repair loop | `cpflight=600`, `dplearnresets=1`, `dpfineretry`, `dpxtrack`, `dpanchorrotstep`, `dpanchorrot2`, `portalpayloadlt`, `offboardtp` | `cpflight=0`, `dplearnresets=-1`, the others `=0` |
+| coins ([COINS.md](COINS.md)) | `dpcoinwin=60,2,700`, `coinapproachreach`, `coinmissearly`, `routeprereq` | `=0` |
+| the section solver ([SECTION_SOLVE.md](SECTION_SOLVE.md)) | `dpsectierfirst`, `dpsecstate`, `secsnapem`, `secjbkeep`, `secheaddash`, `secgracedash`, `secrungcoinoff`, `secbookfirst`, `secredoreach` | `=0` |
+| the level slice ([LEVEL_SLICE.md](LEVEL_SLICE.md)) | `slicetriggers`, `sliceuids`, `slicenotouch`, `slicefirstref`, `slicegiveupcopy` | `=0` |
+
+A switch the clean-up removed is refused by name: `leveldp` stops with "<spelling> was
+removed in <commit>; the behaviour is fixed (since <commit>)", and an `autorun.cfg` that
+names a removed key (`dpladderback`, `dprotextend`, ...) makes the game refuse to solve,
+with the same two commits in `result.txt`. One key is off by default:
+`seccpfallback=1` lets the loop's section searches run on checkpoints again (a
+diagnostic; see [SECTION_SOLVE.md](SECTION_SOLVE.md#4-the-search)). What each key
+does, and what it was measured on, is in its comment in `src/mod/config.hpp`,
+`src/solver/secsolve.hpp` or `src/solver/psnap.hpp`.
 
 ## 5. What the model covers
 

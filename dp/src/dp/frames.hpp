@@ -1,5 +1,6 @@
 #pragma once
 #include "dp/object.hpp"
+#include <atomic>
 
 namespace dp {
 
@@ -199,6 +200,441 @@ inline thread_local int g_tcBranchP1 = 0;
 // GD's ceiling seat even where the ramp window has dropped the ramp. See the
 // branch beside the push-out gate in step.hpp.
 inline bool g_ceilPush = false;
+// A rule below marked "always on since 2026-10" was a switch until the 2026-10 slope clean-up
+// (cli.hpp, kSlopeAlwaysOn): the release turned it on by default, and as a slope rule it then
+// lost the switch, so only its on behaviour is left. Its --name is kept here to be grepped for.
+// --flipceilride (always on since 2026-10): a flipped cube riding the gravity-facing side of a
+// ceiling ramp -- its floor -- keeps riding. See the hang snap in step.hpp.
+// --flipceilland (always on since 2026-10): ...and a single flipped cube LANDING on that side
+// stops, as the dual one already does. See the landing zeroing beside the hang snap in step.hpp.
+// --seattoldual (always on since 2026-10): the falling cube's 1.0 px seat snap on a downhill
+// ramp applies in a dual section too. See seatTolOk in step.hpp.
+// --flipceilend (always on since 2026-10): a flipped cube's ride on a ceiling ramp's floor side
+// ends the way GD's does -- no x window on a continuing contact, and the tick whose
+// seat repeats the last one is dropped. See the window in step.hpp's flipped branch.
+// --relkeepblock (always on since 2026-10): the downhill release keeps a solid's pin from the
+// same tick. See the downhill release in step.hpp.
+// --lawfrombelow (always on since 2026-10): a ramp contact the window accepts and the "came
+// from below" gate rejects still goes to GD's two-stage law. See that gate in step.hpp.
+// --shrinkpress (on by default since 2026-10): a grounded cube jump on the tick a mini portal fires
+// is the mini jump. See the size portal in step.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --repellpolarity (on by default since 2026-10): the dual ball bounce fires only between bodies of
+// the same polarity, GD's own gate, in place of "moving toward the partner". See the bounce
+// in step.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --rampjumptick (always on since 2026-10): a jump taken on a ramp reads the ride's ramp factor
+// one tick further on than an exit on the same tick. See the on-ramp bonus in step.hpp.
+// --ufobanddir (always on since 2026-10): a UFO's above-the-seat landing band on a ramp opens
+// only when the ramp falls away in the body's own travel direction (GD's bVar22). See the
+// landAllow note in step.hpp.
+// --flyhazafterslope (always on since 2026-10): a ship or UFO the ramp pass moved is tested
+// against the hazards again where the ramps left it. See the end of the ramp pass in step.hpp.
+// --slopetopveto (always on since 2026-10): GD's first m_wasOnSlope veto -- a body climbing the
+// ramp it rides skips a ramp of the same top-ness that falls away. See above the ramp loop in
+// step.hpp.
+// --gravportalseat (on by default since 2026-10): a gravity portal is tested at the body's
+// post-collision y (a ramp's seat included) rather than the free y. See the portal pass's yPort in
+// step.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --slopevelexact (always on since 2026-10): a ramp's exit velocity from GD's own formula
+// instead of the three rounded anchors. See slopeExitVy in slopes.hpp.
+// --undernudge (always on since 2026-10): a flying body the game's slope law takes from the
+// underside gets the underside's own vy := min(vy, -2) in its frame when bVar22 holds. See the law
+// seat's application in step.hpp.
+// --portalslopeorder (always on since 2026-10): a gravity portal with a smaller uid than the
+// ramp the body touches on the same tick fires before that ramp, as it does in the game's object
+// loop. See the end of stepOne in step.hpp.
+// --seatkeepfirst (always on since 2026-10): a ramp falling away in the body's travel, met
+// after another ramp has already seated the body on this tick, takes it only from strictly below
+// its seat (no acquisition tolerance), so the earlier ramp stays the one the body rides and leaves.
+// See the ramp loop in step.hpp.
+// --upceilband (always on since 2026-10): a flying body held up under a ceiling ramp whose
+// bVar22 is set gets no band to be lifted onto the line from below. See the upright underside
+// branch in step.hpp.
+// --lawunderrelease (always on since 2026-10): --slopelaw's underside seat of an upright flying
+// body arms the same release as the ceiling push-down. See the law seat in step.hpp.
+// --dualspeedp2 (on by default since 2026-10): a speed portal the second body of a dual touches
+// sets the pair's speed. See the merge in stepBoth (fixup.hpp).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --speedafterseat (always on since 2026-10): a speed portal with a larger uid than the ramp
+// that seated the body on this tick is judged at the seated y. See the speed portals in step.hpp.
+// --rideseatrepeat (always on since 2026-10): a continuing upright ride keeps the ramp past its
+// x window until the clamped seat repeats. See sampleAt in step.hpp.
+// --slopeinset (always on since 2026-10): a fresh contact with a ceiling ramp from below needs
+// the player's rect more than 1 px into the ramp's rect. See the ceiling press and upceil in
+// step.hpp.
+// --preslopegate (always on since 2026-10): the game's preSlopeCollision gate in front of every
+// ramp but the one the body is on. See the top of the ramp loop in step.hpp.
+// --exitbeatsvy (always on since 2026-10): the uphill exit launch only when it beats the body's
+// own vy on its side. See the launch in step.hpp.
+// --wavepadhalf (on by default since 2026-10): pads meet a mini wave with its 6x6 object rect. See
+// the pad loop in step.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --dualremirror (on by default since 2026-10): a mode portal re-mirrors the body that switched
+// into the partner's mode, which can be p1. See the end of stepBoth in fixup.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --undersidev3 (always on since 2026-10): the seat's underside clamp, min(vy,0) upright /
+// max(vy,0) flipped, for every mode. See the ride's velocity chain in step.hpp.
+// --upceilrepeat (always on since 2026-10): the ceiling push-out drops a continuing contact
+// whose seat repeats the last one. See the upceil clamp in step.hpp.
+// --ballceilveto (always on since 2026-10): the two ball ceilings ask the landing's slope veto.
+// See
+// --ballceilflip in step.hpp.
+// --waverotactual (on by default since 2026-10): the wave's sprite eases toward the angle it
+// actually moved at. See the end of stepOne in step.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --padclearsride (always on since 2026-10): a pad other than the gravity pad ends the ride it
+// fires on. See the pad loop in step.hpp.
+// --swingpushflight (on by default since 2026-10, with --swingpushtol): the swing's face reach is
+// the flight 6.0. See the swing push-out in step.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ceillimv4 (always on since 2026-10): the ceiling press places the release nudge on every
+// contact, not only from a rising body. See slope/ceillim in step.hpp.
+// --bandcarryvy (on by default since 2026-10): a ship carried up by the recorded band's floor
+// thrusts on top of its own vy. See the ship's vp in step.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --waveslopelowend (always on since 2026-10): the wave's corner-sampled ramp kill skips a
+// sample past the ramp's thin end. See the wave branch in step.hpp.
+// A flipped body seated on a ceiling ramp's gravity side lands only below hitGround's 5.0. See the
+// hang seat in step.hpp. On by default; --no-hanglandgate restores the old grounding
+// (--hanglandgate is still accepted and changes nothing).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --wavegrowclamp (on by default since 2026-10): a grounded wave that a mode portal makes a bigger
+// body grows from its resting height (kWaveClamp), not from its 5.0 hitbox half. See the portal
+// re-seat in step.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --portalspidertap (on by default since 2026-10): a mode portal hands the button to a spider -- a
+// fresh press teleports it on the portal's tick if grounded, a press it cannot use yet is kept
+// while held (State::pSpiderTap). See the portal pass in step.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --spiderairbuffer (on by default since 2026-10): a spider's press made in the air is kept while
+// held and teleports it on the first grounded tick (State::pSpiderTap, calib_spiderairhold).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --preslopesolid (always on since 2026-10): the wall / strip
+// preSlopeCollision hits is resolved as a 1-px solid (land / head / crush). See the preslopegate
+// block in step.hpp.
+// --ceiltaponce (on by default since 2026-10): the ball's same-tick tap at the invisible ceiling is
+// skipped when this tick already took an impulse, as the floor-side mirror always was (one press,
+// one tap).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ceilcubejump: a flipped cube that lands on the invisible ceiling (the band's) with a press
+// not yet spent jumps on that landing tick, as the upright cube does on the ground plane.
+// On by default since 2026-10 (--no-ceilcubejump turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ceilcontv4: --ceilcont's seat past a ceiling ramp's span also takes the release nudge V4
+// (-2.0 along gravity on the underside), as the in-span branch does through slopeNudge (step.hpp,
+// slope/ceilcont). On by default since 2026-10 (--no-ceilcontv4 turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --shipceiltol4: a flipped ship's continuing ceiling-ramp ride takes GD's tolerance 4 while its
+// band is open, as the cube's does (step.hpp, contRide). On by default since 2026-10
+// (--no-shipceiltol4 turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --upceilfreshend: an upright flight body that meets a descending ceiling ramp's low end from
+// below for the first time -- its contact point already past the span, its centre within pH of
+// the end -- is seated at the end's flat (line(x1) - pH) as a continuing one is (step.hpp, contU).
+// GD acquires on the box overlapping the ramp past its 1-px inset, not on m_wasOnSlope. Custom
+// custom level A t=9,826: a ship rising under ceiling ramp uid4181 (x 14,970..15,000, line
+// 300 -> 270), contact point 2.75 px past x1, head 1.49 px into the ramp: GD y 255.000 exactly
+// (the model's own limit), the model flew on 7.5 px to the next block. On by default
+// (--no-upceilfreshend turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --uforideflap: a UFO flapping off a ramp it rode last tick (rising in the travel direction)
+// takes updateJump's slope term with the ride's velocity, min(target + v/2, 1.4 x target), in
+// place of the constant kUfoRampFlap, mini included (step.hpp, the UFO flap). On by default
+// (--no-uforideflap turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --lawunderstack: a flying body pushed down by one ceiling ramp's underside and acquired on the
+// same tick by the next one's (a law seat lower still) takes the lower seat, as GD's collision
+// pass leaves the last write that intrudes (step.hpp, the law seat). On by default
+// (--no-lawunderstack turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ridenoblockrest: a ship riding a floor ramp upright is not given the resting slide by a
+// block the support scan finds beside the ramp's end; its ride vy carries on (step.hpp, after
+// the support scan). On by default (--no-ridenoblockrest turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --groundflushflat: a downhill ramp whose low end lies on the ground ends an upright cube's
+// ride by the flush flat's window (kStickGap), as a block's face there does (step.hpp, the
+// cube's extrapolated window). On by default (--no-groundflushflat turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --lawfreeclamp: the law seat reads which side of a ramp the body is on against the line
+// clamped to the ramp's span, as the seat itself is (step.hpp, the law's freeSide). On by
+// default (--no-lawfreeclamp turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --lawseatlaunch: a ship the law seat held on its gravity side, on a ramp climbing in the travel,
+// leaves it with the ride's uphill launch scaled by the seat's age (step.hpp, the seat and the end
+// of the step; State::lawSv). On by default (--no-lawseatlaunch turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --flipcubecrush: a flipped cube meeting a floor ramp's top afresh takes the underside rule
+// (dies more than 2 px past the seat outside the flip grace, else left unmoved) instead of a
+// landing (step.hpp, the ride's seat). On by default (--no-flipcubecrush turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --balltapstep: an upright ball tapping off a ramp that falls in the travel takes the seat's
+// step on the tap tick, as the cube's jump does (step.hpp, the impulse tick's seat). On by
+// default (--no-balltapstep turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ballunderv3: a ball meeting a ceiling ramp's underside takes V3 alone (no -2.000 push
+// velocity), and an underside law seat arms the ball's release as it does the flight modes'
+// (step.hpp, upceil and the law seat). On by default (--no-ballunderv3 turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --jumpafterland: a cube jumping off its support on the tick its box first enters a solid's
+// face within the landing tolerance is put on that face first, keeping the jump (step.hpp, the
+// solid landing). On by default (--no-jumpafterland turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --dualflipclock: the second body of a dual keeps its own gravity-flip and mode-switch clocks
+// (State::flipT2 / modeT2, swapped by swapHalves), started when it is born; without it the
+// second body read the first body's. On by default (--no-dualflipclock turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --spiderbandsup: a spider resting on the band's face (a wall band) counts as supported at the
+// head of the tick, so its tap is taken (step.hpp, the cube family's support scan). On by
+// default (--no-spiderbandsup turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --thinsupport (always on since 2026-10): the support scan counts the
+// 1-px strip along a ramp's flat edge, so a body standing on it is grounded for the press
+// (step.hpp).
+// --shipslopecap (always on since 2026-10): a ship's outline around a spiked ramp as measured
+// on the calib_slopespike ship rigs (either gravity) -- caps ph - 1 past the box, window sx0 - ph
+// .. sx1 + ph, the flat side following the inner box (step.hpp, the spiked-ramp kill).
+// --waveslopecap (always on since 2026-10): an upright wave's caps past a ramp's ends sit ph -
+// 1 past the box's edge, not at the line's ends (step.hpp, the spiked-ramp kill;
+// calib_slopespike_wave).
+// --hangrunoff (always on since 2026-10): a ship hanging under a ramp whose contact point has
+// run off the end it travels toward no longer holds the launch-suppression window (step.hpp,
+// rampWindowHere).
+// --dualcubeband (on by default since 2026-10): in a dual, a cube or robot stands on the band's
+// floor (upright) and ceiling (flipped) as the ball and spider do (step.hpp, ceilHere / floorHere).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --dualband (default off): the band inside a dual is updateDualGround's, for either body's mode
+// portal. GD (toggleDualMode, updateDualGround, animateInDualGroundNew, 2.2081):
+//   * the portal that turns the dual ON is kept at layer+0x408 (a dual portal met while the dual is
+//     already on returns early and changes nothing), and every later band is placed from ITS y;
+//   * a mode portal taken by EITHER body calls updateDualGround, whose height is the larger of the
+//     new mode's and the other body's class (240 reads as 270).
+// So (1) p2's own mode portal writes the pair's band -- stepBoth kept only p1's -- with H the max of
+// both bodies' dual heights (step.hpp, the portal band; fixup.hpp stepBoth), and (2) an anchor inside
+// a dual seeds the reference y from the band track's rows, which the portal replay cannot: a dual
+// portal in a group is not in L.portals, so the seed left it at 0 and the next in-dual mode portal
+// wrote bandFor(0, 300) = [90,390] (cli.hpp, the anchor's band seed). Measured on custom level C
+// t=10,570: the dual was turned on at x=6,915 by uid 36984 (cy 465, group 1); GD's band read
+// [330,600] with H 270 and [300,600] with H 300, both bandFor(465, H); the model wrote [90,390].
+inline bool g_dualBand = false;
+// ...its two per-step channels, thread_local because phase 1 steps the layer in parallel.
+// g_bandPortalWrote: set by the portal band write in stepOne (step.hpp), so stepBoth can tell a
+// band the second half WROTE from the one it only carried -- the band's tween (bandAnim) moves
+// every tick, so comparing fields cannot. g_dualOtherMode: the first body's FINISHED mode, handed
+// to the second half's height (GD runs p1's collisions first); -1 = read s.mode2 as before.
+inline thread_local bool g_bandPortalWrote = false;
+inline thread_local int g_dualOtherMode = -1;
+// --dualslide (default off): each dual body keeps its own DART SLIDE arm (State::slideT2 beside
+// slideT; modifiers.hpp slideBoxTouch). GD's is per player: collisionCheckObjects sets THAT body's
+// +0xb78 to 2 when it touches an id-1755 box (0x215ab7), PlayerObject::update steps it down, and
+// collidedWithObjectInternal gives a wave the solid push-out only while it is >= 1. The model had one
+// arm for the pair, so the second body's step read the first's. Measured on custom level C
+// t=10,677-10,680 (hitboxtrace): p1, inside the lower lane's 1755 boxes, is pushed out of block
+// 56076's top at 0.01 px; p2, in the upper lane with no 1755, sinks 0.25-3.48 px into block 56066's
+// top with collidedWithObject returning 0 and dies at 5.1 px -- where the model, on p1's arm, seated
+// p2 at 575 (step.hpp swapHalves, fixup.hpp stepBoth, the dual entry).
+inline bool g_dualSlide = false;
+// --dualdash: each dual body keeps its own dash (State::dashing2 / dashSlope2): GD's m_isDashing is
+// per player, and with one shared field the second body ran the first body's dash (step.hpp
+// swapHalves, fixup.hpp stepBoth, the dual entry, search_key.hpp).
+// On by default since 2026-10 (--no-dualdash turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --hangseatrepeat (always on since 2026-10): a flipped cube's or robot's hang ends on the tick
+// its seat repeats, as a floor ride does under --rideseatrepeat (step.hpp, the hang branch of
+// sampleAt).
+// --sloperot (always on since 2026-10): a cube seated on a ramp turns toward the ramp's own
+// angle, and the ramp's launch spins it the other way at half the take-off size (step.hpp, the
+// cube's spin).
+// --portalpressorder (always on since 2026-10): a mode portal met while a ramp presses the body
+// keeps the press when the ramp comes first in uid order (step.hpp, the free step after a mode
+// portal).
+// --ceilreleaseball (always on since 2026-10): a ball leaving a ceiling ramp's press gets the
+// release's launch as the flying modes do (step.hpp, ceil/release).
+// --undercrush (always on since 2026-10): a cube, robot or spider that takes a ramp's underside
+// outside the 0.1 s grace is not seated -- it dies if it is more than 2 px past the seat, and is
+// left where it is otherwise (step.hpp, the upright ceiling push and the --slopelaw seat).
+// --ufoslopekill (always on since 2026-10): a UFO dies on the ship's measured outline around a
+// spiked ramp (the sloped side at ph, and with --shipslopecap its caps and flat side), instead of
+// by the box overlap the unmeasured modes keep (step.hpp, the spiked-ramp kill).
+// --spikebottom (always on since 2026-10): a spiked ramp's flat-edge
+// strip and wall are the same 1-px solid a plain ramp's are (preSlopeCollision does not read
+// m_slopeIsHazard); the ramp still never seats the body (step.hpp, the preslopegate block and the
+// support scan).
+// --balltapexit (always on since 2026-10): a ball's fresh press on the tick it leaves a ramp
+// with the uphill launch does not tap -- the launch has taken the body off the ground before the
+// buttons run, so it keeps its gravity and the launch's velocity (step.hpp, the top of stepOne).
+// --extseatrepeat (always on since 2026-10): an upright cube riding a downhill ramp's line past
+// its low end keeps the ride while the seat moves and leaves on the tick the clamped seat repeats,
+// the --rideseatrepeat test, instead of on the first tick past the extC window (step.hpp, the extC
+// branch of sampleAt).
+// --tponce (on by default since 2026-10): a teleport portal fires once per contact -- not again
+// while the body is still inside the box it was inside at the previous tick (GD's activatedByPlayer
+// mark; step.hpp, the portal pass).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --tplatch (on by default since 2026-10): ...and once per ATTEMPT, as GD's mark is: a teleport
+// portal takes a bit of State::portalLatch beside the gravity portals (level_loader.hpp numbers
+// them, static and dyn) and does not fire again once set, however the body comes back into its box
+// (step.hpp, the portal pass).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --teleoldpos: on a teleport tick, a portal with a smaller uid than the teleport is judged (and
+// fires) at the position the teleport found the player, as GD's ascending-uid pass reaches it first,
+// instead of being skipped (step.hpp, the portal pass).
+// On by default since 2026-10 (--no-teleoldpos turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --stripvetoorder (OFF by default): a ramp's 1-px top / bottom strip (--preslopesolid) is vetoed
+// only by the ramps GD's slope map holds at that point -- the one last ridden and those with a
+// smaller uid -- not by every ramp in the level (step.hpp, thinSolid). Off because its model-only check A/B is
+// negative: on its own it broke ten custom level A episodes (a ramp that takes the body must veto its own
+// strip, --stripownacq), and with --stripownacq it still breaks two of custom level F (t=6,513, a falling
+// ball GD puts on a ceiling ramp's top strip) that nothing told apart from the witness; with it off
+// the rest of the branch fixes the same 22 and breaks none, the witness (custom level B, iteration 33) included.
+inline bool g_stripVetoOrder = false;
+// --ballungroundramp (on by default; --no-ballungroundramp is the off arm): a ship / UFO that a ramp
+// with a smaller uid than the ball portal seated is not on the ground on the tick it becomes a ball
+// (step.hpp, the mode change in the portal pass).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --contseatclamp (on by default; --no-contseatclamp is the off arm): a ship's CONTINUING ride along a
+// ceiling ramp sits one tick on the corner where it passes onto the next same-sign ramp, as the old
+// ramp's clamped seat puts it in GD (step.hpp, the flipped ceiling pin).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --bandfloorunstick (on by default; --no-bandfloorunstick is the off arm): a grounded ship the flying
+// band's floor puts back on it is off the ramp it was riding -- the slope stick does not pull it
+// back down the line on the same tick (step.hpp, fly/bandcarry and stickHere).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ceilgracerider (on by default; --no-ceilgracerider is the off arm): the flipped ceiling push's
+// exit-side grace (|dx| past the ramp's end) is for a body that rode the ramp last tick only
+// (step.hpp, the flipped ceiling pin).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --lawuplaunch (on by default; --no-lawuplaunch is the off arm): a --slopelaw seat dropped as a
+// repeat on a ramp that rises in the travel launches the body as a ride's uphill exit does
+// (step.hpp, the --lawcontact release).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --dualseatt (on by default; --no-dualseatt is the off arm): each body of a dual keeps its own law-
+// seat count (State::seatT2, swapHalves, the merge in fixup.hpp); shared, the first body's step wrote
+// it over the second's.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ceilfreshrect (on by default; --no-ceilfreshrect is the off arm): the flipped ceiling push takes
+// a fresh contact only through GD's inset-rect test, as the ramp window does (step.hpp, the flipped
+// ceiling pin).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ceilpushreach (on by default; --no-ceilpushreach is the off arm): a fresh flipped ceiling push
+// reaches a ramp by box overlap, as GD's acquisition does, not by the rotated contact point
+// (step.hpp, the flipped ceiling pin).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --stripownacq (on by default; --no-stripownacq is the off arm): under --stripvetoorder a ramp's
+// strip is also vetoed by its own ramp when that ramp takes the body on this tick (step.hpp,
+// thinSolid's veto).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --escufo (on by default since 2026-10): escapee-prune leaves the UFO alone, as it does the ship
+// and the wave (step.hpp, where the measurement is).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --spentdyn (on by default since 2026-10): --spentorb also names rings in dyn (cli.hpp, the
+// seeding).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --radreach (on by default since 2026-10): the cube branch's hazard x window reaches a circle's
+// radius when it is wider than the object's rect (step.hpp, the hazard walk).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --uforot (on by default since 2026-10): the UFO's tilt follows GD's updateShipRotation UFO branch
+// (step.hpp, the rotation update, where the constants and the measurement are).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --spdonce (on by default since 2026-10): a speed portal does not fire again while the body stays
+// in its box (step.hpp, the speed portal pass).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --dualorbflip (on by default since 2026-10): a ring that flips a dual body's gravity couples to
+// the partner the way a gravity portal does (step.hpp, after the ring pass; fixup.hpp stepBoth).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ufolawflap (always on since 2026-10): a UFO the --slopelaw seat held on a ramp rising in
+// its travel the tick before flaps at GD's ramp flap, min(flap + v/2, 1.4 x flap), v the ramp's
+// exit velocity (step.hpp, the seat and the UFO flap; State::lawSv; UfoModel::stepVy).
+// --spiderminigd (on by default since 2026-10): a MINI spider's teleport search in frame 0 is GD's
+// own too (spiderTargetGd), with the strip hung off the centre at the mini's half + 1 and the
+// hazard strip at +-4 x 0.6 (step.hpp, spiderTargetY).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --spawnringjump (on by default since 2026-10, with --orbspawn): the spawn ring's own jump, given
+// on the move of the tick after the press (step.hpp, the end of stepOne).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ballstake (on by default since 2026-10): the ball's spin rate is also written where GD writes
+// it -- 0 on entering the ball (toggleRollMode), the ground rate off a pad (propellPlayer), on a
+// speed portal (updateTimeMod) and on a size portal over a ground stake (togglePlayerScale), the
+// air rate on a gravity portal (flipGravity), airborne or not -- and a ring's stake turns from the
+// next tick (step.hpp, the ball branch and the portal pass).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --boostcarry (on by default since 2026-10): the velocity-limit exemption (State::boost) is kept
+// through every mode and set by its writers in every mode, as GD's byte is, and a pad other than
+// the red one clears it (step.hpp, where the per-tick drop was).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --dualflyring (on by default since 2026-10): a dual ship or UFO takes its fly-ring on the press's
+// tick through the early path, as a single one does (step.hpp, the head of stepOne).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --dyngravseen (on by default since 2026-10): a gravity portal without a latch bit (a grouped one)
+// does not fire again while the body stays in its box, through the mode portals' portSeen slots
+// (step.hpp, the portal pass).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --dropfall (on by default since 2026-10): a drop ring skips the next tick's terminal clamp when
+// GD's playerIsFallingBugged says "not falling" on the firing tick, flipped arm and all (step.hpp,
+// the late ring loop's drop ring).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --repelland (on by default since 2026-10): the dual balls' repel is also decided after BOTH
+// bodies' collisions and before either tap, as GD's checkRepellPlayer is -- which a body that lands
+// on the tick its partner closes in needs (fixup.hpp stepBoth, after the second half).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --repela0c (on by default since 2026-10): the dual balls' repel decided once per tick in stepBoth
+// with GD's own choice of body -- p1's +0xa0c up flips p2, else p2's up flips p1 -- from
+// State::hitG, in place of the rule inside each half (and of --repelland's one case).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --spentaction (on by default since 2026-10): an --start anchor whose hist payload says the press
+// is held and spent seeds action = 1 for a UFO or swing, so the first tick does not read a consumed
+// press as a fresh edge (cli.hpp, the hist seeding).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --rot2 (on by default since 2026-10): each dual body keeps its own sprite angle and spin
+// (State::rot2 / rotStep2 / rotNeg2), so the second body's tests against turned objects read its
+// own angle (step.hpp swapHalves, fixup.hpp stepBoth).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --cubeentryspin: a cube entered in the air from the robot or the spider does not turn until a
+// spin is staked (updateJump's fall stake or the usual ones); see the cube's spin block in step.hpp.
+// On by default since 2026-10 (--no-cubeentryspin turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ringrotsign: a rotated ring's firing box is tested at the ring's own angle (-rot in the math
+// sense), not its mirror; see the late ring loop in step.hpp.
+// On by default since 2026-10 (--no-ringrotsign turns it off).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --a1clatch (on by default since 2026-10): GD's +0xa1c per body (State::a1cLatch) -- raised by the
+// jump, a ring, a pad, a ramp's launch, the head-hit flip and a gameplay rotation, lowered by
+// updateJump the first tick playerIsFallingBugged holds -- and a ramp's exit does not launch a
+// cube, robot or spider, nor release any mode, while it is up (step.hpp, the ramp exit and the
+// ceiling release).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --lawcontact (always on since 2026-10): the tick after the slope law seats an upright body on
+// a floor ramp is GD's continuing contact (m_wasOnSlope): no solid's face the ramp vetoes holds the
+// body, the law re-seats it within the 4 px band and drops a target equal to the last one, and a
+// dropped downhill contact releases at the face's velocity (step.hpp, the law seat and the ramp
+// exit).
+// --padentry (on by default since 2026-10): with all four pad slots taken, a pad the body did not
+// overlap at the previous tick's position fires instead of being skipped (step.hpp, the pad loop).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --forceboxdir (on by default since 2026-10): a force box (2069) pushes along its own direction --
+// rotation and flipY, from calculateForceToTarget -- instead of always up (level_loader.hpp).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ceilwallnopush (always on since 2026-10): an upright ship on a rising ceiling ramp's wall
+// side (dirs {2,3,4,6} with the centre left of the box; the others travelling left, right of it) is
+// not pushed by that ramp -- preSlopeCollision returns the wall first -- so neither the V-valley
+// corner (ceilLimSeat's min with the neighbour) nor cornerReg applies there (step.hpp).
+// --heldtolhead (always on since 2026-10): the spiked-ramp kill's head-side band. A flight mode
+// holding the button, against a ramp bVar22 leaves clear and while not on a slope, dies 1 px (2
+// when it was on a slope last tick) short of the line and cap (step.hpp, the spiked-ramp kill;
+// 0x38ff71..).
+// --heldnodown (always on since 2026-10): the descending floor ramp's +1 of the spiked-ramp
+// kill is the feet side's band, which a ship holding the button does not get (step.hpp;
+// 0x38fe6b-0x38fe7d).
+// --capinsetgate (always on since 2026-10): the spiked-ramp kill's caps sit at the box's edge
+// plus ph; the pixel the rigs measured short of that is the fresh-contact 1-px inset, which a body
+// that was on a slope last tick does not face (step.hpp; 0x38fc0e-0x38fc7b).
+// --ballslopekill (always on since 2026-10): a ball dies on the ship's
+// outline around a spiked ramp instead of by the box overlap (step.hpp, the spiked-ramp kill).
+// --flipcldbg N: print the first N states where the --flipceilland rule acts (print
+// only; it says where in a search the rule takes effect).
+inline std::atomic<int> g_flipLandDbgLeft{0};
 // slope law: the acquisition GD actually performs, in place of --ceilpush's
 // one-sided push-out. See step.hpp's site for what is measured and what is not.
 // On since v0.1.4; always on since the flag clean-up.
@@ -232,8 +668,8 @@ inline bool g_ceilPush = false;
 // (cli.hpp, the plan writer's two-pass latency), which GD and --replay apply one tick
 // LATE. Measured in cold runs: lv12 t=19,034 (ball -> ship at 19,033) and lv14 t=19,638
 // (cube -> ship at 19,637), both SOLVED plans whose own witness lived while --replay of
-// the emitted plan followed GD to its death. Off by default.
-inline bool g_latGap = false;
+// the emitted plan followed GD to its death. On by default since 2026-10 (was opt-in).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
 // --waveslopeside: the wave's floor-ramp kill with the two things the plain rig
 // measured on 2026-09-17 (calib_slopespike_wave and _wave_mini, bisected to 0.006 px,
 // positions converted to the kill tick): a MINI wave's perpendicular distance is 3.0
@@ -253,8 +689,9 @@ constexpr double kWaveSlopeDescendDy = 1.0;
 // ...and past the high end the kill is flat at objMaxY + half - 1.0 (both directions).
 // The downhill +1.0 is the source's tolerance xmm10 = (m_slopeUphill == 0), x4 while
 // m_wasOnSlope, plus a velocity term for a moving ramp (0x38fab3-0x38fb94); only the
-// static, not-sliding case is modelled here.
-constexpr double kWaveSlopeCapInset = 1.0;
+// static, not-sliding case is modelled here. (That 1.0 was kWaveSlopeCapInset; since
+// --waveslopecap and --capinsetgate lost their switches the upright wave's cap is the
+// capped outline's, whose inset is the fresh contact's 1 px -- insetK in step.hpp.)
 // The overlap of the two flipped-wave brackets (m=0.5: 5.83-5.97, m=1: 5.69-5.86).
 constexpr double kWaveFlipSlopeKillD = 5.845;
 // (--nofreeside, which dropped --slopelaw's one empirical conjunct, is gone since the flag clean-up.)
@@ -263,6 +700,12 @@ constexpr double kWaveFlipSlopeKillD = 5.845;
 // on; the switch is gone since the flag clean-up.
 inline thread_local bool g_preBtnSet = false;
 inline thread_local double g_preBtnY = 0.0;
+// Did the last stepOne's ball tap? Written by stepOne (cleared on entry, set from its own
+// ballFlippedThisTick near the end), read by stepBoth right after each half (--repelland).
+inline thread_local bool g_ballTapped = false;
+// ...and the body's +0xa0c as the repel reads it: after this tick's collisions, before its tap
+// (--repela0c; stepOne writes it next to g_ballTapped).
+inline thread_local uint8_t g_hitGRepel = 0;
 
 // ---- THE 2.2 TRIGGER QUEUE (channel / ord) ---------------------------------
 //
@@ -447,11 +890,31 @@ inline const char* const kHistNames[] = {"pressSpent", "pressSpent2"};
 // (player+0x820 against the clock at +0xaa0), State::spiderJumpT. An anchor
 // taken inside that window otherwise starts saturated and kills on the solid
 // side GD spares.
-inline std::array<const char*, 4> histNamesFor(int version) {
-    if (version == 3) return {"pressSpent", "pressSpent2", "freeMode", "spiderJumpT"};
-    if (version == 2) return {"pressSpent", "pressSpent2", "freeMode", nullptr};
-    return {kHistNames[0], kHistNames[1], nullptr, nullptr};
+// Version 4 adds p1's slope ride as GD's raw facts: `slopeOn` (+0x9b0),
+// `slopeUnder` (+0x9b8), `slopeUid` (the ramp at +0x678), `slopeAge` (ticks
+// since the ride's clock +0x598 was stamped, read against +0xaa0) and
+// `slopeLanded` (a grounded row since then). -1 = not said. Parsed always,
+// seeded only under --anchorride (cli.hpp maps them onto the ride fields).
+inline std::array<const char*, 9> histNamesFor(int version) {
+    if (version == 4)
+        return {"pressSpent", "pressSpent2", "freeMode", "spiderJumpT", "slopeOn",
+                "slopeUnder", "slopeUid", "slopeAge", "slopeLanded"};
+    if (version == 3)
+        return {"pressSpent", "pressSpent2", "freeMode", "spiderJumpT", nullptr,
+                nullptr, nullptr, nullptr, nullptr};
+    if (version == 2)
+        return {"pressSpent", "pressSpent2", "freeMode", nullptr, nullptr,
+                nullptr, nullptr, nullptr, nullptr};
+    return {kHistNames[0], kHistNames[1], nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr};
 }
+// --anchorride / --no-anchorride (default on since 2026-09-30): seed the anchor's
+// slope-ride fields from the hist payload's version-4 values (cli.hpp, after the
+// geometric guess rideAtAnchor). A payload before version 4 seeds nothing, so a
+// run without the recording keeps the guess. On together with the mod's cfg
+// histride, which writes version 4 and passes one of the two flags on every
+// anchored call (config.hpp).
+inline bool g_anchorRide = true;
 // Which subsystems this payload claims. The lock and the rotation queue keep
 // their own seeding until someone measures a reason to move them.
 inline bool g_ownsTouch = false;

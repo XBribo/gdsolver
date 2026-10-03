@@ -54,25 +54,109 @@ inline int envTwinUid(int uid) { return kEnvTwinUidBase + uid; }
 // first one that has it is enough. Empty when none does.
 inline std::unordered_map<int, uint8_t> g_groupInit;
 
+// sscanf's %d and %f, one field at a time, on a recording held in memory. The reader was
+// getline + sscanf("%d,%d,%f,%f,%f,%f,%d,%f,%d"), and on a custom level's 1.5M-row recording that
+// was over two seconds of every call that found a recording changed (MOAI, measured 2026-09-30).
+// These read the same text the same way: blanks before a number are skipped, the comma after it
+// must follow directly, and the first field that does not convert ends the line with the count so
+// far -- so a line cut off mid-write still loads or is skipped exactly as before.
+namespace groupscan {
+
+inline bool blank(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+inline bool digit(char c) { return c >= '0' && c <= '9'; }
+
+inline bool scanInt(const char*& p, const char* e, int& out) {
+    const char* q = p;
+    while (q < e && blank(*q)) ++q;
+    bool neg = false;
+    if (q < e && (*q == '+' || *q == '-')) neg = *q++ == '-';
+    if (q >= e || !digit(*q)) return false;
+    long long v = 0;
+    for (; q < e && digit(*q); ++q)
+        if (v < 100000000000LL) v = v * 10 + (*q - '0');
+    out = (int)(neg ? -v : v);
+    p = q;
+    return true;
+}
+
+// A plain decimal (the recorder writes %.3f) is m / 10^k with m below 2^53: the quotient of two
+// exact doubles is the correctly rounded double, and with at most 8 fractional digits a value that
+// is not a float's rounding midpoint cannot be within half a double ulp of one, so narrowing it
+// gives the correctly rounded float -- the value %f produces. Anything else (an exponent, inf, nan,
+// hex, more digits) goes to strtof, the C library's own reading of the same grammar.
+inline bool scanFloat(const char*& p, const char* e, float& out) {
+    static const double kPow10[] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8};
+    const char* q = p;
+    while (q < e && blank(*q)) ++q;
+    const char* s = q;
+    bool neg = false;
+    if (q < e && (*q == '+' || *q == '-')) neg = *q++ == '-';
+    unsigned long long m = 0;
+    int nInt = 0, nFrac = 0;
+    for (; q < e && digit(*q); ++q, ++nInt)
+        if (nInt < 18) m = m * 10 + (unsigned long long)(*q - '0');
+    if (q < e && *q == '.') {
+        ++q;
+        for (; q < e && digit(*q); ++q, ++nFrac)
+            if (nInt + nFrac < 18) m = m * 10 + (unsigned long long)(*q - '0');
+    }
+    const bool letterNext = q < e && ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z'));
+    if (nInt + nFrac > 0 && nInt + nFrac <= 15 && nFrac <= 8 && !letterNext) {
+        const double d = (double)m / kPow10[nFrac];
+        out = (float)(neg ? -d : d);
+        p = q;
+        return true;
+    }
+    // strtof skips blanks itself, and from the line's end that would read the next line's number.
+    if (s >= e) return false;
+    char* end = nullptr;
+    const float v = std::strtof(s, &end);
+    if (end == s) return false;
+    out = v;
+    p = end;
+    return true;
+}
+
+// A literal in the format: must be the very next character.
+inline bool scanChar(const char*& p, const char* e, char c) {
+    if (p >= e || *p != c) return false;
+    ++p;
+    return true;
+}
+
+}  // namespace groupscan
+
 // `initOut`, when given, receives the `init,<uid>,<on>` lines: each tracked object's on/off as
 // the game's reset left it, before the first update (the mod's grouptrace::snapshotInit) -- the
 // t=0 an object's switches (OnEvent) are applied to. A recording made before those lines existed
 // leaves it empty. Without `initOut` the lines are skipped, as they always were.
-inline GroupTimeline loadGroupTimeline(const std::string& path,
-                                       long long* endOut = nullptr,
-                                       std::unordered_map<int, uint8_t>* initOut = nullptr) {
+// `bytes` is the whole file; `path` only names it in the line this prints.
+inline GroupTimeline parseGroupTimeline(const std::string& bytes, const std::string& path,
+                                        long long* endOut = nullptr,
+                                        std::unordered_map<int, uint8_t>* initOut = nullptr) {
+    using namespace groupscan;
     if (endOut) *endOut = -1;
     if (initOut) initOut->clear();
     GroupTimeline g;
-    std::ifstream in(path);
-    if (!in) {
-        std::fprintf(stderr, "groups: cannot open %s\n", path.c_str());
-        return g;
-    }
-    std::string line;
-    std::getline(in, line);   // header
+    const char* p = bytes.data();
+    const char* const end = p + bytes.size();
+    // Lines as getline on a text-mode stream gives them: split at '\n', a '\r' before it dropped.
+    auto nextLine = [&](const char*& b, const char*& e) {
+        if (p >= end) return false;
+        b = p;
+        const char* nl = static_cast<const char*>(std::memchr(p, '\n', (size_t)(end - p)));
+        e = nl ? nl : end;
+        p = nl ? nl + 1 : end;
+        if (nl && e > b && e[-1] == '\r') --e;
+        return true;
+    };
+    const char* b = nullptr;
+    const char* e = nullptr;
+    nextLine(b, e);   // header
     long long rows = 0;
-    while (std::getline(in, line)) {
+    while (nextLine(b, e)) {
         int t = 0, uid = 0, on = 1, env = 0;
         float cx = 0, cy = 0, w = 0, h = 0, rot = 0;
         // a run that is cut off mid-write leaves one short line; skip it.
@@ -81,18 +165,29 @@ inline GroupTimeline loadGroupTimeline(const std::string& path,
         // used to mean). `env` is written only on the rows that have it (the box
         // GD's random numbers can put the object in, DynSample::env), always
         // after a `rot`.
-        if (line.rfind("end,", 0) == 0) {
-            if (endOut) *endOut = std::atoll(line.c_str() + 4);
+        const size_t len = (size_t)(e - b);
+        if (len >= 4 && !std::memcmp(b, "end,", 4)) {
+            if (endOut) *endOut = std::atoll(std::string(b + 4, e).c_str());
             continue;
         }
-        if (line.rfind("init,", 0) == 0) {
+        if (len >= 5 && !std::memcmp(b, "init,", 5)) {
+            const char* q = b + 5;
             int u = 0, o = 1;
-            if (initOut && std::sscanf(line.c_str() + 5, "%d,%d", &u, &o) == 2)
+            if (initOut && scanInt(q, e, u) && scanChar(q, e, ',') && scanInt(q, e, o))
                 (*initOut)[u] = o ? 1 : 0;
             continue;
         }
-        const int n = std::sscanf(line.c_str(), "%d,%d,%f,%f,%f,%f,%d,%f,%d", &t,
-                                  &uid, &cx, &cy, &w, &h, &on, &rot, &env);
+        const char* q = b;
+        int n = 0;
+        if (scanInt(q, e, t) && ++n && scanChar(q, e, ',') && scanInt(q, e, uid) && ++n
+            && scanChar(q, e, ',') && scanFloat(q, e, cx) && ++n
+            && scanChar(q, e, ',') && scanFloat(q, e, cy) && ++n
+            && scanChar(q, e, ',') && scanFloat(q, e, w) && ++n
+            && scanChar(q, e, ',') && scanFloat(q, e, h) && ++n
+            && scanChar(q, e, ',') && scanInt(q, e, on) && ++n
+            && scanChar(q, e, ',') && scanFloat(q, e, rot) && ++n
+            && scanChar(q, e, ',') && scanInt(q, e, env))
+            ++n;
         if (n < 6) continue;
         g[uid].push_back({t, cx, cy, w * 0.5f, h * 0.5f,
                           (uint8_t)(on ? 1 : 0), rot, (uint8_t)(env ? 1 : 0)});
@@ -100,10 +195,23 @@ inline GroupTimeline loadGroupTimeline(const std::string& path,
     }
     for (auto& kv : g)
         std::sort(kv.second.begin(), kv.second.end(),
-                  [](const DynSample& a, const DynSample& b) { return a.t < b.t; });
+                  [](const DynSample& a, const DynSample& b2) { return a.t < b2.t; });
     std::printf("groups: %lld samples for %zu objects (%s)\n", rows, g.size(),
                 path.c_str());
     return g;
+}
+
+inline GroupTimeline loadGroupTimeline(const std::string& path,
+                                       long long* endOut = nullptr,
+                                       std::unordered_map<int, uint8_t>* initOut = nullptr) {
+    std::string bytes;
+    if (!readFileBytes(path, bytes)) {
+        if (endOut) *endOut = -1;
+        if (initOut) initOut->clear();
+        std::fprintf(stderr, "groups: cannot open %s\n", path.c_str());
+        return GroupTimeline{};
+    }
+    return parseGroupTimeline(bytes, path, endOut, initOut);
 }
 
 // --groupholdend <n>: the bootstrap takes over only n ticks AFTER the overriding
@@ -117,6 +225,10 @@ inline GroupTimeline loadGroupTimeline(const std::string& path,
 // row (t=16,252); the bootstrap has it at x 26,376 with on=0 on t=16,253, so the
 // model's hazard never saw it and GD killed the same plan four times.
 inline int g_groupHoldEnd = 0;
+// The last tick the --groups recordings cover (the largest `end,<tick>` trailer among the
+// files; -1 = no trailer, or no recording). Read by --ridebox to tell a ride the recording
+// saw end from one it was still inside when it stopped.
+inline long long g_groupsEndT = -1;
 
 // Bootstrap re-timing: an object that is still MOVING where the live recording ends
 // continues on the bootstrap's rows, and those are on the bootstrap run's

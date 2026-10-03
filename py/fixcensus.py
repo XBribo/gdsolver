@@ -259,13 +259,17 @@ def trigger_schema_problem(lv: int, extra: tuple[str, ...] = ()) -> str | None:
 def seg_diverge(lv: int, t0: int, span: int, exe: Path, tmp: runtmp.RunTmp,
                 eps: float, gd_ground: str = GD_GROUND_RAW,
                 all_hits: bool = False,
-                extra: tuple[str, ...] = ()) -> list[dict]:
-    """Anchor one section from the real GD state, replay it, hand it to eval_trace."""
+                extra: tuple[str, ...] = (),
+                refs: qr.LevelRows | None = None) -> list[dict]:
+    """Anchor one section from the real GD state, replay it, hand it to eval_trace.
+
+    `refs` holds the level's read_ref rows, parsed once for all of its sections
+    (quick_regress.LevelRows); without it they are read for this section alone."""
     why = trigger_schema_problem(lv, tuple(extra))
     if why:
         raise SystemExit(f"fixcensus: {why}")
     plan = plan_of(lv, str(DATA / "solution_lv{}_dp.txt"))
-    gd = read_ref(lv)
+    gd = refs.get(lv) if refs else read_ref(lv)
     objrects = LEVEL_DATA / f"objrects_lv{lv}.txt"
     if not plan.exists() or t0 not in gd:
         return []
@@ -292,7 +296,7 @@ def seg_diverge(lv: int, t0: int, span: int, exe: Path, tmp: runtmp.RunTmp,
     if obb.exists():
         a += ["--obb", str(obb)]
     a += groups_args(plan)
-    a += ctrlwin_args(lv)
+    a += ctrlwin_args(lv, gd)
     a += qr.rot_anchor_args(lv, t0)
     # ...and the pads the run had already fired before t0 (the same producer
     # quick_regress uses, so the two instruments anchor identically). Without
@@ -490,13 +494,22 @@ def census(a, tmp: runtmp.RunTmp) -> int:
             jobs.append((lv, t))
             t += a.seg_step
 
+    per_level: dict[int, int] = {}
+    for lv, _ in jobs:
+        per_level[lv] = per_level.get(lv, 0) + 1
+    refs = qr.LevelRows(read_ref, per_level)
+
+    def one(lv: int, t: int) -> list[dict]:
+        try:
+            return seg_diverge(lv, t, a.seg_len, Path(a.leveldp), tmp, a.eps,
+                               a.gd_ground, a.all_hits, tuple(a.extra_flag), refs)
+        finally:
+            refs.release(lv)
+
     t0 = time.time()
     found: list[dict] = []
     with ThreadPoolExecutor(max_workers=a.parallel) as ex:
-        futs = [ex.submit(seg_diverge, lv, t, a.seg_len, Path(a.leveldp),
-                          tmp, a.eps, a.gd_ground, a.all_hits,
-                          tuple(a.extra_flag))
-                for lv, t in jobs]
+        futs = [ex.submit(one, lv, t) for lv, t in jobs]
         for f in futs:
             found += f.result()
     # Taken here rather than at the census call so the headline still times THE

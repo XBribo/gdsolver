@@ -440,6 +440,13 @@ inline double padTableVy(int type, int mode, bool mini) {
 // It also gives the pink ring its ship and UFO ratios (ringJump: ship 0.37, UFO 0.42) in place of
 // the cube's 0.72: a custom level t=8,678 and another custom level t=11,196, mini ship, GD -3.309 = 11.18 x 0.37 x 0.8.
 inline thread_local int g_flyRingNested = 0;
+// --portalslopeorder's re-run (frames.hpp; the end of stepOne): the uid of the gravity portal
+// the nested step fires ahead of the ramp pass, -1 when no re-run is in progress.
+inline thread_local int g_prePortalUid = -1;
+// --balltapexit's re-run (frames.hpp; the top of stepOne): 1 while the nested step runs with the
+// ball's fresh-press taps held back, and whether the uphill launch fired in it.
+inline thread_local int g_ballTapNested = 0;
+inline thread_local int g_ballTapLaunch = 0;
 // Ring once (was --ringonce, always on since 2026-09-26): a fired ring never fires again in the
 // run, remembered for the last five rings a body fired (usedOrb, usedOrbOld and
 // State::usedOrbHist) instead of two. GD refuses a ring it has fired even after other rings in

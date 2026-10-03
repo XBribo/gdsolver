@@ -153,6 +153,83 @@ inline double g_portalDodgeMin = 0.1;
 // ...and the same for SPEED portals, but OFF by default (see the note at the
 // use site). --speeddodge <px>.
 inline double g_speedDodgeMin = 0.0;
+// THE GLITCH-AVOID MODE (both 0 = off; the user's option, never a cold's default). Routes that
+// only work by frame-level precision are dropped from the search -- not the physics, which stays
+// GD's. Two shapes, each measured on an official solution the user named as a glitch:
+//   --glitchportal <px>  a branch that passes a portal which would change something (mode,
+//                        size, gravity, dual, teleport AND speed) by less than this is dropped,
+//                        unless it is still closing on it -- g_portalDodgeMin / g_speedDodgeMin
+//                        widened. lv17's wave slips under a ship portal 8-10 px clear, lv22's
+//                        early dash release passes a 1x portal 12.3 px clear.
+//   --glitchwave <px>    a wave that comes this close to something that kills it (a hazard, or a
+//                        solid it cannot slide on) is dropped. lv17's wave rides 0-4 px over a
+//                        row of spikes, switching the button every 2 ticks. The level's floor and
+//                        ceiling are not objects and the 1755 slide seat is exempt: touching those
+//                        is how the wave is meant to be flown.
+//   --glitchembed <px>   a ship, ufo or swing that ends a tick with its outer box this deep in a
+//                        solid is dropped: the ship half sunk into a step, which lives only
+//                        because GD's crush test reads the inner box. The depth has to stay above
+//                        what ordinary flying reaches: lv1's third coin sits behind a slot exactly
+//                        as tall as the ship, flown 11.4 px into its step, and the mod's default
+//                        is 14 (config.hpp kGlitchEmbedDefault).
+inline double g_glitchPortal = 0.0;
+inline double g_glitchWave = 0.0;
+inline double g_glitchEmbed = 0.0;
+//   --glitchdeco         a decoration that is a hazard's look (90% of its placements sit on
+//                        that hazard) and is placed without one is loaded as that hazard
+//                        (level_loader.hpp addHazardLookalikes, where g_glitchDeco lives: the
+//                        loader comes first in the header chain): the hole in lv20's first
+//                        spike wall is two such edge pieces with nothing under them.
+// --coinwin <yBin>,<vyBin>,<len> (all 0 = off): with --coins, a state inside the approach window
+// of a coin it still lacks -- x in [coin - len, coin + hw], frame 0, the coin's miss prune final --
+// gets a cap class of its own per (y / yBin, vy / vyBin) cell, so the alive cap's water-fill keeps
+// a share of every cell there instead of one stride over the whole layer. lv22's second coin sits
+// in a pocket above a spike row, entered from below through a gap: the route dives to the floor
+// ~520 px before the coin and climbs at full speed from there, a minority of the swing layer that
+// the stride thins out long before the gap. At cap 40,000 every branch then passes under the coin
+// and the miss prune empties the frontier (x=10,555, from every anchor the ladder tries -- in the
+// ordinary coin run too, where only the in-game section solve found the pocket). With the cells the
+// same call keeps it and takes the coin. The cell needs BOTH axes: a y grid alone is still pruned
+// (the pocket route is not rare in y, only in y and vy together).
+inline double g_coinWinY = 0.0;
+inline double g_coinWinVy = 0.0;
+inline double g_coinWinLen = 0.0;
+// --ladderback (on by default since 2026-10, --no-ladderback the off arm; cli.hpp cliMain, step
+// 3; it acts only inside --capladder): a death inside a --capladder window changes one
+// thing at a time -- the lead (x2) or the cap (x4) -- starting with the lead, keeping a kind that
+// moved the death (a later death tick) and swapping one that did not. A wall that one step of each
+// kind has left in place, or with both kinds spent, goes to the plain search as the default's
+// does. The default raises both together, so a window has the full cap after two repeats at a lead
+// of 1,200 px and the ladder goes to the plain search, which drops the grid and searches the whole
+// level at the full cap. Walls come in kinds: lv14's crossed with a longer lead at cap 500 where
+// the default had gone to 2000 and then plain; lv19's at x 28,074 did not move for any lead at cap
+// 500 and moved at once at cap 2000; lv20's at x 22,888 moves for nothing at all.
+// Official 1-22 from t=0 on RC9, the loop's base search, offline: 153.5 -> 136.7 s coins off,
+// 160.1 -> 163.3 s coins on, 22/22 either way (lv14 24 -> 9 s; lv19 20 -> 23 s and lv21 10 ->
+// 11 s pay for the lead step at a wall that wanted the cap).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --ladderx0 (off; with --ladderback; a measurement): the window from x 0 at the full cap, once,
+// before the plain search at a wall neither kind of step moved (cli.hpp cliMain step 3). It
+// crosses lv16's wall at x 11,371 (34 -> 11 s) and costs every wall no search crosses a second
+// plain-sized search: RC9 lv20 26 -> 54 s offline, SubZero 4002 with coins 251 -> 853 s of dp in
+// the cold.
+inline bool g_ladderX0 = false;
+// --capenvelope (off; --ladderenv passes it to the attempts after a coin's miss prune, cli.hpp
+// cliMain): a class the alive cap thins keeps its lowest and its highest state
+// (by y, then vy, then layer order) before the stride takes the rest of its share. The stride
+// samples in layer order, so a lane at the edge of a class's heights is a minority it can drop on
+// any layer, and a lane dropped once is gone (lv1 with coins, cap 125: the high lane to the last
+// coin drifts out over ~2,300 px). On every search it costs more than it saves: official 1-22 from
+// t=0, 184 -> 238 s coins off, lv11 6 -> 34 s.
+inline bool g_capEnvelope = false;
+// --ladderenv (on by default since 2026-10, --no-ladderenv the off arm; with --ladderback): the
+// envelope step above. A frontier that died at a coin's
+// miss prune (SearchOutcome::coinWall: the deepest x at the far edge of a coin whose passing is
+// final) gets the next attempt with --capenvelope at once, once per coin; kept for the rest of the
+// ladder if it moved the death, dropped if not. Nowhere else: without coins the ladder is
+// --ladderback's own. Official 1-22 from t=0 on RC9, with coins: 163.3 -> about 146 s, lv1 26 ->
+// 4 s.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
 // (--rotport lives in bands.hpp: dynamics.hpp reads it and comes first in the
 // header chain.)
 // out-of-play bound, set from the level's own geometry (see Level::maxY)

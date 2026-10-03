@@ -148,6 +148,13 @@ struct State {
     // dual's two bodies share it (not in swapHalves).
     int16_t prevC6q = 0;
     float slopeM;
+    // --ufolawflap only (0 otherwise): GD's m_slopeVelocity as this tick's --slopelaw seat left it
+    // for a UFO -- the seat is collidedWithSlopeInternal, which writes m_isOnSlope and the ramp's
+    // velocity whatever it then decides about landing -- when the ramp rises in the travel
+    // direction, else 0. The next tick's flap reads it (step.hpp, the UFO flap). One tick of life
+    // (cleared at the top of stepOne), not seeded; single-player only (a dual's halves would share
+    // it, as they share seatT).
+    float lawSv = 0.f;
     // Ticks since gravity last flipped, saturated at 24 -- the same 0.1 s at
     // 240 ticks/s as slopeT above, and read the same way: GD stamps the time in
     // flipGravity (player+0x800) and collidedWithObjectInternal (:1180-1226)
@@ -184,6 +191,9 @@ struct State {
     // armT uses it. NOT carried by --start yet: an anchor taken inside the arm's
     // 2-tick window would need it, and nothing has measured one.
     uint8_t slideT = 255;
+    // ...the SECOND body's, under --dualslide (frames.hpp g_dualSlide): GD's +0xb78 is per player.
+    // Swapped with slideT for p2's step only under the flag, so off it is inert and stays 255.
+    uint8_t slideT2 = 255;
     // Ticks since the SPIDER last teleported -- its tap, a spider pad or a spider orb --
     // saturating at kSpiderJumpGraceTicks. GD stamps the time in spiderTestJumpInternal
     // (player+0x820) and collidedWithObjectInternal (0x391a70, the side-kill block after the
@@ -384,6 +394,12 @@ struct State {
     // 1-tick lifetime. The anchor (--start) does not carry it -- a documented
     // hole only when a section head lands on the 1 tick right after the portal.
     uint8_t pFlap = 0;
+    // --portalspidertap / --spiderairbuffer only (0 otherwise): a SPIDER press
+    // that could not be used yet -- handed over by a mode portal
+    // (calib_portalspider) or made in the air (calib_spiderairhold). Kept while
+    // the button stays down, spent by the teleport, which happens on the first
+    // grounded tick. Not carried by the anchor, like pFlap.
+    uint8_t pSpiderTap = 0;
     // [2026-08-19 D9, REMOVED 2026-09-03] `pBallOff` used to mark the tick on
     // which a ball left its surface through a gravity flip in a rotated frame,
     // so that the next tick could write vy := -1.000. There is no such write in
@@ -456,6 +472,9 @@ struct State {
     uint8_t dual;
     // the second body had nothing within reach this tick (see stepBoth)
     uint8_t freeHalf = 0;
+    // --dualseatt: the second body's law-seat count (see seatT). It accumulates and is not seeded
+    // (seatT is not either).
+    uint8_t seatT2 = 0;
     float y2, vy2, slopeM2, snapDist2;
     uint8_t grounded2, flip2, ringHold2, onSlope2;
     uint8_t pressSpent2 = 0;   // second body's pressSpent (see pressSpent)
@@ -1035,6 +1054,56 @@ struct State {
     // lineage obeys its own count, so a merge only chooses among lineages that all kept the rule.
     // At the END on purpose (positional State{...}).
     uint8_t edgeAge = 255;
+    // --sloperot: the cube's spin was staked by a ramp's launch (PlayerObject::boostPlayer,
+    // 0x39fee0), which writes m_rotationSpeed = (flip ? +180 : -180) / (0.8666667 | 0.6666667):
+    // half the take-off's size and the other way round. 1 = turn at that size (with rotNeg holding
+    // its sign) until the next event stakes the spin again. Written and read only under the flag.
+    // It accumulates; the --start anchor seeds it from the 30th field (the turn the reference
+    // measured) when that is a boost's size. At the END on purpose (positional State{...}).
+    uint8_t rotBoost = 0;
+    // --spdonce: the last two speed portals this body fired, newest first (uids, -1 = empty). GD
+    // marks a speed portal when it activates it and does not activate it again (activatedByPlayer),
+    // so one still under the body after a second portal has changed the speed does not take it
+    // back. Written and read only under the flag; not seeded at an anchor (a portal fired before t0
+    // and still under the body re-fires there, as it did before the flag). At the END on purpose.
+    int32_t spdFired[2] = {-1, -1}, spdFired2[2] = {-1, -1};
+    // --repela0c: GD's +0xa0c per body at the end of the tick -- hitGround sets it on every tick
+    // the body is on the ground, a jump with the button held (the ball's tap) and propellPlayer
+    // clear it, and nothing else touches it, so it outlives a walk off an edge or a repel. The
+    // dual balls' repel (checkRepellPlayer) reads it to choose which body to flip (fixup.hpp
+    // stepBoth). It accumulates; the --start anchor seeds it from the grounded fields (cli.hpp),
+    // which misses a body that left the ground without a tap or a pad. At the END on purpose.
+    uint8_t hitG = 0, hitG2 = 0;
+    // --rot2: the SECOND body's own sprite angle and spin stake (see rot / rotNeg / rotStep). The
+    // pair used to share p1's, so every turned object p2 met was tested against p1's angle --
+    // the mirror of p2's own for a mirrored UFO. Swapped by swapHalves and merged by stepBoth
+    // under the flag only; seeded from the 31st-33rd --start fields (p1's when not said).
+    // It accumulates. At the END on purpose.
+    // (rotNeg2 first: it takes the byte after hitG2, so the two floats cost 8 bytes and not 16.)
+    uint8_t rotNeg2 = 0;
+    // --a1clatch: GD's +0xa1c, bit 0 for the body being stepped and bit 1 for the second body
+    // (swapHalves swaps the two bits, stepBoth merges bit 1 from the second half). updateJump's
+    // jump block (0x38bbda), ringJump for every impulse ring but the drop ring (0x3991fe),
+    // propellPlayer (0x39f86e), boostPlayer (0x39feee), didHitHead's flip (0x393c7f) and
+    // rotateGameplay (0x399fe0) raise it; updateJump lowers it the first tick
+    // playerIsFallingBugged holds (0x38c154, and 0x38cb2f on the flying branch). postCollision
+    // reads it at a ramp's exit (0x38d7f5, 0x38da69). It accumulates and is NOT seeded at an
+    // --start anchor (the dump has no column for it), so an anchor starts it at 0; printed in
+    // --seeddump under the flag. One byte for both bodies: it takes the padding byte after
+    // rotNeg2, so sizeof is unchanged. 0 whenever the flag is off.
+    uint8_t a1cLatch = 0;
+    // --dualdash: the SECOND body's dash (see dashing / dashSlope), swapped by swapHalves and
+    // merged by stepBoth under the flag. Held, so it accumulates; NOT seeded at an --start anchor
+    // (the 17th/18th fields carry p1's only, as for boost2), and 0 whenever the flag is off.
+    // dashing2 takes the padding byte after a1cLatch.
+    uint8_t dashing2 = 0;
+    // --dualflipclock: the SECOND body's own gravity-flip and mode-switch clocks (see flipT /
+    // modeT), swapped by swapHalves and merged by stepBoth under the flag. A body born at a dual
+    // portal starts both at 0 (it is spawned upside down, in its own mode). Like flipT, not
+    // carried by --start (255 = no grace). In the padding after dashing2, so sizeof is unchanged.
+    uint8_t flipT2 = 255, modeT2 = 255;
+    float rot2 = 0.f, rotStep2 = 0.f;
+    float dashSlope2 = 0.f;
 };
 
 // THIS ASSERT IS A QUESTION, NOT A BUDGET. If you added a field and the build
@@ -1109,8 +1178,22 @@ struct State {
 // One tick of memory, rewritten every tick, so there is nothing to seed; printed in --seeddump.
 // [2026-09-25] 440 -> 480: touchRing / touchRing2 and their touched bits (--ringorder). Two ticks
 // of memory, not seeded (see the field); printed in --seeddump.
+// [2026-09-30] 480 -> 496: spdFired / spdFired2 (--spdonce, the last two speed portals fired per
+// body). They accumulate and are not seeded, for usedOrbOld's reason; printed in --seeddump.
+// [2026-09-30] hitG / hitG2 (--repela0c) landed in the tail padding: still 496.
+// [2026-09-30] 496 -> 504: rotNeg2 / rot2 / rotStep2 (--rot2, the second body's own angle and
+// spin). They accumulate; seeded from the 31st-33rd --start fields (p1's when not said), not
+// printed in --seeddump yet.
+// [2026-09-30] a1cLatch (--a1clatch, both bodies' +0xa1c in one byte) landed in the padding
+// after rotNeg2: still 504. It accumulates and is not seeded (see the field).
+// [2026-09-30] 504 -> 512: lawSv (--ufolawflap), one tick of life, so nothing to seed.
+// [2026-10-01] 512 -> 520: dashSlope2 (--dualdash; dashing2 took the padding after a1cLatch). Both
+// accumulate (a dash is held) and are NOT seeded at an anchor: the --start line has one dash pair
+// and it seeds p1's, as boost2's note says of its own field. Not printed in --seeddump yet.
+// [2026-10-02] seatT2 (--dualseatt) landed in the padding after freeHalf: still 520. It accumulates
+// and is not seeded, as seatT is not.
 constexpr size_t kStateBytes =
-    (480u + (size_t)(kTouchBits - 32) * sizeof(uint16_t)
+    (520u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
           + (sizeof(TouchMask) - sizeof(uint32_t))
           + 2u * (sizeof(GravLatch) - sizeof(Bits<128>)) + 7u) / 8u * 8u;
 static_assert(sizeof(State) == kStateBytes,

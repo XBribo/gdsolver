@@ -38,7 +38,11 @@ candidate. A section solve — a *rung* — is started when one of these holds:
   work the loop has spent at this wall, counted in solver calls and states rather
   than wall-clock time, reaches the average cost of this run's earlier rungs
   (before the first one, an assumed cost, `dpsecrungprior`);
-* **the ladder has nothing left**: every anchor past the last splice has been tried;
+* **the ladder has nothing left**: every anchor past the last splice has been tried.
+  The section solve comes before the DP is given a larger cap (`dpsectierfirst`, on
+  by default): one window per escalation, each further back, and only a wall none of
+  them crossed goes on to the next cap tier. A full frontier is usually a
+  divergence, so the game's own search goes first and more states only after it;
 * optionally: a plan that claimed the goal died at the wall (`dpsecsolved`), the
   loop stalled for N rounds at the same wall (`dpsecstall`), or N deaths in a row
   taught no fixup (`dpsecnorec`) — all off by default.
@@ -56,6 +60,31 @@ wall right behind a previous splice doubles that margin (`dpsecchain`). The fron
 is capped at `dpseccap` states per layer (100). A wall whose windows are spent — the
 head would fall before tick 1, or further back than `dpsecmaxback` if that is set —
 gets no more rungs.
+
+**A wall the player's size makes** (`dpsecstate`, on by default). A plan that took
+an optional size portal can reach a wall that only the other size gets over, and
+every window drawn after that portal searches the size the plan already has. On a
+custom level whose player turned mini about 2,750 ticks before its last wall, the
+windows took 14 searches and about 600 s before one began before the portal. So once
+the wall's first window (and its cap tiers) has found nothing and the plan's size
+changed within 4,000 ticks before it, the loop asks the game:
+
+1. **The probe.** The same window is searched with the size undone at its head
+   (`secforcesize`). No route reaches that state, so the answer is a verdict and
+   nothing is spliced. On that level it crossed in 3–7 s at normal size.
+2. **The decision.** If it crossed, a window from 100 ticks before the size change
+   to 200 after it is searched, dropping every branch that changes the size
+   (`seckeepsize`), at each cap tier. Its splice replaces the deepest plan, and its
+   end becomes the depth to beat.
+3. **The way on is the model's.** From there the DP plans towards the wall at the
+   kept size. Until the run is past that wall the size is a requirement: the probe
+   does not question it, and the ordinary windows the loop draws on the new way (at
+   whatever stretch the model gets wrong) keep it too.
+
+Asked wall by wall instead, a wall in between reversed the choice: a spike in a dual
+section was easier at mini size, and the run went back to the wall it had just
+escaped. On that level the loop went from 44 rounds and about 1,500 s to 34 rounds
+and 277 s, with 10 section searches taking 53 s between them.
 
 ## 3. The handoff
 
@@ -106,12 +135,32 @@ same shape as the DP so that truncation behaves the way it does there.
   recording, not from the search. A rung started for a particular coin only accepts
   leaves that took it.
 
-**Snapshots or checkpoints.** A rung sweeps the section head once and picks the
-primitive: the snapshot where it reproduces the game, the checkpoint where
-something moves that the snapshot cannot carry (a moving portal always means the
-checkpoint). Under snapshots, every 20 layers each frontier node is replayed from
-the last checkpoint and dropped if it does not match: the snapshot's only known
-error is a missed death, so this can only remove false survivors.
+**Snapshots, not checkpoints.** A rung searches on snapshots, without sweeping the
+head first: it checks its frontier against the game every 20 layers instead (below),
+which catches a snapshot that does not reproduce the game where it starts to lie.
+Where something moves that the snapshot cannot carry — a moving portal — the rung
+does not search at all: the window goes back to the loop as searched and exhausted.
+(The sweep that picks between the two primitives is left to a search set up by hand
+with `secsnap=2` and no `secverifyevery`.) A checkpoint search costs about twenty times a snapshot
+search per restore, and in the runs it was measured on it found a crossing in 5
+windows of 58, the rest taking up to 835 s each for nothing. For the same reason a
+snapshot search whose *spine* — the plan the game has already flown, followed from
+the head — dies before the plan did, and that then finds nothing, is not asked
+again on checkpoints either; the loop carries on from its deepest plan.
+`seccpfallback=1` brings both checkpoint searches back (a diagnostic), and with it
+a re-ask is still skipped when the snapshot search lived to the plan's verified
+death anyway (`secredoreach`). A one-way search started by hand (`secsolve`, §8)
+is not affected.
+
+The snapshot carries more than the player: the effect manager in full, as the
+game's own checkpoint keeps it, so the group commands in progress (a Keyframe
+Animation's among them) come back with it (`secsnapem`); each body's buffered press
+as that point had it, rather than the one a held restore raises on both
+(`secjbkeep`); and at the head, a dash in progress from the plain flight, which the
+head's checkpoint load never has (`secheaddash`). Under snapshots, every 20 layers
+each frontier node is replayed from the last checkpoint and dropped if it does not
+match: the snapshot's only known error is a missed death, so this can only remove
+false survivors.
 
 ## 5. Verification and the splice
 
@@ -119,7 +168,9 @@ error is a missed death, so this can only remove false survivors.
 no cap — the moment it reaches the goal:
 
 * `SOLVED` — the replay reaches the goal alive and at least one follow-up line
-  (no press, held, periodic taps) survives `secgrace` ticks past it;
+  (no press, held, periodic taps) survives `secgrace` ticks past it, or reaches a
+  state where input works again: on the ground, in a mode that steers in the air,
+  or riding a dash ring's dash, which letting go ends (`secgracedash`);
 * `DOOMED` — it reaches the goal but every follow-up line dies there: a dead end,
   so the search keeps going;
 * `UNVERIFIED` — the plain replay does not reproduce the leaf. A rung passes over
@@ -138,8 +189,8 @@ the pin, the wall goes to another section solve; only if none can be started is 
 pin dropped.
 
 Nothing the search finds is taken on its word: the spliced plan is flown by the
-game from the start of the level like every other plan, and only a plan the game
-clears is filed.
+game like every other plan, and only a plan the game clears from the start of the
+level is filed.
 
 ## 6. What it cannot see
 
@@ -186,8 +237,11 @@ Follow's variance is not detected yet.
     the same rounds and the same search layers.
 * Rendering and the visibility pass are held off for the whole search: the search
   moves the world back and forth through geometry it does not restore.
-* The search yields a frame every `secslicems` (12 ms) so the game window stays
-  responsive.
+* The search yields a frame every `secslicems` (50 ms) so the game window stays
+  responsive -- about twenty frames a second while it runs. Each frame costs the
+  game's own frame work (~4 ms), which at the earlier 12 ms was a fifth of the
+  search's time; on a heavy custom level the search went from 166.5 to 136.8 s
+  at 50 ms, through the same search layers.
 
 ## 8. Running one by hand
 
@@ -211,7 +265,7 @@ The loop's keys (autorun.cfg / the play menu's cfg):
 | `dpsecsolved` | 0 | start one when a plan that claimed the goal dies at the wall |
 | `dpsecstall` | 0 | start one after N rounds at the same wall (0 = off) |
 | `dpsecnorec` | 0 | start one after N deaths with no fixup (0 = off) |
-| `dpsectierfirst` | 0 | with no anchor left, try a section solve before a larger DP |
+| `dpsectierfirst` | 1 | with no anchor left, try a section solve before a larger DP cap (§2) |
 | `dpsecmargin` | 54 | ticks past the wall the search must survive |
 | `dpsecchain` | 1 | double the margin for a wall right behind a splice |
 | `dpsecchainspan` | 30 | how close to a pin counts as "right behind" |
@@ -220,12 +274,20 @@ The loop's keys (autorun.cfg / the play menu's cfg):
 | `dpsecmaxback` | 0 | refuse windows starting more than N ticks before the wall (0 = no limit) |
 | `dpsecreuse` | 1 | keep the started-from plan as the rejoin target |
 | `dpseccoinrung` | 1 | with coins, start rungs at the coin wall and require that coin |
+| `dpsecstate` | 1 | ask whether the player's size stops a wall, and keep the size that does not (§2) |
+| `seccpfallback` | 0 | 1 = a rung may search on checkpoints: where the snapshot cannot branch, and as the re-ask after its spine died early (§4; a diagnostic) |
+| `secredoreach` | 1 | with `seccpfallback=1`, no re-ask when the snapshot search lived to the plan's verified death (§4) |
 
 The search's own keys (by hand; a rung sets what it needs): `sectarget`,
 `sectargety` / `sectargetydir`, `sectargetdepth`, `sechorizon`, `seccap`, `secgrace`
 (600), `secmaxdoomed` (500), `seccoins` (1), `secsnap` (0 checkpoint, 1 snapshot,
-2 sweep and decide), `secverifyevery` (0; a rung uses 20), `secslicems` (12),
-`secshaderskip` (1). The remaining `sec*` keys are measurement switches.
+2 sweep and decide), `secverifyevery` (0; a rung uses 20), `secslicems` (50),
+`secshaderskip` (1), `secforcesize` / `seckeepsize` (-1; 0 normal, 1 mini: start the
+search with player 1 at that size / drop every branch not at it). On by default and
+turned off with `=0`: `secsnapem`, `secjbkeep`, `secheaddash` (what the snapshot
+carries, §4), `secgracedash` (§5), `secrungcoinoff` and `secbookfirst` (see
+[COINS.md](COINS.md#3-in-the-section-search)). The remaining `sec*` keys are
+measurement switches.
 
 ## 10. What it writes to result.txt
 
@@ -234,6 +296,8 @@ The search's own keys (by hand; a rung sets what it needs): `sectarget`,
 * `secrung: the prefix died at t=... before the head t=... (try N of 2)` and
   `secrung: abandoned - ...`
 * `secsolve: SOLVED|UNVERIFIED|DOOMED|EXHAUSTED ...` — the search's verdict
+* `secsolve: not searched - the snapshot cannot branch in this window ...` and
+  `secrung: not asked again on checkpoints ...` — a window left to the loop (§4)
 * `secrung: spliced N ticks from t=... pinned at t=... - the loop carries on`, or
   `secrung: the search found nothing - the loop carries on from the deepest plan`
 * `seclayer: ...` — one line per layer (always on for a rung): frontier, deaths,

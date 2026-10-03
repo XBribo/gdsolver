@@ -28,14 +28,25 @@ public:
     // references at 0x38c59e (the clear), 0x38c5be / 0x38c5d8 (the ship) and
     // 0x38ca9f (the clamp) and no other -- so for the UFO the latch does one
     // thing only: it skips the terminal clamp.
+    // `slopeVel`: GD's m_slopeVelocity when the flap comes off a ramp contact (dp's
+    // --ufolawflap), 0 otherwise.
     static double stepVy(double vy, bool flap, const UfoParams& p,
-                         bool gravityFlipped = false, bool boostLatch = false) {
+                         bool gravityFlipped = false, bool boostLatch = false,
+                         double slopeVel = 0.0) {
         // A flap RAISES vy to the target and then the same call's gravity step
         // runs, which is where the old constant 6.871 came from. It is not an
         // overwrite: GD (PlayerObject::updateJump) only calls setYVelocity when
         // vy is below s*literal, so a UFO already climbing faster than the
         // target keeps its speed and merely spends the press.
-        if (flap && vy < p.flapTargetVy) vy = p.flapTargetVy;
+        if (flap && vy < p.flapTargetVy) {
+            vy = p.flapTargetVy;
+            // ...and off a ramp (m_isOnSlope / m_wasOnSlope, m_slopeVelocity > 0) it adds
+            // half the ramp's velocity, at most 1.4x the flap (the float product).
+            if (slopeVel > 0.0) {
+                const double cap = (double)(float)(vy * 1.399999976158142);
+                vy = std::min((double)((float)slopeVel * 0.5f) + vy, cap);
+            }
+        }
         const double s = gravityFlipped ? -p.accelSwitchVy : p.accelSwitchVy;
         const double a = (vy <= s) ? p.gravityWeak : p.gravityStrong;
         double next = vy + a;

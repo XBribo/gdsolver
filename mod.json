@@ -1,11 +1,12 @@
 {
 	"geode": "5.10.1",
 	"gd": {
-		"win": "2.2081"
+		"win": "2.2081",
+		"android": "2.2081"
 	},
 	"id": "gdsolver.solver",
 	"name": "GD Solver",
-	"version": "v0.3.2",
+	"version": "v0.4.0",
 	"developers": ["gdsolver"],
 	"description": "Automatically finds an input sequence that clears a level, with the game itself as the verifier.",
 	"tags": ["gameplay", "utility", "offline", "cheat"],
@@ -22,6 +23,12 @@
 			"name": "Choose the mode on Play",
 			"description": "A level's play button opens a menu: Normal, Replay or Solve. Off, the play button just plays the level, as without the mod.",
 			"default": true
+		},
+		"solve-gamble": {
+			"type": "bool",
+			"name": "Solve faster (not reproducible)",
+			"description": "The search takes a shortcut as soon as it will do instead of waiting for its full ladder. Usually faster, but the same level can take a different route and time from one solve to the next, and it is no more certain to be solved. Every plan is still checked by the game itself. Takes effect at the next Solve.",
+			"default": false
 		},
 		"key-overlay": {
 			"type": "keybind",

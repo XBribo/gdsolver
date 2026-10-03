@@ -41,6 +41,11 @@ constexpr double kCubeJumpMini = 8.944;
 // really do differ per constant and must stay measured one by one.)
 constexpr double kMiniImpulse = 0.800;
 constexpr double kCubeInner = 4.5;  // side/ceiling kill box
+// collidedWithObjectInternal's reach for the flight modes (ship / UFO / swing): a body within it
+// of a face is landed or stopped there, not crushed (the other modes use 10). The --preslopesolid
+// thin solid uses the same numbers; --shipslopecap derives a ship's flat-side distance from a
+// spiked ramp from it, min(kCubeInner, half - 6): 4.5 full, 3.0 mini, both as measured.
+constexpr double kFlyThinTol = 6.0;
 // ---- ROBOT (mode 5) -------------------------------------------------------
 // Read out of PlayerObject::updateJump (win RVA 0x38b900), not fitted. The
 // robot is a cube with three differences, all of which are literal branches in
@@ -111,8 +116,8 @@ inline bool g_oldLatency = false;   // --old-latency
 // clean-up. The measurement is at the ring loop.
 // --swingpushtol: the swing's push-out onto a face needs the face within
 // kLandTol, as GD's face pick does; beyond it the contact is a side hit.
-// Off by default until measured; see the push-out branch in step.hpp.
-inline bool g_swingPushTol = false;   // --swingpushtol
+// On by default since 2026-10 (was opt-in); see the push-out branch in step.hpp.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
 // A ring's press latch is GD's +0x986, which every consumer clears, so the
 // grounded jump spends the press too. (--no-pressspent, the pre-2026-09-05
 // `!s.ringHold` gate, is gone since the flag clean-up.)
@@ -304,7 +309,7 @@ inline int g_halfNow = 0;
 // (0x38fd42-0x38fdf0, re-evaluated on every acquiring tick 0x39072c) -- see
 // slopeSeatTarget in slopes.hpp for the formula, the RVAs and the lv16 t=9,241
 // witness. The two agree everywhere except on the ENTRY side of a ramp.
-inline bool g_noSlopeSeat = false; // --no-slopeseat
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
 
 // The UFO's floor acquisition allowance used to be kShipLandTol (6.0), before
 // 2026-09-06 (the --no-ufolandtol arm, gone since the flag clean-up). That 6.0 was never measured -- the
@@ -890,7 +895,8 @@ constexpr double kHazMargin = 0.0;
 // left alone when the cube side landed. GD's hazard stage is after the solid loop for every
 // mode, so the same hole should be there -- but nothing has measured it, so this one is off
 // by default until it is.
-inline bool g_flyHazAfterSolid = false;
+// On by default since 2026-10 (was opt-in).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
 // Cube: how far below a surface the foot may already be and still be pushed up.
 // 3.0 was a guess and it was too small: lv6 t=13606 has GD landing the cube on
 // the ledge at x=17700 (top y=180) with the foot 3.29 px below it, and the model
@@ -981,13 +987,11 @@ inline double kStepDepth = 3.15;
 // which is conservative (it never plans a route that GD would end).
 constexpr double kShipLandTol = 6.0;
 // --ceilrideslope: the flight ceiling ride (fly/ceilride) does not fire while a
-// ceiling ramp is pressing the player (see the branch in step.hpp). Off by default.
-// The 6.0 above was re-measured on 2026-09-18 on calib_slabside (a UFO on the floor
-// entering a 30x1.5 slab sideways): head 6.0 px into it is pushed out, 6.1 is not.
-inline bool g_ceilRideSlope = false;
+// ceiling ramp is pressing the player (see the branch in step.hpp). Always on since 2026-10 (the
+// slope clean-up; was opt-in). The 6.0 above was re-measured on 2026-09-18 on calib_slabside (a
+// UFO on the floor entering a 30x1.5 slab sideways): head 6.0 px into it is pushed out, 6.1 is not.
 // --lawseatonslope: a ride's slopeT starts from the --slopelaw seat, not from the
-// model's landing (State::seatT). Off by default.
-inline bool g_lawSeatOnSlope = false;
+// model's landing (State::seatT). Always on since 2026-10 (the slope clean-up; was opt-in).
 // --ceilpinmin: a flight pin under a ceiling that moved toward gravity this tick
 // sets vy to min(vy, -1) when the updated vy points with gravity, and 0 otherwise,
 // instead of the face's dcy/0.25 (see the ceiling-ride branch). On since

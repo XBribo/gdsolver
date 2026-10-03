@@ -180,6 +180,10 @@ struct SearchOutcome {
     bool horizonCut = false;
     long long deepT = -1;    // where the frontier died (PARTIAL / FAILED); -1 = never reported
     double deepX = -1.0;
+    // The coin whose miss prune the frontier died at (index into the level's coins; -1 = none):
+    // deepX lies at the far edge of a coin whose passing is final (cli.hpp coinPruneOk), i.e. the
+    // last states were the ones that passed it without it. Read by --ladderenv (cliMain).
+    int coinWall = -1;
     long long capHits = -1;  // -1 = no capstat line, i.e. the layer loop never ran
     // The search's own work: the states its layers carried forward (each layer's frontier after
     // the alive cap, summed). Deterministic, printed nowhere -- the mod weighs a repair round's
@@ -290,11 +294,23 @@ struct SearchOutcome {
     // Level::unsupported, when the load refused the level (cliMain returned 2 before
     // searching). Empty otherwise.
     std::string unsupported;
+    // The cap ladder's own account of the call (cli.hpp cliMain), written as it returns; empty
+    // for a call that was not a ladder. `attempts=N idle=K plain=<hash> chosen=<hash> via=<how>`:
+    // idle = the attempts whose alive cap never bound, the hashes FNV-1a over the plan file's
+    // bytes (`-` = that search did not run, `none` = it wrote no plan), via = which search the
+    // answer is (attempt, plain, again; gamble = the plain search taken early under
+    // PlainElsewhere::ready, cli.hpp). A change to the ladder can show from these that what
+    // it chose did not move, call by call.
+    std::string ladder;
+    // This call wrote its plan file (--out), and the trace beside it. An early return and a
+    // cancelled search write neither, and a ladder's files then still hold the search before.
+    bool planWritten = false;
 
     void reset() {
         verdict = VerdictFailed;
         horizonCut = false;
         deepT = -1; deepX = -1.0; capHits = -1; replayDiedT = -1; cancelT = -1; rejoinT = -1;
+        coinWall = -1;
         workStates = 0;
         rejoinBadT = -1; rejoinBadWhy = nullptr;
         resimDead = -1; resimFirst = -1; resimWhy = nullptr;
@@ -313,6 +329,8 @@ struct SearchOutcome {
         trigMaxKeptX = 0.0;
         trigMapSig = 0;
         unsupported.clear();
+        ladder.clear();
+        planWritten = false;
     }
 };
 

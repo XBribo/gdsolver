@@ -117,6 +117,10 @@ inline int g_uiMode = UI_MODE_NORMAL;
 // Replay plays the coin solution rather than the plain one. The two kinds of solution are kept in
 // separate files (Config::coinFiles), so neither mode overwrites the other's.
 inline bool g_uiCoins = false;
+// ...and the third, shown only in Solve: search without the routes that need frame-level precision
+// (the glitch-avoid mode, Config::glitchPortal / glitchWave). A choice about how to solve, not a
+// kind of solution: the plan it finds is filed where Solve always files it.
+inline bool g_uiGlitch = false;
 // The level the menu's Start was pressed for. PlayLayer::init starts a session only for this
 // level, and disarms it whatever it decides: the choice is made per play, not left standing.
 // A standing mode is what the old corner panel had, and there it was visible; a menu that has

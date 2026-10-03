@@ -207,10 +207,10 @@ struct ForceUnit { double v; };
 // force's own step is 0.225 x m_force for a cube (the 0.945 note at the force
 // application in step.hpp), and lv22 t=20,958..20,960 (mini cube, speed 1.1,
 // one 4.2 box) reads +0.730 = 0.945 - 0.215 in GD where the speed's g gives
-// 4.2 x 0.2239 = 0.941 and +0.726. Off by default.
-inline bool g_forceUnit1x = false;
-inline ForceUnit forceUnitFor(uint8_t mode, float dxF) {
-    const double g = std::fabs(cubePhysFor(g_forceUnit1x ? 1.29825f : dxF).g);
+// 4.2 x 0.2239 = 0.941 and +0.726. On by default since 2026-10 (was opt-in).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+inline ForceUnit forceUnitFor(uint8_t mode, float /*dxF*/) {
+    const double g = std::fabs(cubePhysFor(1.29825f).g);
     switch (mode) {
         case 0: return {g / kForceGDiv};                  // cube
         case 1: return {kForceUnitShip};
@@ -232,6 +232,9 @@ struct ForceBox {
     double force;   // m_force
     int uid = -1;
     int fid = 0;    // m_forceID (property 530); 0 = none, set by --forceids
+    // The push's world-y share: 1 for a box pointing up. --forceboxdir sets it from the box's
+    // rotation and flipY (level_loader.hpp, the FORCE BOX branch); off, every box pushes up.
+    double dirY = 1.0;
 };
 inline std::vector<ForceBox> g_forceBoxes;
 // --forceids <file>: the forceblocks dump (uid,...,forceid). GD sums the boxes a
@@ -257,7 +260,7 @@ inline double forceBoxSum(double x, double y, double pHalf) {
                 if (dup) continue;
                 if (ns < 8) seen[ns++] = fb.fid;
             }
-            f += fb.force;
+            f += fb.force * fb.dirY;
         }
     return f;
 }
@@ -478,6 +481,12 @@ struct FlipHeadBox {
     // when the box never moves (or when no recording was given), which reads
     // as "the load-time position is the live one".
     std::vector<ModRow> live;
+    // --ridebox: the box is carried by a Move locked to the player on BOTH axes
+    // (an autonomous one, from the level data), and the recording says over which
+    // ticks it rode: rideT0 = its first moving row, rideT1 = its last (INT_MAX when
+    // the recording ends inside the ride). -1/-1 = no ride known in this call.
+    bool rides = false;
+    int rideT0 = -1, rideT1 = -1;
 };
 inline std::vector<FlipHeadBox> g_flipHeadBoxes;
 // --fgarmlive: arm from the box's LIVE position and let the arm DECAY, instead
@@ -522,6 +531,83 @@ inline bool flipHeadArms(double x, double y, double pHalf, int t) {
     for (const auto& b : g_flipHeadBoxes) {
         double bx = b.cx, by = b.cy;
         if (g_fgArmLive) flipHeadAt(b, t, bx, by);
+        if (std::fabs(x - bx) <= b.hw + pHalf
+            && std::fabs(y - by) <= b.hh + pHalf)
+            return true;
+    }
+    return false;
+}
+// --ridebox (on by default since 2026-10): an arm box that RIDES THE PLAYER is not read at the
+// position a recording gives it. It rode the RECORDED run's player, so for any other plan -- every
+// candidate of a search that leaves the recorded flight -- that position is wrong by the
+// whole difference between the two paths. Measured on lv22's cold of 2026-09-30 (bundle
+// v5): the t=2,076 search was given a recording whose uid2860 had followed a run that left
+// the playfield (y 757 at t=2,850 against the candidates' 290-330), so under --fgarmlive
+// no low candidate was ever armed, all of them died at x~4,030-4,105 on the first ceiling
+// or side contact, and the only survivor was the arc into the sky. Same flags without
+// --fgarmlive crossed that wall from the same anchor and inputs.
+//
+// WHAT GD DOES, read from the binary (2.2081):
+//   - the arm is renewed on every tick of contact: collisionCheckObjects' per-object loop
+//     writes 2 into m_stateFlipGravity (player+0xb80) for an id-2866 (0x215ba1, on
+//     `cmp ecx,0xb32`) and into m_stateHitHead (+0xb7c) for an id-1859 (0x215ac6, on
+//     `cmp ecx,0x743`); PlayerObject::update decrements both every tick (0x389f40 /
+//     0x389f47). So: armed on the contact tick and the one after (kArmTicks).
+//   - a Move locked to the player moves its group by the player's own displacement:
+//     GJBaseGameLayer::update stores player.position - player.m_lastPosition into the
+//     effect manager (+0x800 x, +0x804 y; 0x238222-0x2382b2, with a y-only teleport
+//     guard at 0x23823f-0x238266), and GJEffectManager::prepareMoveActions, for a move
+//     command with m_lockToPlayerX (+0x73) / m_lockToPlayerY (+0x74), takes that times
+//     the move's mod as the step's delta. So the group keeps a FIXED offset from the
+//     player for the whole ride -- the offset it had when the Move fired.
+//   - measured against the trunk clear of 2026-09-30 (lv22 attempt 52): recorded box(t)
+//     minus the player's position at t-1 is constant to 0.001 px over the whole ride --
+//     uid2860 (0.765, 6.000) over 648 ticks, uid2152 (0.901, 6.000) over 387.
+//
+// SO THE ARM DURING A RIDE IS A PROPERTY OF THE STATE, NOT OF THE RECORDING: with the
+// offset fixed, the player overlaps the box on every tick of the ride exactly when it
+// overlapped it on the tick the ride began -- which is the tick before the box's first
+// moving row, where the box is still at its load-time place. The model therefore takes
+// only the WINDOW from the recording (rideT0..rideT1) and, inside it, renews the arm
+// exactly when it was renewed on the previous tick (the counter at its fresh value);
+// before the window the load-time box is tested as usual. Nothing reads the recorded
+// position of a riding box.
+//
+// Scope and the holes it leaves, all written down rather than guessed at:
+//   - both axes locked (lockx && locky on an autonomous Move reaching the box). A box
+//     locked on one axis keeps the pre-flag reading and the loader says so.
+//   - the window comes from the recording; a recording without the ride (the flight
+//     died before it) gives no window, and the box is then read as parked.
+//   - after the ride the box stands wherever it stopped, which depends on the state's
+//     own path again; nothing renews the arm there (it lapses in kArmTicks). GD keeps
+//     renewing while the player still overlaps the stopped box.
+//   - the offset is exact only while the player's half-size does not change inside
+//     the ride; a growing half cannot lose the overlap, a shrinking one could.
+//   - "renewed last tick" is one counter per arm kind, so two riding boxes of the same
+//     kind would share it (lv22 has one of each).
+//   - GD's y guard on a teleport (above) breaks the fixed offset; not modelled.
+// Implies --fgarmlive's counter (decays, kArmTicks) for the 2866; the 1859 already had
+// it. With both flags, --ridebox decides for riding boxes and --fgarmlive's live reading
+// is kept for 2866 boxes that do not ride.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// 0 before the box's ride, 1 inside it, 2 after it (and 0 when no ride is known).
+template <class Box> inline int rideStage(const Box& b, int t) {
+    if (!b.rides || b.rideT0 < 0) return 0;
+    if (t < b.rideT0) return 0;
+    return t <= b.rideT1 ? 1 : 2;
+}
+// --ridebox's renewal test for the 2866 arm: true when the arm is renewed on tick t.
+// `freshPrev` = the counter was at its fresh value after the previous tick.
+inline bool flipHeadArmsRide(double x, double y, double pHalf, int t, bool freshPrev) {
+    for (const auto& b : g_flipHeadBoxes) {
+        const int st = rideStage(b, t);
+        if (st == 1) {
+            if (freshPrev) return true;
+            continue;
+        }
+        if (st == 2) continue;
+        double bx = b.cx, by = b.cy;
+        if (!b.rides) flipHeadAt(b, t, bx, by);   // a box that does not ride: as --fgarmlive
         if (std::fabs(x - bx) <= b.hw + pHalf
             && std::fabs(y - by) <= b.hh + pHalf)
             return true;
@@ -593,22 +679,48 @@ struct ArmBox {
     double cx, cy, hw, hh;      // LOAD-TIME position
     int uid = -1;
     std::vector<ModRow> live;   // the recording's rows for this uid (see FlipHeadBox)
+    bool rides = false;         // --ridebox, as FlipHeadBox
+    int rideT0 = -1, rideT1 = -1;
 };
 inline std::vector<ArmBox> g_armBoxes;
+inline void armBoxAt(const ArmBox& b, int t, double& bx, double& by) {
+    bx = b.cx;
+    by = b.cy;
+    if (b.live.empty()) return;
+    size_t lo = 0, hi = b.live.size();
+    while (lo < hi) {
+        const size_t m = lo + (hi - lo) / 2;
+        if (b.live[m].t <= t) lo = m + 1; else hi = m;
+    }
+    if (lo > 0) {
+        bx = (double)b.live[lo - 1].cx;
+        by = (double)b.live[lo - 1].cy;
+    }
+}
 inline bool armBoxTouch(double x, double y, double pHalf, int t) {
     for (const auto& b : g_armBoxes) {
-        double bx = b.cx, by = b.cy;
-        if (!b.live.empty()) {
-            size_t lo = 0, hi = b.live.size();
-            while (lo < hi) {
-                const size_t m = lo + (hi - lo) / 2;
-                if (b.live[m].t <= t) lo = m + 1; else hi = m;
-            }
-            if (lo > 0) {
-                bx = (double)b.live[lo - 1].cx;
-                by = (double)b.live[lo - 1].cy;
-            }
+        double bx, by;
+        armBoxAt(b, t, bx, by);
+        if (std::fabs(x - bx) <= b.hw + pHalf
+            && std::fabs(y - by) <= b.hh + pHalf)
+            return true;
+    }
+    return false;
+}
+// --ridebox's renewal test for the 1859 arm (see g_rideBox): a riding box renews inside
+// its ride exactly when it renewed on the previous tick, is read at its load-time place
+// before the ride and renews nothing after it; a box that does not ride is read live, as
+// armBoxTouch does.
+inline bool armBoxTouchRide(double x, double y, double pHalf, int t, bool freshPrev) {
+    for (const auto& b : g_armBoxes) {
+        const int st = rideStage(b, t);
+        if (st == 1) {
+            if (freshPrev) return true;
+            continue;
         }
+        if (st == 2) continue;
+        double bx = b.cx, by = b.cy;
+        if (!b.rides) armBoxAt(b, t, bx, by);
         if (std::fabs(x - bx) <= b.hw + pHalf
             && std::fabs(y - by) <= b.hh + pHalf)
             return true;

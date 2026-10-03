@@ -3,18 +3,49 @@
 **An automatic TAS solver for Geometry Dash** (2.2081, Windows / Steam). It
 solves a level by playing it — inside the game, from cold.
 
+**[Download `gdsolver.solver.geode`](https://github.com/gdsolver/gdsolver/releases/latest)**
+from the latest release, drop it into Geometry Dash's `geode/mods/` folder and
+start the game. [Geode](https://geode-sdk.org) has to be installed first; see
+[Installing](#installing). An Android build comes separately, as an experimental
+pre-release that is not supported ([docs/ANDROID.md](docs/ANDROID.md)).
+
 <p align="center">
   <img src="docs/media/solve-to-replay.webp" width="720"
-       alt="gdsolver solving Dash: the dark fast loop with the overlay counters climbing, then the screen coming back for the solution replayed at 1x">
+       alt="gdsolver solving Bloodbath: the dark fast loop with the overlay counters climbing, then the screen coming back for the solution replayed at 1x, and its wave part">
 </p>
 
 <p align="center"><sub>
-  The last five seconds of solving <b>Dash</b>, then the first seven of the
-  replay. The overlay is the loop's own: which round it is on, how far the best
-  plan has reached, how far the search has got. The screen is dark because the
-  search is running — the frames go to the fast loop instead — and it comes back
-  when a candidate has actually cleared.
+  The last four seconds of solving <b>Bloodbath</b>, the first three of the
+  replay, then ten of its wave part. The overlay is the loop's own: which round
+  it is on, how far the best plan has reached, how far the search has got. The
+  screen is dark because the search is running — the frames go to the fast loop
+  instead — and it comes back when a candidate has actually cleared.
 </sub></p>
+
+## A few of the Extreme Demons it has solved
+
+<p align="center">
+  <a href="https://youtu.be/1ORlnG4zFfc"><img src="https://img.youtube.com/vi/1ORlnG4zFfc/maxresdefault.jpg" width="32%" alt="Video: Bloodbath solved by gdsolver"></a>
+  <a href="https://youtu.be/lPco2GpVe2c"><img src="https://img.youtube.com/vi/lPco2GpVe2c/maxresdefault.jpg" width="32%" alt="Video: Antarctic Lights solved by gdsolver"></a>
+  <a href="https://youtu.be/b1taOeFYbY0"><img src="https://img.youtube.com/vi/b1taOeFYbY0/maxresdefault.jpg" width="32%" alt="Video: Amethyst solved by gdsolver"></a>
+</p>
+
+| Level | Uploaded by |
+|---|---|
+| Bloodbath | Riot |
+| Antarctic Lights | declanlc |
+| Amethyst | iMist |
+
+These three were solved cold by the v0.4.0 build, the way any level is — its play
+button, **Solve**, and nothing else: no seeds, no previous solution, no hints,
+nothing but the level — for the end of the level (Antarctic Lights has three coins,
+the other two none).
+
+These are other people's levels, solved by a bot. A solution is a TAS, not a
+completion: while the mod drives nothing is recorded, and its replays are marked as
+bot input (see [Safety](#safety--community-notes)). They are also custom levels,
+and unlike the official levels they are not guaranteed to solve: of 300 rated
+levels drawn at random, 258 cleared ([docs/CUSTOM_LEVELS.md](docs/CUSTOM_LEVELS.md)).
 
 Give it a level and it finds an input sequence that clears it. It does not
 re-implement the game's physics: an approximate, measured-where-it-matters model
@@ -46,119 +77,9 @@ not progress on a save file.
 Those levels are also the supported set — see [What's next](#whats-next) for
 where custom levels and platformer mode stand.
 
-## Results
-
-The tables are cold regression runs of the v0.3.0 build (2026-09-27; v0.3.1
-builds to the same code, see the [changelog](changelog.md)) —
-`python py/cold_regress.py --one-session`, the whole suite inside a single game
-session, no plan and no solution file to start from — one with coins
-(`--cfg coinroute=1 coins=1`) and one for the end of the level alone. The coin
-runs ended every level with every coin, as the game itself counted them. The
-same runs are the regression baseline.
-
-**v0.3.2 was not re-measured for these tables.** It fixes the game's random
-seeds while the bot drives, corrects a few rules and speeds up section searches
-(see the [changelog](changelog.md)), so some counts and times differ from the
-ones below. Before release it was run the same way — the 22 levels with and
-without coins, the 17 spin-off levels without coins and the six of them with
-coins, each suite in one game session — and every level cleared, with every
-coin in the coin runs. The counts that moved: Dash 26 → 30 without coins and
-39 → 41 with them, Press Start 29 → 28 without coins, and Nock Em 56 → 57 and
-Power Trip 103 → 104 with coins. Those runs shared the machine, so their times
-are not comparable with the tables.
-
-Every cell reads **with every coin**, then in brackets **the end of the level
-alone**.
-
-| # | Level | Repairs | Time | | # | Level | Repairs | Time |
-|--:|---|--:|--:|---|--:|---|--:|--:|
-| 1 | Stereo Madness | 1 (0) | 6 s (4 s) | | 12 | Theory of Everything | 0 (0) | 6 s (5 s) |
-| 2 | Back On Track | 0 (0) | 3 s (4 s) | | 13 | Electroman Adventures | 0 (1) | 5 s (6 s) |
-| 3 | Polargeist | 0 (0) | 4 s (4 s) | | 14 | Clubstep | 0 (0) | 6 s (24 s) |
-| 4 | Dry Out | 0 (0) | 4 s (3 s) | | 15 | Electrodynamix | 2 (1) | 13 s (8 s) |
-| 5 | Base After Base | 0 (0) | 4 s (4 s) | | 16 | Hexagon Force | 4 (15) | 54 s (1 m 26 s) |
-| 6 | Can't Let Go | 0 (0) | 4 s (4 s) | | 17 | Blast Processing | 4 (1) | 13 s (7 s) |
-| 7 | Jumper | 0 (0) | 4 s (4 s) | | 18 | Theory of Everything 2 | 8 (3) | 23 s (16 s) |
-| 8 | Time Machine | 0 (3) | 5 s (8 s) | | 19 | Geometrical Dominator | 4 (5) | 38 s (1 m 5 s) |
-| 9 | Cycles | 0 (0) | 5 s (4 s) | | 20 | Deadlocked | 22 (14) | 1 m 51 s (1 m 18 s) |
-| 10 | xStep | 1 (1) | 6 s (5 s) | | 21 | Fingerdash | 12 (23) | 2 m 24 s (3 m 17 s) |
-| 11 | Clutterfunk | 5 (1) | 38 s (9 s) | | 22 | Dash | 39 (26) | 12 m 5 s (2 m 55 s) |
-
-The two numbers in a cell are two separate searches, not a total and a part:
-with coins the goal is a different one, so the search takes a different route
-from the first round on, and it is not always the longer one.
-
-Against `v0.2.0` the counts moved on most of the later levels. The large moves:
-Hexagon Force 38 → 15 without coins, where a section solve now crosses the wall
-the repairs used to grind at, and 17 → 4 with them; Geometrical Dominator 15 → 4 and
-Dash 56 → 39 with coins; and Fingerdash 5 → 12 with coins and 8 → 23 without.
-Fingerdash's rise comes from one of the coin changes — a shallower replay's
-recording of the moving geometry now replaces one that is out of phase with it
-(cfg `groupsretime`); without coins and with that switched off, it takes 9
-rounds again.
-
-### The spin-off levels
-
-The official levels of Meltdown, World and SubZero, and The Challenge, run the
-same way, one game session per set. World's levels and The Challenge have no
-coins, so they have one number. These levels are not in the main game's level
-list; the suite reads them from level files (cfg `leveldir=<dir>`, one
-`<id>.lvl` per level), which are not distributed here.
-
-| Game | # | Level | Repairs | Time |
-|---|--:|---|--:|--:|
-| Meltdown | 1001 | The Seven Seas | 7 (5) | 19 s (15 s) |
-| Meltdown | 1002 | Viking Arena | 2 (5) | 12 s (18 s) |
-| Meltdown | 1003 | Airborne Robots | 1 (1) | 12 s (13 s) |
-| World | 2001 | Payload | 0 | 3 s |
-| World | 2002 | Beast Mode | 0 | 4 s |
-| World | 2003 | Machina | 0 | 2 s |
-| World | 2004 | Years | 0 | 6 s |
-| World | 2005 | Frontlines | 0 | 5 s |
-| World | 2006 | Space Pirates | 0 | 6 s |
-| World | 2007 | Striker | 1 | 4 s |
-| World | 2008 | Embers | 3 | 3 s |
-| World | 2009 | Round 1 | 0 | 4 s |
-| World | 2010 | Monster Dance Off | 0 | 4 s |
-| — | 3001 | The Challenge | 6 | 6 s |
-| SubZero | 4001 | Press Start | 33 (29) | 4 m 57 s (1 m 15 s) |
-| SubZero | 4002 | Nock Em | 56 (26) | 15 m 27 s (2 m 10 s) |
-| SubZero | 4003 | Power Trip | 103 (41) | 10 m 49 s (1 m 57 s) |
-
-**Repairs** is how many times the loop had to go back: solve, replay, die,
-re-anchor on the game's real state, solve the tail. `0` means the very first
-plan the DP produced cleared the level. For a given build the count is
-normally reproducible, and `py/cold_regress.py` compares the `[fp]` line each
-round prints against `data/cold_baseline.json` (`data/cold_baseline_coins.json`
-for a coin run); a change is reported, not failed. The spin-off levels have
-baselines of their own, kept with their level files. The one level known to vary
-from run to run was SubZero 4003 with coins: its section searches could take a
-different route each time (102 to 106 rounds over three runs of the v0.3.0 build,
-all clearing with every coin). The cause was the game's random seeds, which v0.3.2
-fixes while the bot drives; every run of it since — seven, over four builds — has
-taken 104 rounds.
-
-It is not a fidelity score. It counts what the loop had to do, and that depends
-on which corridor the search happens to walk as much as on where the model is
-wrong — the search is deepest-first, so touching one rule reorders the frontier
-and the run takes a different route. Making the model *more* correct can raise
-it: closing a route the model only believed in sends the search off to find the
-real one.
-
-**Time** comes from those same runs — 8 solver threads on a 16-core desktop — and
-it counts everything from the level being built to the solution being written
-(the game's own start-up is not in it);
-the 22 add up to the 20 minutes the coin suite took (12 without coins). Each
-suite ran alone on the machine, but read the clock as a guide and not as a
-contract: it is not what the regression compares, and a level's time is read
-from outside the game about once a second.
-
-Almost all of it is the search. Broken down on the 2026-08-27 run, before the
-section solver joined the loop, the DP calls were 86 % of the total and 88–93 % on
-the four expensive levels; on the ones that finish inside half a minute, most of
-what is left is starting the game and loading the level. On a level where section solves run (Dash
-with coins, SubZero) a good part of the time is now spent searching inside the
-game instead; how large a part has not been measured.
+The per-level results — repairs and times for the 22 official levels and the 17
+spin-off levels, with and without coins, and how they compare with v0.3.2 — are in
+[docs/RESULTS.md](docs/RESULTS.md).
 
 ## How it works
 
@@ -253,22 +174,40 @@ Around that loop:
 
 ## What's next
 
-**Custom levels — unsupported today, partial support planned.** Nothing in the
-loop is specific to the official levels, any level can be picked, and plenty of
-custom levels already solve as they are: in a random sample of rated levels built
-with 1.7-era parts, 71 of 78 cleared cold (measured the week before this release,
-which may change that). They are nonetheless **not supported**:
-the regression covers the official levels only, so nothing is keeping them honest,
-and a level that leans on a mechanic the model has never been measured against is
-one it is wrong about — which costs rounds, and how often a newer level gets
-through has not been measured yet. [docs/CUSTOM_LEVELS.md](docs/CUSTOM_LEVELS.md) says which levels
-usually solve, which gimmicks the model does not cover, and what a failure looks
-like. The rule is to clear what the game lets the loop clear: where the model has
-no answer, the section solver searches the game itself, and a plan the game clears
-is a solution however it was found. The work is to say plainly which levels the
-model covers — fast and predictable, kept so by the regression — and which clear
-only with the section solver's help, and to tell the player up front when a level
-uses something the model does not have.
+**Custom levels — most older ones solve; the newest gimmicks often do not yet.**
+Nothing in the loop is specific to the official levels, and any level can be
+picked. On the release build, 300 rated levels chosen at random were each given
+up to 20 minutes, and 258 cleared cold (86 %). Levels built only from parts that
+existed before 2.0 mostly solve as they are — 206 of the 215 that use nothing from
+2.0 on, and the model disagreed with the game about a fifth as often per tick on
+them as on the rest. Levels that lean on the 2.1 and 2.2 gimmicks often do not
+solve yet: of the levels saved in those versions, 35 of 49 and 11 of 29 cleared.
+The regression covers the official levels only, so a custom level's result is
+outside what it keeps honest. The play menu says so up front: a yellow line on a
+custom level that uses objects from 2.0 on, and a red one when a level holds
+something the model cannot express at all.
+[docs/CUSTOM_LEVELS.md](docs/CUSTOM_LEVELS.md) has the breakdown, which gimmicks
+the model does not cover, and what a failure looks like. The rule stays to clear
+what the game lets the loop clear: where the model has no answer, the section
+solver searches the game itself, and a plan the game clears is a solution however
+it was found.
+
+The work on custom levels:
+
+* **Model divergences** — the rules that disagree with what the game measures are
+  fixed one at a time; this never stops.
+* **The search's logic** — plans that die where the model is right; most of the
+  official levels' repairs are of this kind ([docs/RESULTS.md](docs/RESULTS.md)).
+  Also continuous.
+* **Custom levels in the regression**, so that a change is measured on them too.
+* **Heavy levels** — the speed of levels with very many objects.
+
+**The next milestone: the search as a plug-in.** Today the reachability DP and
+the physics model are written together. The plan is to separate them, so that the
+search can be swapped without touching the physics and new searches can be tried
+side by side — one search tuned for every level may not exist. The search is also
+the part that needs no knowledge of Geometry Dash's physics, so it is where
+contributions are most welcome.
 
 **Platformer levels are outside the formulation, not merely unmeasured.** The
 search rests on there being no steering input; a platformer level hands the player
@@ -294,6 +233,12 @@ Geode itself has to be installed first ([geode-sdk.org](https://geode-sdk.org)).
 The build is for **Windows and GD 2.2081**; Geode refuses to load it on anything
 else rather than misbehaving. Nothing else is needed — no Python, no external
 process, no second copy of the game.
+
+**Android** (android64, GD 2.2081): an Android build is published on the releases
+page as a separate pre-release, as an experiment. It is not supported: the model's physics is Windows GD's, and
+whether Android GD behaves the same has not been measured, so a result reached on
+Android is Android's alone. [docs/ANDROID.md](docs/ANDROID.md) says how the port
+differs.
 
 The mod announces itself in the log the moment it loads, and says what it
 suppresses:

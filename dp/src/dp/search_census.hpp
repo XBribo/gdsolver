@@ -35,8 +35,7 @@ inline int g_searchCensus = 0;
 // On since 2026-09-25: --twinaudit found no mispredicted pair over the 22 official levels, 7
 // customs and 176 loop calls rebuilt from divdb kits; plan, trace and band were byte-identical
 // with it on and off, and a lv22 cold arm printed the same [fp] lines as its control.
-inline constexpr bool kDefTwinSkip = true;
-inline bool g_twinSkip = kDefTwinSkip;
+// (The --twinskip switch is gone since the 0.4.0 clean-up; --twinaudit stays.)
 inline bool g_twinAudit = false;
 
 // Input quantisation (off at 0/1; a search restriction, not physics -- holding and letting go
@@ -86,7 +85,7 @@ struct TwinStats {
             std::printf("twinaudit: predicted=%lld violations=%lld (cube=%lld ball=%lld robot=%lld "
                         "spider=%lld)\n",
                         predicted, violations, byMode[0], byMode[2], byMode[5], byMode[6]);
-        if (g_twinSkip && !g_twinAudit && g_searchCensus > 0)
+        if (!g_twinAudit && g_searchCensus > 0)
             std::printf("twinskip: skipped=%lld (cube=%lld ball=%lld robot=%lld spider=%lld)\n",
                         skipped, byMode[0], byMode[2], byMode[5], byMode[6]);
     }
@@ -114,10 +113,10 @@ inline const CensusField kCensusFields[] = {
     {"action", [](State& s) { s.action = 0; }, true},
     {"slope", [](State& s) { s.onSlope = 0; s.onSlope2 = 0; }, true},
     {"oneshot", [](State& s) {
-         s.pFlap = 0; s.pNoTerm = 0; s.pExitVy = 0.f; s.frameChg = 0;
+         s.pFlap = 0; s.pSpiderTap = 0; s.pNoTerm = 0; s.pExitVy = 0.f; s.frameChg = 0;
          s.ceilT = 0; s.ceilM4 = 0; s.jumpBuf = 0;
      }, true},
-    {"boost", [](State& s) { s.boost = 0; s.boost2 = 0; }, true},
+    {"boost", [](State& s) { s.boost = 0; s.boost2 = 0; s.a1cLatch = 0; }, true},
     {"arms", [](State& s) { s.fgArm = 0; s.ogLinger = 0; s.holdDead = 0; s.armT = 255; }, true},
     {"coins", [](State& s) { s.coins = 0; s.items = 0; s.taps = 0; }, true},
     {"latch", [](State& s) { s.portalLatch = GravLatch{}; s.portalLatch2 = GravLatch{}; }, true},

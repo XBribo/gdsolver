@@ -62,11 +62,16 @@ class $modify(PlayLayer) {
     }
 
     void safeUpdateVisibility(float dt) {
+#ifdef GEODE_IS_WINDOWS
         __try {
             PlayLayer::updateVisibility(dt);
         } __except (visAvNote(GetExceptionInformation())) {
             logVisibilityCrashSwallowed();
         }
+#else
+        // No SEH on Android: the pass runs unguarded, and a fault in it ends the game.
+        PlayLayer::updateVisibility(dt);
+#endif
     }
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         // A session is configured here for the level the play menu's Start was pressed for, in
@@ -96,7 +101,8 @@ class $modify(PlayLayer) {
         if (g_rngFresh) {
             static bool saved = false;
             static long long seeds[3];
-            static const uintptr_t kSeedRva[3] = {0x6c2e90, 0x6c2ee0, 0x6c2ef8};
+            static const uintptr_t kSeedRva[3] = {gdoff::kSeedTriggerRva, gdoff::kSeedVarIndexRva,
+                                                  gdoff::kSeedVarTableRva};
             auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
             for (int k = 0; k < 3; ++k) {
                 auto* p = reinterpret_cast<long long*>(base + kSeedRva[k]);
@@ -239,13 +245,23 @@ class $modify(PlayLayer) {
                                             // start of the attempt
             g_stopFired = false;
             g_nextInput = 0;
+            g_attemptFed = false;
             g_nextToggle = 0;
             g_tick = 0;
             g_gameFrame = 0;   // rotation does not carry across attempts
             anchors::onAttemptStart();   // the re-anchor record is per attempt
             padseed::reset();            // ...and so are the pads it seeds (cfg dpspentpad)
             ringseed::reset();           // ...and the rings (dp --spentorb)
+            // ...and the gravity portals and touch triggers (cfg portalpayload / touchpayload).
+            // Kept per level, their first-wins ticks came from whichever attempt got there
+            // first: lv20's bootstrap record runs the level to the end on its own route and
+            // reached x=22,747 at t~14,446, so an anchor at t=15,433 (x=22,332) carried that
+            // portal as spent, the model did not fire it, and GD did.
+            portalseed::reset();
+            touchseed::reset();
             itermap::onAttemptStart();   // ...and so is the seek bar's tick -> x record
+            // The HUD's best coin count, before the attempt that got them is cleared.
+            solver::g_coinBest = std::max(solver::g_coinBest, solver::coinsThisAttempt());
             solver::g_coinPickupTick.assign(solver::g_coins.size(), -1);
             // GD's verdict is per attempt for the same reason ours is. GD's own
             // "already collected" dictionary is NOT cleared here -- that is its
@@ -273,6 +289,18 @@ class $modify(PlayLayer) {
             // retire mid-attempt (its tick budget), and levelComplete asks afterwards -- see the
             // note on g_recordAttempt.
             dpsolve::g_recordAttempt = dpsolve::g_deepActive;
+            // cfg cpflight: this attempt's checkpoint set. Only the loop's own flights take them --
+            // not a recording pass, a check flight, a section search's replay, a slice's flight on
+            // the level itself, the probe or its control, or the showing.
+            cpflight::g_forceHead = false;
+            cpflight::onAttemptStart(g_attempt,
+                g_started && g_cfg.dpSolve && !g_dpShowSolution && !secsolve::g_on
+                && !dpsolve::g_deepActive && !dpsolve::g_ckFlying
+                && levelslice::g_phase != levelslice::Verifying
+                && levelslice::g_phase != levelslice::RefFlight
+                && !(cpflight::g_starting && cpflight::g_starting->probe)
+                && !cpflight::g_controlStarting);
+            if (cpflight::g_controlStarting) cpflight::startControl();
             // Required for coinMode / clearance: a plain replay never runs buildPois, and
             // with g_coins / g_solids empty neither pickup detection nor sample collection
             // ever runs
@@ -314,9 +342,28 @@ class $modify(PlayLayer) {
         }
         PlayLayer::resetLevel();
         rngFixAfterReset(this);   // the trigger seed GD just drew from the clock (see g_rngFix)
+        // cfg secshadersig (print only): the shader layer's hierarchy after a real reset -- the
+        // first of every layer, and the first after a section search (secsolve::shaderSig).
+        if (secsolve::g_shaderSig) {
+            static const void* s_sigLayer = nullptr;
+            if (s_sigLayer != this) {
+                s_sigLayer = this;
+                writeResult("shadersig: first reset of level " + std::to_string(g_cfg.levelId)
+                            + " " + secsolve::shaderSig(this));
+            } else if (secsolve::g_shaderSigPending) {
+                writeResult("shadersig: first reset after the search "
+                            + secsolve::shaderSig(this));
+            }
+            secsolve::g_shaderSigPending = false;
+        }
+        // cfg cpflight: a flight from a checkpoint takes the loop's books up to it from the
+        // attempt that took it -- its recording included, `init,` lines and all.
+        const bool cpStart = !ckptRestore && cpflight::g_starting;
+        if (cpStart) cpflight::splice(*cpflight::g_starting);
+        else if (!ckptRestore) cpflight::afterHeadReset(this);   // the carry's node prediction, checked
         // The objects' on/off as the reset left them, before the first update (see
         // grouptrace::snapshotInit for why this phase and not the recording's first row).
-        if (!ckptRestore && grouptrace::g_on) grouptrace::snapshotInit();
+        if (!ckptRestore && !cpStart && grouptrace::g_on) grouptrace::snapshotInit();
         // resetLevel bumps the LEVEL's attempt counter inline (no call to hook), so put the
         // record back here -- see restoreProgress.
         restoreProgress();
@@ -345,7 +392,8 @@ class $modify(PlayLayer) {
                 wasEndAnim ? 1 : 0);
             writeResult(rb);
         }
-        if (!ckptRestore && g_started && g_cfg.blockInput) {
+        // (Not for a flight from a checkpoint: the layer puts its hold back as the checkpoint had it.)
+        if (!ckptRestore && !cpStart && g_started && g_cfg.blockInput) {
             // Guard against a leftover hold: if the previous attempt ends while pressed, the
             // button carries over into tick 0 of the next attempt and it jumps continuously
             // from the very start (breaking reproduction of the same plan)
@@ -399,6 +447,9 @@ class $modify(PlayLayer) {
     // updated"
     void rollGroupTrace() {
         if (!grouptrace::g_on) return;
+        // cfg cpflightprobe: the recordings of the probe and its control stay in grouptrace.txt, where
+        // the control's end compares them; grouptrace_last.txt stays the loop's.
+        if (cpflight::g_probeFlying || cpflight::g_controlFlying) return;
         // g_tick, not the recording's last row: see roll's `endTick`
         auto r = grouptrace::roll(g_tick);
         writeResult("gt_last: attempt=" + std::to_string(g_attempt)
@@ -408,7 +459,15 @@ class $modify(PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (this != PlayLayer::get()) { PlayLayer::destroyPlayer(player, object); return; }
+        // A layer on its way out still dies, and records like any other (see NoRecordGuard).
+        // Measured on a slice swap: the level's own layer, left running for the frames the
+        // copy's scene takes to come up, died over and over, and one death reached GD's record
+        // block -- four writes into the level's record, each stopped only by the hooks.
+        if (this != PlayLayer::get()) {
+            NoRecordGuard nr(this);
+            PlayLayer::destroyPlayer(player, object);
+            return;
+        }
         // cfg killersite=1: built before the original call, written after it (see below).
         char siteBuf[256];
         bool siteArmed = false;
@@ -480,6 +539,7 @@ class $modify(PlayLayer) {
             // `killer:` line below waits for.
             if (g_cfg.killerSite && !player->m_isDead && !secsolve::g_noKill
                 && !secsolve::g_active && !g_cfg.noDeath) {
+#ifdef GEODE_IS_WINDOWS
                 static uintptr_t base = 0, size = 0;
                 if (!base) {
                     base = (uintptr_t)GetModuleHandleW(nullptr);
@@ -515,6 +575,11 @@ class $modify(PlayLayer) {
                     }
                 }
                 if (!kept) snprintf(sb + o, kSb - o, "(none in module)");
+#else
+                // The stack scan reads the PE image and Windows' memory map; not on Android.
+                snprintf(siteBuf, sizeof siteBuf, "killsite: t=%lld obj=%s rva=(unavailable)",
+                         (long long)g_tick, object ? "yes" : "NULL");
+#endif
                 siteArmed = true;
             }
             // The same verdict, latched for the iteration map (itermap.hpp). GD holds the killer
@@ -538,6 +603,19 @@ class $modify(PlayLayer) {
                      object ? object->getPositionX() : 0.f,
                      object ? object->getPositionY() : 0.f);
             writeResult(kb);
+        }
+        // The two returns below (the section search's no-kill, cfg nodeath) keep GD's own
+        // destroyPlayer from running, and with it GD's anti-cheat check. For its spike GD returns
+        // early if player 1 is locked or the layer's player has died, and otherwise sets
+        // m_damageVerified and returns without killing (PlayLayer::destroyPlayer, 0x3b39d0).
+        // Swallowed, the check never passes: GD puts the spike back on player 1 every substep, and
+        // every substep it is hit checkCollisions returns before postCollision. Measured with lv16's
+        // solution, nodeath=1 against nodeath=0: 18,867 spike calls against 13, and the trajectory
+        // apart from t=3,078. So those paths do for the spike what GD does, and nothing more
+        // (cfg anticheatpass, on). Not a death either way.
+        if (anticheat && g_cfg.antiCheatPass && (secsolve::g_noKill || g_cfg.noDeath)) {
+            if (!(m_player1 && m_player1->m_isLocked) && !m_playerDied) m_damageVerified = true;
+            return;
         }
         if (secsolve::g_noKill) {
             if (player == m_player1 || player == m_player2) secsolve::g_died = true;
@@ -648,6 +726,7 @@ class $modify(PlayLayer) {
                 // run from this line and reads dump.csv / grouptrace_last.txt right after
                 rollGroupTrace();
                 flushAll();
+                cpflight::noteEnd(g_tick);   // the flight's work, by kind (cpflight summary)
                 writeResult("death: attempt=" + std::to_string(g_attempt)
                     + " tick=" + std::to_string(g_tick)
                     + " x=" + std::to_string(pos.x)
@@ -673,6 +752,25 @@ class $modify(PlayLayer) {
         if (this != PlayLayer::get()) {
             NoRecordGuard nr(this);
             PlayLayer::levelComplete();
+            return;
+        }
+        // A completion the attempt did not earn. Every classic completion is the last action of
+        // the end animation, which checkForEnd starts after raising m_levelEndAnimationStarted,
+        // and only a reset lowers that byte -- so one arriving with the byte down was started for
+        // a world that has since been reset. And during a section search the world is the
+        // search's: the frame between two slices asks checkForEnd on whatever branch was left in
+        // the player (secStepBegin, hooks_gamelayer.cpp). Measured on a custom level: taken for
+        // the session's clear, it filed the plan the search had started from -- which died short
+        // of the end -- skipped the slice's flight on the level itself, and a harness counted it
+        // as cleared.
+        if (g_started && !g_sessionOver && !m_isPlatformer
+            && (secsolve::inFlight() || secsolve::g_active || !m_levelEndAnimationStarted)) {
+            const bool during = secsolve::inFlight() || secsolve::g_active;
+            writeResult(std::string("complete: refused - ")
+                        + (during ? "raised during a section search"
+                                  : "the attempt never started the end animation")
+                        + " (x=" + std::to_string((int)(m_player1 ? m_player1->getPositionX() : -1.f))
+                        + " tick=" + std::to_string(g_tick) + ")");
             return;
         }
         hookdepth::Guard hg(hookdepth::COMPLETE);
@@ -816,6 +914,7 @@ class $modify(PlayLayer) {
             float goalX = solver::g_goalX;
             if (goalX <= 0.f && m_endPortal) goalX = m_endPortal->getPositionX();
             rollGroupTrace();
+            cpflight::noteEnd(g_tick);
             writeResult("complete: attempt=" + std::to_string(g_attempt)
                 + " step=" + std::to_string(m_currentStep)
                 + " tick=" + std::to_string(g_tick)
@@ -836,6 +935,18 @@ class $modify(PlayLayer) {
                 if (dpsolve::g_deepActive) dpsolve::finishDeepRecord("reached the end");
                 else writeResult("dpsolve: the no-death pass reached the end after its recorder "
                                  "had already retired - not a clear");
+                return;
+            }
+            // cfg cpflightprobe: the probe or its control reaching the end is kept or compared like a
+            // death, never filed.
+            if (g_cfg.dpSolve && cpflight::g_probeFlying) {
+                writeResult(cpflight::probeCapture(g_tick, cx, "cleared"));
+                g_paused = true;
+                return;
+            }
+            if (g_cfg.dpSolve && cpflight::g_controlFlying) {
+                writeResult(cpflight::controlEnd(g_tick, cx, "cleared"));
+                g_paused = true;
                 return;
             }
             // GD raised levelComplete a long way short of the goal. It really does that -- an end
@@ -878,6 +989,7 @@ class $modify(PlayLayer) {
             // anything is filed, and this gate judges it there.
             if (g_cfg.dpSolve && !g_dpShowSolution && cx >= 0.f && goal > 1.f
                 && levelslice::g_phase != levelslice::Sliced
+                && levelslice::g_phase != levelslice::RefFlight
                 && (goal - cx) > g_clearMargin
                 && this->getCurrentPercent() < 95.0f && !endTrigLevel) {
                 char fb[256];
@@ -924,6 +1036,16 @@ class $modify(PlayLayer) {
             if (g_cfg.dpSolve && !g_dpShowSolution
                 && levelslice::onSliceCleared(g_cfg.inputs, g_tick))
                 return;
+            // cfg cpflight: a clear from a checkpoint is not filed. The plan flies once more from
+            // the head (hooks_gamelayer, at the next frame boundary), and that flight's clear is.
+            if (g_cfg.dpSolve && !g_dpShowSolution && cpflight::g_from >= 0) {
+                writeResult("cpflight: attempt " + std::to_string(g_attempt)
+                            + " cleared from the checkpoint at t=" + std::to_string(cpflight::g_from)
+                            + " - flying the plan from the head before it is filed");
+                cpflight::g_forceHead = true;
+                cpflight::g_headPending = true;
+                return;
+            }
             if (g_cfg.dpSolve && !g_dpShowSolution) levelslice::onLevelCleared(g_tick);
             // A plan that has just been SEEN to clear the level is a solution; file it under
             // the name Replay mode looks for, so the next visit does not have to solve again.
@@ -935,6 +1057,8 @@ class $modify(PlayLayer) {
                                          : "%s/solution_lv%d_dp.txt",
                          DATA_DIR, g_cfg.levelId);
                 if (writeInputsFile(name, g_cfg.inputs)) {
+                    // ...and which version solved it, for the play menu (solvedWithPath).
+                    writeSolvedWith(name, Mod::get()->getVersion().toVString());
                     writeResult(std::string("dpsolve: solution saved -> ") + name);
                     notify::show("gdsolver: solution saved", NotificationIcon::Success, 3.f);
                 }

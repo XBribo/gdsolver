@@ -140,6 +140,10 @@ struct SolveOutcome {
     // The load refused the level (dp Level::unsupported); the call returned 2 and
     // searched nothing. Empty otherwise.
     std::string unsupported;
+    // The cap ladder's account of the call (dp progress.hpp SearchOutcome::ladder): its
+    // attempts, how many never bound their cap, the plain search's plan hash and the chosen
+    // plan's. Empty for a call that was not a ladder.
+    std::string ladder;
 };
 SolveOutcome outcome();
 // Seconds into the last call at the end of each part of its preparation (dp::g_prepMark: arguments,
@@ -182,4 +186,27 @@ void cancelSearch(bool on);
 // Kills by the Area Move boxes (hazard twins) over the life of the process (dp::g_envKills);
 // take the difference across the span to be counted.
 long long envKillsTotal();
+
+// The cap ladder's plain search beside the ladder (dp cli.hpp PlainElsewhere), from a second copy
+// of the core: 1, a ladder starts its plain search at once on a thread of its own and takes its
+// result where it would have searched it; what the call returns is the same, only sooner. 0, the
+// ladder searches it itself after the attempts. 2, the instrument: both, the ladder's own result
+// kept and the other compared with it (plan, trace, exit code, outcome) -- besideCheckTaken.
+// 3, the gamble: 1, and the plain search taken as soon as it has finished and solved or died no
+// earlier than the ladder's deepest death so far -- not reproducible (dp cli.hpp
+// PlainElsewhere::ready). Only between solves.
+void plainBeside(int mode);
+// The last comparison's line under plainBeside(2), taken (empty when this call made none).
+std::string besideCheckTaken();
+
+// The second copy of the core (dp_bridge2.cpp). Nothing but plainBeside's hooks calls it.
+namespace second {
+int solve(const std::string& csv, const std::vector<std::string>& argv);   // argv[0] included
+SolveOutcome outcome();
+// What it printed since the last call, taken: its stdout is held rather than interleaved with the
+// first copy's (dp_bridge2.cpp).
+std::string takeOutput();
+void cancel(bool on);
+long long envKillsTotal();
+}  // namespace second
 }  // namespace dpbridge

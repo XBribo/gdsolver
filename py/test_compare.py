@@ -549,8 +549,9 @@ MODEL16 = {
 for _r in MODEL16.values():
     _r.update({"mode": "1"})
 
-# The other seat arm, from 6a3e5f8's measurement (`--no-slopeseat`): y = 585
-# exactly at 9,243, grounded. One row, because one row is all the block's
+# The other seat arm, from 6a3e5f8's measurement (`--no-slopeseat`, an arm the
+# 0.4.0 clean-up removed; the numbers stay as recorded): y = 585 exactly at
+# 9,243, grounded. One row, because one row is all the block's
 # second number ever was.
 SEAT16 = {9243: {"tick": "9243", "y": "585", "vy": "0", "grounded": "1", "mode": "1"}}
 

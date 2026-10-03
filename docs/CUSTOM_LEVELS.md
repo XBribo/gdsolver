@@ -1,11 +1,12 @@
 # Custom levels
 
-Custom levels are **not supported yet**. Nothing in the loop is specific to the
-official levels — level selection is the game's own, and the level model is built
-out of whatever `PlayLayer` loaded — so any level can be picked, and many custom
-levels solve as they are. What "not supported" means is that nothing keeps them
-honest: the regression covers the official levels only, and the physics is
-measured against what those levels, and the calibration rigs in `data/rigs`, use.
+Nothing in the loop is specific to the official levels — level selection is the
+game's own, and the level model is built out of whatever `PlayLayer` loaded — so
+any level can be picked, and most custom levels built from parts that existed
+before 2.0 solve as they are. What custom levels do not have is a guarantee: the
+regression covers the official levels only, and the physics is measured against
+what those levels, and the calibration rigs in `data/rigs`, use. A custom level's
+result is whatever the game lets the loop do on it.
 
 A level that leans on a mechanic the model has not been measured against is a
 level the model is wrong about. Being wrong does not produce a wrong answer —
@@ -22,7 +23,7 @@ the section solver's help is slower, and may take a different route each time.
 
 This page says what that looks like in practice: which levels usually solve,
 which gimmicks the model does not cover, and what a failure looks like. No level
-is named; the levels measured are other people's work.
+of the survey is named; the levels measured are other people's work.
 
 ## Trying one
 
@@ -32,46 +33,55 @@ are the same as everywhere: while the mod drives, nothing is recorded.
 
 ## What the measurements say
 
-Rated levels were drawn at random from the level server and solved cold with the
-same loop as the official ones. They are grouped by the game version the level was
-last saved in, which is the best available guess at which parts it uses:
+300 rated levels were drawn at random from the level server and solved cold with
+the release build — the same loop as the official ones, each level given up to
+20 minutes. Grouped by the game version the level was last saved in:
 
-| built with | parts it can contain | levels | cleared | the rest |
-|---|---|--:|--:|---|
-| 1.7 and before | cube, ship, ball, UFO; the early portals, pads and rings | 78 | 71 | 4 gave up at a wall, 2 were refused (too many gravity portals, since accepted), 1 not run to the end |
-| 1.8 | slopes and dual added | 25 | 19 | 3 ran out of time, 2 gave up at a wall, 1 could not make a first plan |
-| 1.9 – 2.2 | wave, robot, spider, swing; the 2.x triggers | 97 | — | not run to the end (below) |
+| saved in | parts it can contain | levels | cleared | the rest | rounds (median, cleared) |
+|---|---|--:|--:|---|--:|
+| before 1.8 | cube, ship, ball, UFO; the early portals, pads and rings | 78 | 76 | 2 ran out of time | 0 |
+| 1.8 | slopes and dual added | 125 | 118 | 5 ran out of time, 2 gave up at a wall | 2 |
+| 1.9 | wave added | 10 | 10 | — | 2.5 |
+| 2.0 | robot, teleports, move and toggle triggers | 9 | 8 | 1 ran out of time | 6 |
+| 2.1 | spider, dash rings, many triggers | 49 | 35 | 14 ran out of time | 11 |
+| 2.2 | swing, area effects, many more triggers | 29 | 11 | 16 ran out of time, 2 gave up at a wall | 11 |
+| all | | 300 | 258 (86 %) | | |
 
-The early levels solve, often at once: 32 of the 71 cleared on the first or second
-plan. The 1.8 levels take several times as many rounds (a median of 8 against 2).
-1.8 is where slopes and dual arrive, and in the same survey the model disagreed
-with the game about ten times as often per minute of play on a 1.8 level as on an
-earlier one.
+The version a level was saved in is only a guess at what it uses: a level saved in
+2.1 may hold nothing newer than 1.8. Grouped instead by the newest object a level
+actually holds (each object dated by the oldest game version of a server level
+that contains it), the 215 levels with nothing from 2.0 on cleared 206 times; the
+85 with an object from 2.0 on, 52 times. That is the line the play menu's yellow
+note draws.
 
-The newer levels were only run until the first disagreement, to catalogue where
-the model is wrong rather than to clear them. Almost every one of them had one
-(81 of 97; 1 cleared without any), and 13 could not make a first plan at all. So
-for a 2.x level the honest expectation is "it will need repairs, and it may not
-get through"; how often it does has not been measured.
+Where the model and the game came apart, per 10,000 ticks the game flew (each
+level's deepest attempt; a place counts once however many rounds died there, and a
+death where only the kill differed counts once the model, replayed on its own,
+has confirmed it — the few that could not be checked are left out):
 
-*When and with what:* the surveys ran from 2026-09-22 to 2026-09-25, on builds
-from the week before v0.3.0. The section solver running on its own (it searches
-the game itself where the repairs are not getting across a wall) and several of
-the fixes in v0.3.0 came after, so with this release the numbers may well be
-different. They have not been measured again yet.
+| the level holds | all | cube | ship | ball | UFO | wave | robot | spider | swing |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| nothing newer than 1.8 | 0.45 | 0.28 | 0.29 | 1.00 | 1.01 | — | — | — | — |
+| 1.9's wave, nothing from 2.0 on | 1.17 | 0.77 | 0.75 | 2.39 | 2.00 | 0.99 | — | — | — |
+| an object from 2.0 on | 2.57 | 1.23 | 3.46 | 4.52 | 2.72 | 11.91 | 2.32 | 1.99 | 34.1 |
+
+The ten wave levels are a small sample; their rates rest on 18 places. On the
+levels with newer objects the wave is the outlier, and the swing has barely been
+measured at all.
+
+*When and with what:* 2026-10-02, on the v0.4.0 build.
 
 ## Levels that usually solve
 
-* Built from **1.7-era parts**: cube, ship, ball and UFO, the early portals
-  (gravity, size, speed, mirror, mode), yellow/pink/blue pads and rings, blocks,
-  spikes, saws and moving geometry driven by the plain move, rotate and toggle
-  triggers.
+* Built from **parts that existed before 2.0**: cube, ship, ball, UFO and wave,
+  slopes and dual, the early portals (gravity, size, speed, mirror, mode),
+  yellow/pink/blue pads and rings, blocks, spikes and saws.
 * **Not too long and not too heavy.** Every round replays the level from the
   start, and the model is built from every object; a few thousand objects is
   typical of the levels above.
-* Where the model has been measured most: the **cube** disagreed with the game
-  least often; the ship, the ball and especially the mini UFO more, and over half
-  of the disagreements found were in mid-air or next to a ring.
+* Where the model has been measured most: on those levels the **cube** and the
+  **ship** disagreed with the game least often, the ball and the UFO three to four
+  times as often, and most disagreements were in mid-air or next to a ring.
 
 ## Gimmicks the model does not cover
 
@@ -93,7 +103,17 @@ section solver finds a way through the game itself — slowly, and not always.
 
 * **The gravity trigger (2.2).** A level that changes the strength of gravity is
   flown by the game with the new value and planned by the model with the old one.
-  Three of the 13 2.x levels that could not make a first plan use it.
+* **Most teleports of 2.1 and 2.2.** The model keeps x as its clock, so a teleport
+  portal whose exit is elsewhere in x is a jump it cannot take; nor does it read a
+  portal that keeps the player's height, one that pushes the player (a static or
+  redirected force), or one whose exit the game draws from several objects, and
+  it has no teleport orb or teleport trigger at all. A portal whose exit is right
+  above or below it is modelled.
+* **Levels that change from one attempt to the next.** An Item Compare or Item
+  Edit can read the attempt count, and Item Persistence keeps items across
+  attempts, so a level can, say, skip its intro from the second attempt on. The
+  loop records the moving geometry on one attempt and flies its plans on later
+  ones, and a solution replayed as a first attempt meets a different level.
 * **Randomness the model cannot box in.** An Area Move with a random variance is
   planned against the whole box it can land in. Area Rotate and Area Scale with a
   variance, and an Advanced Follow's, are not covered yet; the session's
@@ -108,8 +128,10 @@ section solver finds a way through the game itself — slowly, and not always.
 
 ### In the model, but measured less
 
-* **Slopes**, above all where they meet other slopes, blocks or the ceiling: the
-  1.8 row above.
+* **Slopes**, above all where they meet other slopes, blocks or the ceiling.
+* **The wave** against plain floors, ceilings and slides, and on the levels with
+  newer objects generally — its rate in the table above is the highest of the
+  modes that have been measured much.
 * **Mechanics no official level uses.** The model is measured one mechanic at a
   time against the official levels and the rigs; where a mechanic-and-mode
   combination has never been measured, the code carries a fallback that says so
@@ -127,8 +149,8 @@ physics and gets through where the model cannot follow.
 
 ### Very heavy levels
 
-Levels with tens of thousands of objects (the 2.x sample's median was about 26,000,
-the largest over 150,000) are slow: the game's own update, the recording of the
+Levels with tens of thousands of objects (in an earlier sample of 2.x levels the
+median was about 26,000, the largest over 150,000) are slow: the game's own update, the recording of the
 moving geometry and the model all grow with the object count. A level with at least
 10,000 objects its run cannot depend on is solved on a copy without them and
 verified on the level itself ([LEVEL_SLICE.md](LEVEL_SLICE.md)), which helps; a
@@ -159,18 +181,21 @@ counters, keys and gates their coins wait for. A custom level's coins can hang o
 triggers the official ones never use, and the search holds at most eight coins — a
 level with more turns the routing off and says so. See [COINS.md](COINS.md).
 
-## What "supported" will take
+## What is being worked on
 
-"Supported" will mean the model covers a level's mechanics, so a solve is fast
-and predictable and the regression keeps it that way. Getting there means picking
-that subset, saying plainly which objects and modes are in it, and measuring the
-ones that are not yet. The early-era levels above are the natural first subset:
-they already clear nine times in ten, and what remains there is being worked on
-one disagreement at a time.
+* **Model divergences** — each rule that disagrees with what the game measures is
+  fixed, one at a time; this never stops.
+* **The search's logic** — plans that die where the model is right. On the
+  official levels most repairs are of this kind (see [RESULTS.md](RESULTS.md)).
+* **Custom levels in the regression**, so that a change is measured on them and
+  not only on the official levels.
+* **Heavy levels** — the speed of levels with very many objects.
 
-Outside the subset the loop still tries, and a level clears if the game lets it.
-What is planned is to say so up front and afterwards: a warning in the play menu
-when a level uses something the model does not have, and a clear reported as
-either the model's alone or one with stretches the section solver found. (The
-menu already says when a level has a Random trigger or an effect with a random
-variance.)
+Whatever a level uses, the loop tries, and a level clears if the game lets it.
+The play menu says up front where that is less likely
+([RUNNING.md](RUNNING.md#the-play-menu)): a red
+line when a level holds something the model cannot express (the teleports and
+the gravity trigger above, or a level that changes from one attempt to the
+next), and a yellow one on a custom level with objects from 2.0 on. What is
+still planned is saying it afterwards too: a clear reported as either the
+model's alone or one with stretches the section solver found.

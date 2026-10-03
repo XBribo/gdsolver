@@ -2768,6 +2768,78 @@ def build_slopespike_mode(mode: str, mini: bool = False,
     return header(start_mode=mode, mini=mini) + ";" + ";".join(objs) + ";"
 
 
+def build_slopespike_mirror(mode: str, mini: bool = False) -> str:
+    u"""Rig for A SPIKED RAMP MIRRORED IN x (2026-09-29).
+
+    Every unit of the slopespike rigs has flip_x 0, so the only descending ramps
+    they sweep are the ROTATED ones (366 rot 90 reports dir 4). A ramp mirrored in
+    x -- dir 2 on a floor, the form a custom level's ridge uses -- was never on a
+    rig. On such a ridge the game kills a full ship 0.98 px above the cap the
+    rotated unit measures (objMaxY + ph - 1, 269 there, both ends and both slopes),
+    and the ship's attitude does not move that cap, so the mirrored unit itself is
+    the next thing to measure.
+
+    The same unit function and spacing as build_slopespike_mode, in its own file
+    so no unit measured there moves: the two spiked ids at rot 0, mirrored in x,
+    upright and flipped in y.
+    """
+    UNITS.clear()
+    PLAN.clear()
+    objs: list[str] = []
+    x = 600.0
+    for oid in (SPIKE30, SPIKE60):
+        for fx, fy in ((True, False), (True, True)):
+            part, x, u = slopespike_unit(x, oid, 0.0, fx, fy)
+            objs += part
+            u["mode"] = mode
+            u["mini"] = int(mini)
+            UNITS.append(u)
+    # the terminal spike and the floor, for the reason build_slopespike_mode gives
+    objs.append(obj(SPIKE, x + 4 * GRID, GROUND_TOP + 6.0))
+    objs += floor_run(0, x + 300.0)
+    return header(start_mode=mode, mini=mini) + ";" + ";".join(objs) + ";"
+
+
+TWIN_SPIKED60, TWIN_PLAIN60 = 364, 493   # a custom level's stacked 60x30 pair
+
+
+def build_slopespike_twin(mode: str, mini: bool = False) -> str:
+    u"""Rig for A SPIKED RAMP STACKED ON ITS PLAIN TWIN (2026-09-29).
+
+    The slopespike rigs hang each spiked ramp alone, on purpose (see
+    slopespike_unit), and on them the model's outline for a ship holds to 0.05 px
+    -- the high-end cap, the mirrored unit and a ship turned by 33 degrees all
+    included. Where a custom level stacks the spiked 60x30 on a plain 60x30 at the
+    same place, the game kills a ship 0.5 to 1 px outside that outline, under a
+    ceiling unit and at a floor ridge alike. So the twin is the variable left.
+
+    Four units, each the pair at one (cx, cy): the ceiling unit (rot 180), the
+    floor unit rising, the floor unit mirrored in x (falling), and the last two
+    side by side as a ridge.
+    """
+    UNITS.clear()
+    PLAN.clear()
+    objs: list[str] = []
+    cy = GROUND_TOP + 150.0
+    x = 600.0
+    for label, parts in (("ceil", ((180.0, False),)),
+                         ("rise", ((0.0, False),)),
+                         ("fall", ((0.0, True),)),
+                         ("ridge", ((0.0, False), (0.0, True)))):
+        x0 = x
+        for i, (rot, fx) in enumerate(parts):
+            cx = x + 30.0 + 60.0 * i
+            objs.append(obj(TWIN_SPIKED60, cx, cy, rot=rot, flip_x=fx))
+            objs.append(obj(TWIN_PLAIN60, cx, cy, rot=rot, flip_x=fx))
+        w = 60.0 * len(parts)
+        UNITS.append({"x0": x0, "label": label, "oids": [TWIN_SPIKED60, TWIN_PLAIN60],
+                      "cy": cy, "sx0": x0, "sx1": x0 + w, "mode": mode, "mini": int(mini)})
+        x = x0 + w + 6 * GRID
+    objs.append(obj(SPIKE, x + 4 * GRID, GROUND_TOP + 6.0))
+    objs += floor_run(0, x + 300.0)
+    return header(start_mode=mode, mini=mini) + ";" + ";".join(objs) + ";"
+
+
 def portalpress_unit(x: float, frm: str, to: str, offset: int,
                      cell: str, air: bool = False
                      ) -> tuple[list[str], float, dict]:
@@ -2886,6 +2958,127 @@ def build_portalpress() -> str:
             UNITS.append(u)
     objs += floor_run(0, x + 300.0)
     return header(start_mode="cube") + ";" + ";".join(objs) + ";"
+
+
+# Corridor height, floor top -> ceiling bottom. 120 was too low: a cube that
+# jumps at portal_t - 3 becomes a spider on the way up, keeps rising under the
+# spider's much weaker gravity (-0.129/tick) and bonks the ceiling -- the
+# second pass died there at unit 10 and left every later unit empty.
+PORTALSPIDER_CEIL = 240.0
+
+
+def portalspider_unit(x: float, frm: str, press: tuple[int, int], cell: str
+                      ) -> tuple[list[str], float, dict]:
+    u"""ONE `frm -> spider` portal, with the button down over [portal_t + a,
+    portal_t + b] (a == b is a one-tick press).
+
+    The corridor has a ceiling, because a spider's jump is a teleport to the
+    nearest surface above it: without one the rig could not see the jump at
+    all. Each unit opens with normal-gravity portals at floor AND ceiling
+    height (a spider the last unit left on the ceiling meets the upper one and
+    falls back to the floor), then the `frm` portal on the floor past where that
+    fall lands, so the old body settles before the test.
+    """
+    objs: list[str] = [obj(GRAV_NORM, x + 1 * GRID, GROUND_TOP + 15.0),
+                       obj(GRAV_NORM, x + 1 * GRID,
+                           GROUND_TOP + PORTALSPIDER_CEIL - 15.0),
+                       obj(MODE_PORTAL[frm], x + 6 * GRID, GROUND_TOP + 15.0)]
+    x_test = x + 25 * GRID
+    # Floor-level, as in calib_portalpress: only a body on (or just off) the
+    # floor meets it.
+    objs.append(obj(P_SPIDER, x_test, GROUND_TOP + 15.0))
+    pt = mode_change_near(x_test)
+    base = pt if pt >= 0 else tick_at(x_test)
+    a, b = press
+    PLAN.append((base + a, 1))
+    PLAN.append((base + b + 1, 0))
+    u = {"x0": x, "x1": x + 40 * GRID, "from": frm, "to": "spider",
+         "press_a": a, "press_b": b, "cell": cell, "x_test": x_test,
+         "press_t": base + a, "portal_t": pt, "portal_t_measured": pt >= 0}
+    return objs, x + 40 * GRID, u
+
+
+def build_portalspider() -> str:
+    u"""DOES A MODE PORTAL HAND A PRESS TO A SPIDER, AND WHEN?
+
+    calib_portalpress settled it for cube / UFO (the press belongs to the new
+    body from portal_t - 1, and the new body's precondition still applies) and
+    left wave / robot / spider / ball / swing unmeasured. lv21 t=16,723 is a
+    wave -> spider portal met grounded, with the button held since the wave
+    climbed a ramp: GD's spider teleports on the next tick (y 163.5 -> 226.5,
+    once; the button stays down and nothing more happens), and the model's does
+    not, because its re-issue covers cube / robot / UFO only.
+
+    Cells, per old body:
+      ONE-TICK PRESSES at portal_t -12 and +12 (controls: the old body's and the
+        spider's own answer, away from the seam) and -3..+2 (the sweep: which
+        body owns the press, and the input lag).
+      HELD from before the portal to +15: the lv21 shape as far as a flat floor
+        allows. A held wave or ship rises off the floor, so those arrive
+        airborne; a UFO held from -40 flaps once and is back on the floor, still
+        held, at the portal -- the "grounded, held, press already spent" cell.
+    The wave goes last: one death ends the run.
+    """
+    UNITS.clear()
+    PLAN.clear()
+    objs: list[str] = []
+    x = 90.0
+    sweep = ((-12, "control"), (-3, "sweep"), (-2, "sweep"), (-1, "sweep"),
+             (0, "sweep"), (1, "sweep"), (2, "sweep"), (12, "control"))
+    for frm in ("ufo", "cube", "ship", "wave"):
+        for off, cell in sweep:
+            part, x, u = portalspider_unit(x, frm, (off, off), cell)
+            objs += part
+            UNITS.append(u)
+        held = ((-40, 15),) if frm == "ufo" else ((-6, 15), (-1, 15))
+        for a, b in held:
+            part, x, u = portalspider_unit(x, frm, (a, b), "held")
+            objs += part
+            UNITS.append(u)
+    objs += floor_run(0, x + 300.0)
+    ceil_cy = GROUND_TOP + PORTALSPIDER_CEIL + GRID / 2.0
+    objs += floor_run(0, x + 300.0, y=ceil_cy)
+    return header(start_mode="cube") + ";" + ";".join(objs) + ";"
+
+
+def build_spiderairhold() -> str:
+    u"""DOES A SPIDER KEEP A PRESS MADE IN THE AIR UNTIL IT LANDS?
+
+    calib_portalspider left one cell the portal rules do not cover: a ship ->
+    spider unit whose press started one tick after the portal, with the spider
+    already falling (it comes out 1.5 px above the floor), held -- GD teleports
+    on the tick it lands (+11), and the model, whose spider teleports only on a
+    fresh press while grounded, never does. That is a claim about the spider
+    in general, so it is asked here with no portal at all: a yellow pad puts a
+    spider on the floor into the air, and the press is made on the way up or on
+    the way down, then held (or released) through the landing.
+
+    Cells: held from pad_t +10 / +40 / +80 until pad_t +400; one tick at pad_t
+    +40 (the control that a released press is not kept); one tick at pad_t +600,
+    long after landing (the grounded tap every other rig already sees).
+    """
+    UNITS.clear()
+    PLAN.clear()
+    objs: list[str] = []
+    x = 90.0
+    cells = (((10, 400), "held"), ((40, 400), "held"), ((80, 400), "held"),
+             ((40, 40), "released"), ((600, 600), "grounded"))
+    for (a, b), cell in cells:
+        objs.append(obj(GRAV_NORM, x + 1 * GRID, GROUND_TOP + 15.0))
+        objs.append(obj(GRAV_NORM, x + 1 * GRID, GROUND_TOP + PORTALSPIDER_CEIL - 15.0))
+        objs.append(obj(P_SPIDER, x + 6 * GRID, GROUND_TOP + 15.0))
+        x_pad = x + 20 * GRID
+        objs.append(obj(PAD["yellow"][0], x_pad, GROUND_TOP + 15.0))
+        base = tick_at(x_pad)
+        PLAN.append((base + a, 1))
+        PLAN.append((base + b + 1, 0))
+        UNITS.append({"x0": x, "x1": x + 40 * GRID, "cell": cell, "press_a": a,
+                      "press_b": b, "x_pad": x_pad, "pad_t_est": base,
+                      "press_t": base + a})
+        x += 40 * GRID
+    objs += floor_run(0, x + 300.0)
+    objs += floor_run(0, x + 300.0, y=GROUND_TOP + PORTALSPIDER_CEIL + GRID / 2.0)
+    return header(start_mode="spider") + ";" + ";".join(objs) + ";"
 
 
 def build_slopeup() -> str:
@@ -6064,6 +6257,8 @@ BUILDERS = {"probe": build_probe, "slopes": build_slopes,
             # and 367 is |m| = 0.5, which is what separates a vertical offset
             # from a perpendicular one.
             "portalpress": build_portalpress,
+            "portalspider": build_portalspider,
+            "spiderairhold": build_spiderairhold,
             "slopeup": build_slopeup,
             "slopeceil": build_slopeceil,
             "slopeflip": build_slopeflip,
@@ -6074,6 +6269,11 @@ BUILDERS = {"probe": build_probe, "slopes": build_slopes,
             "slopespike_ship": lambda: build_slopespike_mode("ship"),
             "slopespike_cube": lambda: build_slopespike_mode("cube"),
             "slopespike_wave_mini": lambda: build_slopespike_mode("wave", True),
+            "slopespike_ship_mini": lambda: build_slopespike_mode("ship", True),
+            "slopespike_ship_flip": lambda: build_slopespike_mode("ship", False, True),
+            "slopespike_ship_mini_flip": lambda: build_slopespike_mode("ship", True, True),
+            "slopespike_mirror_ship": lambda: build_slopespike_mirror("ship"),
+            "slopespike_twin_ship": lambda: build_slopespike_twin("ship"),
             "hazrot_wave": lambda: build_hazrot("wave"),
             "hazrot_cube": lambda: build_hazrot("cube"),
             "slopespike_wave_flip": lambda: build_slopespike_mode("wave", False, True),

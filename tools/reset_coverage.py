@@ -375,6 +375,30 @@ MUTATE = [
 ]
 
 
+def namespace_spans(text: str) -> list:
+    """(open, close, name) for every `namespace X {` in `text`, brace-matched.
+
+    A function belongs to the innermost namespace whose span CONTAINS it. Taking
+    the last `namespace X {` written before the function instead is wrong as soon
+    as a namespace opens and closes in between: repair.hpp's `namespace rotseed`
+    (a few helpers, closed again) sits between `namespace dpsolve {` and
+    dpsolve::start(), so start() was filed under rotseed and the audit reported
+    its entry point as not found -- and every reset inside it as missing."""
+    spans = []
+    for nm in re.finditer(r"\bnamespace\s+([\w:]+)\s*\{", text):
+        i, depth = nm.end() - 1, 0
+        while i < len(text):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        spans.append((nm.start(), i, nm.group(1)))
+    return spans
+
+
 def collect_bodies(root: Path) -> dict:
     """(namespace, funcname) -> body text, comments stripped."""
     bodies = {}
@@ -383,6 +407,7 @@ def collect_bodies(root: Path) -> dict:
             continue
         text = strip_comments(path.read_text(encoding="utf-8",
                                              errors="replace"))
+        spans = namespace_spans(text)
         for m in FUNC.finditer(text):
             # brace-match the body
             i, depth = m.end() - 1, 0
@@ -395,9 +420,10 @@ def collect_bodies(root: Path) -> dict:
                         break
                 i += 1
             body = text[m.end():i]
-            ns = ""
-            for nm in re.finditer(r"\bnamespace\s+([\w:]+)\s*\{", text[:m.start()]):
-                ns = nm.group(1)          # innermost preceding; good enough here
+            ns, nsOpen = "", -1
+            for o, c, name in spans:      # the innermost namespace containing it
+                if o < m.start() < c and o > nsOpen:
+                    ns, nsOpen = name, o
             bodies.setdefault((ns, m.group(1)), body)
             bodies.setdefault(("", m.group(1)), body)
     return bodies
@@ -541,6 +567,9 @@ ALLOWLIST_DATA = """
 B g_levelCsv        set unconditionally at src/mod/dp_bridge.cpp:52 before every in-process cliMain and cleared at :61 -- the caller's data, not the last solve's (reset.hpp documents it)
 B g_progress        a live readout the mod polls from another thread; cliMain re-opens it with g_progress.begin() at cli.hpp:2398 and a ProgressGuard ends it (reset.hpp documents it)
 B g_outcome         cleared by cliMain itself at cli.hpp:41, deliberately ABOVE resetInvocationState so an early return leaves "FAILED, nothing measured" rather than the last verdict
+B g_plainElsewhere  the caller's hooks, not a solve's state: set unconditionally by dpbridge::plainBeside before every in-process call (src/mod/repair.hpp timedSolve), and never written by dp
+B g_ladderBestT     one ladder's: cliMain stores -1 at every ladder's start and its EndLadder guard stores -1 on every way out; outside a ladder nothing reads it
+B g_ladderStop      one ladder's: cliMain stores false at every ladder's start, after taking the plain search, and in its EndLadder guard on every way out
 #
 # (B) per-tick step scratch, thread_local. cli.hpp:2218-2223 zeroes all six
 #     immediately before every stepBoth call, so nothing can read an older
@@ -685,7 +714,17 @@ RATCHET = """
   g_watchCycleLast g_watchCycleSec g_watchFlips g_watchPurge
   g_watchStartTick g_winShift g_worldDiff g_xHist
   g_xq g_yq
+  g_beside g_besideKills g_checkM g_checkLast g_checked g_differed g_m g_held
+  g_plainBesideMode
 """
+# The last two lines above were added 2026-09-29 with a reason, as the header asks: process lifetime
+# by design, around the second copy of the core. g_beside (src/mod/dp_bridge.cpp) is the plain
+# search beside a ladder, every field refilled by its start(); g_besideKills is summed into
+# envKillsTotal(), which callers difference across a span; g_checkM, g_checkLast, g_checked and
+# g_differed are the dpplainbeside=2 instrument's line (taken after every call) and running
+# counts; dp2out::g_m and g_held (dp_bridge2.cpp) hold the second copy's stdout until the search
+# it came from is taken or dropped. g_plainBesideMode (src/mod/repair.hpp) is set by
+# dpsolve::start() on every session from cfg dpplainbeside or the settings menu.
 
 
 # ---------------------------------------------------------------------------

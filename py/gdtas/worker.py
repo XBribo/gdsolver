@@ -57,6 +57,10 @@ BASE_CFG = {
     "music": "mute",
     "coins": "0",
     "servemode": "1",
+    # The per-attempt research trail (dp_band_itN/dp_groups_itN, dp_fixin_*/dp_attempt_itN) is
+    # off by default in the mod (a player's Solve should not accumulate it); this worker serves
+    # the research/cold loop, so it always asks for it explicitly.
+    "capture": "1",
 }
 
 SW_SHOWMINNOACTIVE = 7
@@ -345,12 +349,62 @@ class SessionResult:
     lines: list[str]
     exit_code: int | None = None
     timed_out: bool = False
+    # Why the caller's guard ended the launch ("" when it did not): a level past its
+    # deadline, the machine below its memory floor. timed_out is set as well, so the
+    # evidence-keeping path for a cut-off level runs unchanged.
+    stopped_why: str = ""
+
+
+class _ResultTail:
+    """Follow a growing result.txt by what was APPENDED, not by re-reading it.
+
+    run_session polls once a second, and a one-session cold run's log reaches tens of
+    MB, so reading the whole file each time grew the reader's memory and I/O with the
+    log -- times four arms in one window, which is how a cold window died of a
+    MemoryError (an empty exception text) the evening the machine ran low on commit.
+    This reads from the last offset, hands on only COMPLETE lines (an unfinished
+    last line waits for its newline, so a marker is never seen in halves), and keeps
+    nothing but that unfinished line between polls.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.pos = 0          # bytes consumed
+        self.carry = b""      # an unfinished last line
+
+    def poll(self) -> tuple[str, str]:
+        """(the complete new lines, the same plus the unfinished line) since the last
+        poll. Both are empty when nothing was appended."""
+        try:
+            size = self.path.stat().st_size
+            if size < self.pos:            # replaced by a shorter file: start over
+                self.pos, self.carry = 0, b""
+            if size == self.pos:
+                return "", ""
+            with open(self.path, "rb") as f:
+                f.seek(self.pos)
+                new = f.read(size - self.pos)
+        except OSError:
+            return "", ""
+        first = self.pos == 0
+        self.pos += len(new)
+        if first and new.startswith(b"\xef\xbb\xbf"):
+            new = new[3:]                  # the stream's BOM, as utf-8-sig drops it
+        buf = self.carry + new
+        cut = buf.rfind(b"\n") + 1
+        self.carry = buf[cut:]
+        # ...and CRLF read as "\n", the way read_text's universal newlines did: the MOD
+        # writes result.txt with CRLF, and a line-anchored pattern (cold_regress's
+        # `^suite: level=... \)$`) does not match a line that still ends in "\r".
+        return (buf[:cut].decode("utf-8", errors="replace").replace("\r\n", "\n"),
+                buf.decode("utf-8", errors="replace").replace("\r\n", "\n"))
 
 
 def run_session(worker_id: int, cfg_lines: list[str], timeout_s: float = 360.0,
                 workers_root: Path = WORKERS_ROOT, mod_file: Path = BUILD_MOD,
                 minimized: bool = True, stall_s: float = 90.0,
-                progress=None, done_marker: str = R.SESSION_END) -> SessionResult:
+                progress=None, done_marker: str = R.SESSION_END,
+                guard=None) -> SessionResult:
     """Run exactly one autorun launch and read result.txt.
 
     For a plain replay that does not use servemode (attempts=1 quitwhendone=1).
@@ -362,6 +416,11 @@ def run_session(worker_id: int, cfg_lines: list[str], timeout_s: float = 360.0,
     was written for. A `levels=` suite writes one of those per LEVEL, so a reader
     left on the default would take the first level's log for the whole run and
     kill the game with twenty-one levels still to go: it passes `suite: done`.
+
+    `guard`, when given, is called once a poll with this worker's root directory and
+    returns "" to go on or a reason to stop. It is the caller's own limit inside the
+    launch -- a level's deadline, a memory floor -- and only ever ends THIS launch's
+    processes (the ones started from under this worker's directory).
     """
     w = _WorkerBase(worker_id, workers_root)
     w._wait_free()   # confirm it is free before overwriting .geode (fails if held)
@@ -373,40 +432,57 @@ def run_session(worker_id: int, cfg_lines: list[str], timeout_s: float = 360.0,
 
     proc = _spawn(w.exe, w.root, w.data, minimized)
     deadline = time.time() + timeout_s
-    last_len, last_change = -1, time.time()
+    last_change = time.time()
+    tail = _ResultTail(result)
     timed_out, stalled = True, False
+    stopped_why = ""
     while time.time() < deadline:
         time.sleep(1.0)
         if proc.poll() is not None:
             timed_out = False
             break
-        try:
-            txt = result.read_text(encoding="utf-8-sig", errors="replace")
-        except OSError:
-            txt = ""
-        if done_marker in txt:
+        lines_new, seen_new = tail.poll()
+        if done_marker in seen_new:
             timed_out = False
             break
-        if len(txt) != last_len:
-            last_len, last_change = len(txt), time.time()
+        if guard is not None:
+            # The lines first, so a guard that keeps "the last iteration / death" sees
+            # the poll it is deciding on.
+            if progress is not None and lines_new:
+                try:
+                    progress(lines_new)
+                except Exception:
+                    pass
+                lines_new = ""
+            try:
+                stopped_why = guard(w.root) or ""
+            except Exception:
+                stopped_why = ""
+            if stopped_why:
+                wall_event("session-guard", f"worker={worker_id} {stopped_why}")
+                break
+        if seen_new:
+            last_change = time.time()
             # The section solver RUNS ENTIRELY INSIDE A SINGLE GD FRAME, so during it
             # neither rendering nor the HUD refresh runs (the overlay looks frozen for
             # 20-30 minutes). This is the only place the caller can report progress.
-            if progress is not None:
+            # `progress` gets the complete lines appended since the last call, not the
+            # whole log (see _ResultTail).
+            if progress is not None and lines_new:
                 try:
-                    progress(txt)
+                    progress(lines_new)
                 except Exception:
                     pass
         # The MOD emits a heartbeat every ~10s. A long silence is not "quiet", it is
         # "stuck"
-        if last_len > 0 and time.time() - last_change > stall_s:
+        if tail.pos > 0 and time.time() - last_change > stall_s:
             stalled = True
             wall_event("session-stall",
                        f"worker={worker_id} no result.txt update for {stall_s:.0f}s"
                        f" - aborting")
             break
 
-    if timed_out and not stalled and proc.poll() is None:
+    if timed_out and not stalled and not stopped_why and proc.poll() is None:
         wall_event("session-timeout",
                    f"worker={worker_id} budget {timeout_s:.0f}s spent")
     if proc.poll() is None:
@@ -424,7 +500,7 @@ def run_session(worker_id: int, cfg_lines: list[str], timeout_s: float = 360.0,
     # Stop-Process is asynchronous. Unless we wait for it to really vanish, the next
     # session gets rejected.
     _wait_gone(w.image, 20)
-    return SessionResult(w.data, R.read_lines(result), code, timed_out)
+    return SessionResult(w.data, R.read_lines(result), code, timed_out, stopped_why)
 
 
 # ---------- resident session (servemode) ----------

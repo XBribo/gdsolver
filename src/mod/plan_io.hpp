@@ -12,6 +12,8 @@ enum Phase {
     Sliced,      // solving on a copy without the objects the run cannot depend on
     Verifying,   // back on the level itself, flying the plan that cleared the copy
     Whole,       // the plan did not hold there: solving on the level itself from here on
+    RefFlight,   // on a fresh copy, flying the plan a wall check just flew on the level, as the
+                 // copy's first attempt (cfg slicefirstref, level_slice.hpp onRefFlightEnd)
 };
 inline int g_phase = Off;
 inline void reset();
@@ -169,6 +171,22 @@ inline bool writeInputsFile(const std::string& path, const std::vector<InputCmd>
     for (const InputCmd& c : plan)
         f << "input=" << c.step << "," << (c.down ? 1 : 0) << "\n";
     return true;
+}
+
+// Which version of the mod solved a stored solution: one line ("v0.3.2") in a file beside it
+// (<solution>.ver), so the solution itself keeps the format every reader of it expects. A
+// solution filed before the versions were written has none, and reads as "".
+inline std::string solvedWithPath(const std::string& solutionPath) { return solutionPath + ".ver"; }
+inline void writeSolvedWith(const std::string& solutionPath, const std::string& version) {
+    std::ofstream f(solvedWithPath(solutionPath), std::ios::trunc);
+    if (f) f << version << "\n";
+}
+inline std::string readSolvedWith(const std::string& solutionPath) {
+    std::ifstream f(solvedWithPath(solutionPath));
+    std::string v;
+    if (f) std::getline(f, v);
+    while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
+    return v;
 }
 
 // ============================================================

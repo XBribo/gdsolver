@@ -318,6 +318,8 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // p1's pre-button y, saved before p2's stepOne can overwrite it
     const bool preBtnSet = g_preBtnSet;
     const double preBtnY = g_preBtnY;
+    const bool p1Tapped = g_ballTapped;   // --repelland, likewise
+    const uint8_t p1HitG = g_hitGRepel;   // --repela0c, likewise
     if (!s.dual) {
         dead = d1;
         markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0);
@@ -357,6 +359,9 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // ordering really means, but it is a much larger change than the one measurement here
     // supports, and this gate is the only cross-body read in stepOne.
     sb.grounded2 = c.grounded;
+    // --repellpolarity: the same bounce's polarity gate reads p1's finished polarity
+    // too. stepOne reads flip2 nowhere else, so this reaches only that gate.
+    sb.flip2 = c.flip;
     // [2026-09-05] ...and the SECOND cross-body read: p1's gravity flip reaches
     // the partner. GD's flipGravity fires the other player with the polarity
     // inverted, from inside p1's collision pass -- so it lands BEFORE p2's own
@@ -385,8 +390,15 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     bool d2 = false;
     bool p2FlippedGravity = false;
     g_halfNow = 1;
+    // --dualband: the second half's portal band reads p1's finished mode, and says if it wrote
+    g_bandPortalWrote = false;
+    if (g_dualBand) g_dualOtherMode = (int)c.mode;
     State cb = stepOne(sb, input, K, d2, &p2FlippedGravity);
+    g_dualOtherMode = -1;
+    const bool p2WroteBand = g_bandPortalWrote;
     g_halfNow = 0;
+    const bool p2Tapped = g_ballTapped;   // --repelland
+    const uint8_t p2HitG = g_hitGRepel;   // --repela0c
     swapHalves(cb);
     // shared fields (x, speed, dual) come from the first half; the second half
     // only contributes its own body -- and `mode` / `mini` / the ceiling press
@@ -402,16 +414,32 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     c.pressSpent2 = cb.pressSpent2;
     c.slopeT2 = cb.slopeT2;
     c.rideLanded2 = cb.rideLanded2;
+    c.seatT2 = cb.seatT2;   // --dualseatt
     // ...and the second body's velocity-limit exemption (State::boost2, added
     // 2026-09-06 with swapHalves). The third of the three sites the SIZE note
     // above is about: without this line p2's latch is written inside its own
     // stepOne and thrown away here every tick.
     c.boost2 = cb.boost2;
+    // --dualslide: ...and the second body's dart slide arm (State::slideT2), which its own
+    // stepOne wrote into the swapped slot.
+    if (g_dualSlide) c.slideT2 = cb.slideT2;
+    // --dualdash: ...and its dash (State::dashing2 / dashSlope2), for the same reason
+    { c.dashing2 = cb.dashing2; c.dashSlope2 = cb.dashSlope2; }
     c.slopeUid02 = cb.slopeUid02;  c.slopeUidNow2 = cb.slopeUidNow2;
     c.snapObj2 = cb.snapObj2;   c.usedOrb2 = cb.usedOrb2;
     c.usedOrbOld2 = cb.usedOrbOld2;
     for (int i = 0; i < 3; ++i) c.usedOrbHist2[i] = cb.usedOrbHist2[i];
+    for (int i = 0; i < 2; ++i) c.spdFired2[i] = cb.spdFired2[i];
+    c.hitG2 = cb.hitG2;   // --repela0c
+    // --a1clatch: the second body's +0xa1c is bit 1 (0 in both halves when the flag is off)
+    c.a1cLatch = (uint8_t)((c.a1cLatch & 1u) | (cb.a1cLatch & 2u));
+    {         // --rot2
+        c.rot2 = cb.rot2;
+        c.rotStep2 = cb.rotStep2;
+        c.rotNeg2 = cb.rotNeg2;
+    }
     c.holdDead2 = cb.holdDead2;
+    { c.flipT2 = cb.flipT2; c.modeT2 = cb.modeT2; }   // --dualflipclock
     for (int i = 0; i < 3; ++i) c.portSeen2[i] = cb.portSeen2[i];
     for (int i = 0; i < 4; ++i) c.touchRing2[i] = cb.touchRing2[i];
     c.touchRingT2 = cb.touchRingT2;
@@ -425,6 +453,28 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // the suppression the latch was supposed to do.
     c.portalLatch2 = cb.portalLatch2;
     for (int i = 0; i < 4; ++i) c.usedPad2[i] = cb.usedPad2[i];
+    // --dualspeedp2 [2026-09-29]: ...but a SPEED portal the second body touches sets the
+    // speed of the pair, and it is written after the first body's (the game handles p1's
+    // collisions first), so the second half's dx wins when its step changed it. Measured on
+    // lv20 t=17,573 (a mirrored dual wave pair, 3x speed portal uid 13878, box y 211..267):
+    // p2's top crosses the box's bottom while p1 is 31 px below it, and the game's speed goes
+    // 1.1 -> 1.3 on that tick (x steps 1.6133 -> 1.9492 from the next); with the button held
+    // from t=17,560, so that p1 climbs into the box and p2 falls away, the switch comes at
+    // t=17,575, the tick p1's top crosses it -- a touch, not an x trigger. The model's p2 step
+    // fired and the merge kept p1's dx, so the pair ran on at 1.1 and the recorder, which
+    // cannot carry x, stopped 5 px later.
+    if (s.dual && cb.dx != sb.dx) c.dx = cb.dx;
+    // --dualband: ...and so does a MODE portal: playerWillSwitchMode calls updateDualGround for
+    // either body, after p1's, so the band the second half wrote is the pair's (frames.hpp
+    // g_dualBand). Taken only when that half's portal wrote it (g_bandPortalWrote); otherwise
+    // p1's stands.
+    if (g_dualBand && s.dual && p2WroteBand) {
+        c.bandFloor = cb.bandFloor;
+        c.bandCeil = cb.bandCeil;
+        c.bandRefY = cb.bandRefY;
+        c.bandBranch = cb.bandBranch;
+        c.bandAnim = cb.bandAnim;
+    }
     // --dualcouple: ...and p2's own flip reaches p1 the same way. GD processes
     // p1 first, so p1 has already integrated when p2's gravity portal calls it:
     // the halving lands on p1's finished vy. lv16 t=13,496 (dual mini ship
@@ -456,11 +506,80 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // mode changed". A same-mode portal touch also re-mirrors in GD but is
     // invisible here (no mode change to see) -- left out until a level
     // needs it.
-    if (c.mode != s.mode) {
+    // --dualremirror [2026-09-29]: the toucher is whichever body switched INTO the mode
+    // the other already has, and since mode2 became its own field that is not always p2.
+    // lv16 t=13,498 (dual, p2 a mini ship since its own touch of the same portal a few
+    // ticks earlier, p1 a mini ball): p1 enters the ship portal (20499,545) alone, and GD
+    // sets p1 to !p2.flip -- up 0 -> 1, vy -5.989 * 0.5 * 0.5 = -1.49725 -- and leaves p2
+    // alone. The rule below flipped p2 instead.
+    const bool p1IsToucher = c.mode != s.mode
+                             && c.mode2 == s.mode2 && s.mode2 == c.mode;
+    if (p1IsToucher) {
+        const uint8_t want = c.flip2 ? 0 : 1;
+        if (c.flip != want) {
+            c.flip = want;
+            c.vy *= 0.5f;
+        }
+    } else if (c.mode2 != s.mode2 && c.mode2 == c.mode) {
         const uint8_t want = c.flip ? 0 : 1;
         if (c.flip2 != want) {
             c.flip2 = want;
             c.vy2 *= 0.5f;
+        }
+    }
+    // --repelland: the dual balls' repel, decided where GD decides it. checkRepellPlayer
+    // (0x2398d0) runs from GJBaseGameLayer::update (0x238845) after both players' collisions and
+    // rotation, and the taps come from the next step's processQueuedButtons -- in a model tick,
+    // between the two halves' collision passes and their taps. Its gate: both balls, the same
+    // upside-down byte, |y1 - y2| < half1 + half2 + 5; then if p1's +0xa0c (hitGround sets it, a
+    // jump or a pad clears it) is up it flips p2, else if p2's is up it flips p1, and the flipped
+    // body leaves at vy -2 upright / +2 upside down. stepOne already runs the rule inside each
+    // half, reading the partner's landing from the start of the tick (p1's half) or from p1's
+    // finished step (p2's half), so the one case it cannot see is p2 LANDING on this tick while p1
+    // closes in: p1 has already stepped. That case is taken here, with the pre-tap reading of p2
+    // (a tap leaves y where the landing put it and only turns the polarity).
+    // A custom level, the dual balls at x~6,083 (custom level B, a 1.8 level, attempt 13 and its
+    // neighbours): p2 lands at 134.950 on t=4,320 and taps (vy 3.426, up 0 -> 1), p1 is falling
+    // 0.694 px above it at 135.644, both upright before the tap, and GD's row has p1 at up 1 with
+    // vy 2.000 -- the repel, then the tap. The model left p1 upright and landed it on 4,321.
+    // --repela0c: ...or the whole rule, with GD's own choice of body. checkRepellPlayer reads the
+    // two +0xa0c bytes (State::hitG, as they stand after this tick's collisions and before either
+    // tap) and flips p2 whenever p1's is up -- even a p2 that has just landed -- and p1 only when
+    // p1's is down and p2's up. The byte outlives a repel and a walk off an edge. Same model-only check
+    // custom level B, iteration 10), where both bodies land at 134.950 on t=4,321: GD
+    // flips p2 (up 1, vy 2.000) and leaves p1 standing; p1 taps on 4,323 (up 1, vy 3.426); and on
+    // 4,324 GD flips p1 back (up 0, vy -2.000) -- p1's byte went down with its tap, p2's has been
+    // up since its landing on 4,321. The rule inside each half asked
+    // for the flipped body to be airborne and read the partner's landing, so it did neither.
+    // A flipped body that tapped on this tick did not tap in GD: the repel came first and
+    // flipGravity took its ground away, so the tap's writes are undone here -- the polarity the
+    // tap left is the repel's too; its vy, spent press and cleared byte are put back.
+    if (s.dual && !d1 && !d2 && c.mode == 2 && c.mode2 == 2
+        && (p1HitG || p2HitG)) {
+        const uint8_t f1 = p1Tapped ? (uint8_t)!c.flip : c.flip;
+        const uint8_t f2 = p2Tapped ? (uint8_t)!c.flip2 : c.flip2;
+        const double halves = playerHalf(2, c.mini != 0) + playerHalf(2, c.mini2 != 0);
+        if (f1 == f2 && std::fabs((double)c.y - (double)c.y2) < halves + 5.0) {
+            if (p1HitG) {
+                c.flip2 = (uint8_t)!f2;
+                c.vy2 = c.flip2 ? 2.0f : -2.0f;
+                c.grounded2 = 0;
+                if (p2Tapped) {
+                    c.pressSpent2 = sb.pressSpent;
+                    c.holdDead2 = sb.holdDead;
+                    c.hitG2 = p2HitG;
+                }
+            } else {
+                c.flip = (uint8_t)!f1;
+                c.vy = c.flip ? 2.0f : -2.0f;
+                c.grounded = 0;
+                if (p1Tapped) {
+                    c.pressSpent = s.pressSpent;
+                    c.holdDead = s.holdDead;
+                    c.hitG = p1HitG;
+                    c.jumpBuf = (uint8_t)(input ? 1 : 0);
+                }
+            }
         }
     }
     // Is the second body in OPEN AIR? Both halves take the same input, so in a

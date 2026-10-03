@@ -32,7 +32,7 @@ inline unsigned char g_ckptOobLatch = 0;
 //                what :108 does every substep.
 //
 // So the latch is 0xC38 and the audit's correction was the wrong way round.
-inline constexpr std::size_t kOobLatchOff = 0xC38;
+inline constexpr std::size_t kOobLatchOff = gdoff::kPlayerOutOfBounds;   // 0xC38 on Windows
 // (the dash held across a restore lives with its type, in secsolve.hpp)
 // y velocity at the checkpoint, full precision, for hole 3 -- the
 // restore is read as re-rounding it onto the 0.001 grid, which would lose the
@@ -66,6 +66,9 @@ struct EntrySnap {
     // what THIS pass did from the head over the verification window, so the
     // restored run has something to be compared against without a second pass
     std::vector<SnapState> head;
+    // The player as the pass had it just before the checkpoint was taken (psnap::captureRaw),
+    // written back after the restore (cfg snapplayer): the checkpoint does not carry all of it.
+    std::vector<uint8_t> player;
 };
 inline std::vector<EntrySnap> g_snaps;
 inline size_t g_nextSnap = 0;
@@ -146,7 +149,7 @@ inline void openFiles() {
               "dead,speed,gravityMod,platXVel,vsize,gy1,gy2,"
               "dual,p2y,p2vy,p2up,p2ground,p2dead,pmin,pmax,snapuid,snapdist,"
               "camscale,gframe,ctrlOff,camx,camy,p2ground2,p2mode,p2vsize,p2x,"
-              "rotch,rotidx,rotrev,firedw,bandst,bandmode,camoffy,freemode,bandforce\n";
+              "rotch,rotidx,rotrev,firedw,bandst,bandmode,camoffy,freemode,bandforce,p2rot\n";
 }
 
 inline void ev(const char* name, double a = 0, double b = 0, double c = 0) {

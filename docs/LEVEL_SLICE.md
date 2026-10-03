@@ -20,9 +20,10 @@ those objects are decorations nothing in the run reads.
 
 ## Which objects are kept
 
-Every trigger, area trigger, keyframe point and every object the game does not
-class as a decoration is kept. A decoration is kept only when something reads
-its group as a **position**:
+Every area trigger, keyframe point and every object the game does not class as
+a decoration or a trigger is kept, and so is every trigger except those that
+can only act on what the run cannot depend on (below). A decoration is kept
+only when something reads its group as a **position**:
 
 - a trigger's centre group or its move-to-target reference, and for a
   move-to-target or dynamic move the moved group itself (its reference point can
@@ -40,17 +41,47 @@ Move, Rotate, Scale, Alpha, Toggle or Area effect applies to each member on its
 own. "Relevant" groups start as every group a trigger or a gameplay object is in
 and grow, to a fixed point, by the positions read by triggers acting on them.
 
+A trigger is dropped when it can only act on what the run cannot depend on
+(cfg `slicetriggers`): a mover — Move, Rotate, Follow, Follow Y, Scale, Alpha,
+Pulse, Toggle, Animate, Stop — whose target group holds nothing the run reads,
+and a cosmetic trigger that addresses no group (colour, gradient, background,
+song, sound, shader). What the run reads starts as the groups of every object
+that is neither a decoration nor a trigger, every trigger's centre,
+move-to-target reference and spawn remap, every target that is not a mover's,
+the level's spawn group and the camera triggers' targets (a Move on a static
+camera's target moves the flight band); a kept trigger's own groups and target
+join it, to a fixed point, since Spawn, Toggle and Stop address triggers by
+group. A trigger in a group that an ordered Spawn fires is kept whatever it
+does: such a spawn times its members off their x, so removing one moves the
+others (on lv22, dropping one Pulse moved a zoom trigger of the same group by a
+tick, and the flight band by up to 22 px).
+
 Types, groups and trigger fields are read from the objects the game built when
 it loaded the level; the cut is made in the level string by index, so every kept
 object keeps its bytes and its order. An id the loaded level has no object for,
-or built with more than one type, is kept.
+or built with more than one type, is kept — except an id built as a decoration
+and as exactly one other type, which is decided per object by No Touch (key
+121): the objects carrying it are the decorations, and those can be cut (cfg
+`slicenotouch`). That holds only when the level string's count of such objects
+equals the game's count of the id's decorations; otherwise the id is kept.
+
+An object the cut leaves out is not removed but replaced, in its place, by a
+placeholder that does nothing and takes the same uids (cfg `sliceuids`). The game
+numbers a level's objects in string order as it builds them, and its play depends
+on those numbers: on a heavy custom level with an area move, removing any one
+object before the area trigger moved the player's landing on the platform it
+moves. With the placeholders, every object of the copy has the level's uid, and
+the session checks that it does (`slice: uids ...`).
 
 Before the port, the rule was checked on the level itself against the cut copy:
 the player's state agreed on every tick of known solutions of the four heaviest
 official levels and along a 24,733-tick route of a heavy custom level, and a
 plan solved on the cut copy of lv22 cleared the level itself. Each fix to
 the rule came from a column that disagreed there (the spawn group, the camera
-targets, the area-trigger targets).
+targets, the area-trigger targets). The trigger cut was checked the same way on
+known solutions of lv19–22 and a heavy custom route: every column of the dump
+matched the uncut level except the camera shake (which two runs of the level
+itself do not share), the trigger queue cursor and the snapped object's uid.
 
 ## When a level is sliced
 
@@ -79,7 +110,9 @@ session's end — took under 10 s. A cut of 10,000 objects saves about 0.24 s a
 round and has repaid that within some twenty rounds; a solve shorter than that
 is a short solve, and the most it loses is those few seconds.
 
-Where the official and spin-off levels stand (the cut's census, `slicecount`):
+Where the official and spin-off levels stand (the cut's census, `slicecount`),
+counted before the trigger and No Touch cuts were on — with them, more is
+removable:
 
 | levels | objects | removable | sliced |
 |---|---:|---:|---|
@@ -132,15 +165,25 @@ spin-off level with coins has secret coins, so no coin run of them is sliced.
 5. A copy that is wrong only at a wall would never clear to be verified. So when
    the copy has gone eight rounds without getting deeper, its deepest plan is
    flown on the level itself, once per wall, and compared with the copy's
-   attempt of the same plan. Where the two part, or where the level gets past
-   the copy's death, the objects around it go back as in step 4. A death on the
-   same tick, the same way, means the wall is the level's own, and the solve goes
-   back to the copy where it was: the check is a flight, not a new run, and the
-   copy is rebuilt from the same string, so its objects keep their uids and the
-   loop's recordings, anchors and plans stay valid.
+   attempt of the same plan. A death on the same tick, the same way, means the
+   wall is the level's own, and the solve goes back to the copy where it was:
+   the check is a flight, not a new run, and the copy is rebuilt from the same
+   string, so its objects keep their uids and the loop's recordings, anchors and
+   plans stay valid. Otherwise the level's flight is not yet held against the
+   cut: the copy's attempt it was compared with is the copy's deepest, which can
+   be its hundredth, and what the game carries from one attempt to the next (the
+   flight band) can move the player there. So the plan is flown once more on a
+   fresh copy, as its first attempt, and the two first attempts are compared
+   (cfg `slicefirstref`): if they agree and die on the same tick, the wall is the
+   level's own and nothing goes back; where they part, or where the level gets
+   past the copy's death, the objects around it go back as in step 4.
 6. A solve that gives up on the copy does not end there: giving up is the copy's
    verdict, not the level's. It goes on on the level itself from the copy's
-   deepest plan.
+   deepest plan — unless the wall it gave up at is one step 5 found to be the
+   level's own. The level would then only be the same wall at the level's price,
+   so the solve goes on on a fresh copy instead, with the recordings, anchors and
+   seeds taken again as a move to the level would, once per wall (cfg
+   `slicegiveupcopy`).
 
 ## What carries across a swap
 
@@ -149,8 +192,9 @@ solution back are one frame, and a plan is not thrown away because some objects
 came back. The plan, the fixups (keyed by the player's state, not by any
 object), the phantom vetoes, the coin margin and the round count carry over.
 What is keyed by an object's uid does not — the recordings of the moving
-geometry, the anchor rows, the pads and rings an attempt spent — because the
-copy numbers its objects differently; they are recorded again on the new level.
+geometry, the anchor rows, the pads and rings an attempt spent — even though the
+copy now numbers its objects as the level does (`sliceuids`): they are recorded
+again on the new level.
 The deepest plan is not carried as the deepest: its depth was measured on the
 level the run left, so the carried plan is flown first and measured again.
 
@@ -164,6 +208,11 @@ one of the level the session was started on.
 | `slice` | 1 | 0 = never slice |
 | `slicemin` | 10000 | objects the cut must remove for the copy to be used |
 | `sliceaddbacks` | 2 | add-backs before the solve moves to the level itself |
+| `slicetriggers` | 1 | drop the triggers that can only act on what the run cannot depend on |
+| `sliceuids` | 1 | replace a left-out object by a placeholder with the same uids, so the copy numbers its objects as the level does |
+| `slicenotouch` | 1 | decide an id built as a decoration and one other type per object, by No Touch |
+| `slicefirstref` | 1 | a wall check that does not end like the copy compares two first attempts (step 5) |
+| `slicegiveupcopy` | 1 | giving up at a wall the level shares goes on on a fresh copy, once per wall (step 6) |
 | `slicecount` | 0 | 1 = print the cut's census line and end the session (no solve) |
 | `slicenoposition` | 0 | 1 = drop the decorations read as positions too: a cut that is wrong on purpose, to exercise the verification and the add-back |
 
@@ -173,7 +222,7 @@ one of the level the session was started on.
 the copy's size, the copy's clear, the verification's outcome with where the
 level parted from the copy, each wall check and add-back, and at the session's
 end where it finished (`slice: ended ...`, with the counts of verifications,
-wall checks and add-backs).
+wall checks, add-backs and first-attempt flights on a fresh copy).
 
 ## Limits
 
@@ -182,7 +231,8 @@ wall checks and add-backs).
 - An object whose id the game rewrites when it loads the level has no loaded
   object of the same id to be classed by, and is kept.
 - The add-back puts back a stretch of level around where the runs parted. A cut
-  that is wrong in a way that is not local (an effect whose per-object random
-  index shifts when any object is removed) fails that way every time, and the
-  solve then moves to the level itself.
+  that is wrong in a way that is not local fails that way every time, and the
+  solve then moves to the level itself. (The one such case measured — an effect
+  that depended on the objects' numbering, which removing any object shifted — is
+  what the placeholders of `sliceuids` are for.)
 

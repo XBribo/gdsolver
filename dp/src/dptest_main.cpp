@@ -6,7 +6,11 @@
 // recordings predate the `end` trailer, so quick_regress cannot see the rule at all.
 //
 //   dptest            runs every case, prints one line each, exit 1 on the first failure
+//   dptest --groups-corpus <file>...
+//                     reads each --groups recording with parseGroupTimeline and with the sscanf
+//                     reader it replaced, and says whether they agree bit for bit
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -257,13 +261,7 @@ void activatorRoots() {
         {101, 30}, {102, 30}, {103, 30}, {104, 30}, {105, 36},
         {1001, 0}, {1002, 0}, {2001, 0}, {2002, 2}, {3001, 35}, {4001, 0}, {5001, 35}};
 
-    dp::g_activators = false;
-    const auto off = dp::loadTouchTriggers(trig, grp, -1e18, &types);
-    check(!boxOf(off, 101) && !boxOf(off, 103), "without --activators no pickup is a box");
-
-    dp::g_activators = true;
     const auto on = dp::loadTouchTriggers(trig, grp, -1e18, &types);
-    dp::g_activators = false;
     const dp::TouchTrig* k = boxOf(on, 101);
     bool both = k && k->activator && k->togEv.size() == 2;
     for (size_t i = 0; both && i < k->togEv.size(); ++i)
@@ -278,8 +276,6 @@ void activatorRoots() {
     const dp::TouchTrig* tb = boxOf(on, 105);
     check(tb && tb->activator && tb->press && !k->press,
           "a toggle block is an activator that needs the button; a pickup does not");
-    const dp::TouchTrig* tbOff = boxOf(off, 105);
-    check(!tbOff || !tbOff->press, "without --activators a toggle block is never a press box");
 }
 
 // A trigger row for the chain walks: the columns up to togon matter here (sdelay is the 27th,
@@ -357,16 +353,11 @@ void keyHoldsDelayedSwitch() {
     dp::State b = a;
     b.fireB[0] = 150;
     // a's switch lands at 200, b's at 250: at 220 one world has it and the other does not.
-    dp::g_activators = true;
     dp::buildTouchMoveTicks();
     check(dp::keyOf(a, 220) != dp::keyOf(b, 220),
           "while the later switch has not landed, the two states keep different keys");
     check(dp::keyOf(a, 400) == dp::keyOf(b, 400),
           "once both have landed they merge again");
-    dp::g_activators = false;
-    dp::buildTouchMoveTicks();
-    check(dp::g_touchMoveTicks[0] == 0,
-          "without --activators the switch does not hold the key (nothing reads it)");
     dp::g_touch = saved;
     dp::buildTouchMoveTicks();
 }
@@ -398,7 +389,190 @@ static void commaFields() {
     check(same, "splitCommaFields fills the same fields as the getline loop it replaced");
 }
 
-int main() {
+// The reader loadGroupTimeline was until 2026-09-30 -- getline on a text-mode stream, sscanf per
+// line -- kept as the reference parseGroupTimeline is held to.
+static dp::GroupTimeline groupsByScanf(const std::string& path, long long* endOut,
+                                       std::unordered_map<int, uint8_t>* initOut) {
+    *endOut = -1;
+    initOut->clear();
+    dp::GroupTimeline g;
+    std::ifstream in(path);
+    std::string line;
+    std::getline(in, line);
+    while (std::getline(in, line)) {
+        int t = 0, uid = 0, on = 1, env = 0;
+        float cx = 0, cy = 0, w = 0, h = 0, rot = 0;
+        if (line.rfind("end,", 0) == 0) {
+            *endOut = std::atoll(line.c_str() + 4);
+            continue;
+        }
+        if (line.rfind("init,", 0) == 0) {
+            int u = 0, o = 1;
+            if (std::sscanf(line.c_str() + 5, "%d,%d", &u, &o) == 2) (*initOut)[u] = o ? 1 : 0;
+            continue;
+        }
+        const int n = std::sscanf(line.c_str(), "%d,%d,%f,%f,%f,%f,%d,%f,%d", &t, &uid, &cx, &cy,
+                                  &w, &h, &on, &rot, &env);
+        if (n < 6) continue;
+        g[uid].push_back({t, cx, cy, w * 0.5f, h * 0.5f, (uint8_t)(on ? 1 : 0), rot,
+                          (uint8_t)(env ? 1 : 0)});
+    }
+    for (auto& kv : g)
+        std::sort(kv.second.begin(), kv.second.end(),
+                  [](const dp::DynSample& a, const dp::DynSample& b) { return a.t < b.t; });
+    return g;
+}
+
+static bool sameBits(float a, float b) { return std::memcmp(&a, &b, sizeof a) == 0; }
+
+// Empty when the two hold the same samples, bit for bit, AND iterate in the same order: the loader
+// walks the timeline, so the order is part of what a reader hands on.
+static std::string timelineDiff(const dp::GroupTimeline& a, const dp::GroupTimeline& b) {
+    if (a.size() != b.size())
+        return "objects " + std::to_string(a.size()) + " vs " + std::to_string(b.size());
+    auto ia = a.begin();
+    auto ib = b.begin();
+    for (; ia != a.end(); ++ia, ++ib) {
+        if (ia->first != ib->first) return "order differs at uid " + std::to_string(ia->first);
+        const auto& va = ia->second;
+        const auto& vb = ib->second;
+        if (va.size() != vb.size()) return "uid " + std::to_string(ia->first) + " row count";
+        for (size_t k = 0; k < va.size(); ++k) {
+            const dp::DynSample& x = va[k];
+            const dp::DynSample& y = vb[k];
+            if (x.t != y.t || x.on != y.on || x.env != y.env || !sameBits(x.cx, y.cx)
+                || !sameBits(x.cy, y.cy) || !sameBits(x.hw, y.hw) || !sameBits(x.hh, y.hh)
+                || !sameBits(x.rot, y.rot))
+                return "uid " + std::to_string(ia->first) + " t=" + std::to_string(x.t);
+        }
+    }
+    return "";
+}
+
+// One file through both readers: the rows, the trailer and the init lines. Empty when they agree.
+static std::string groupsReadersDiff(const std::string& path, long long* rows = nullptr) {
+    long long endA = -1, endB = -1;
+    std::unordered_map<int, uint8_t> initA, initB;
+    const dp::GroupTimeline a = groupsByScanf(path, &endA, &initA);
+    const dp::GroupTimeline b = dp::loadGroupTimeline(path, &endB, &initB);
+    if (rows) {
+        *rows = 0;
+        for (const auto& kv : a) *rows += (long long)kv.second.size();
+    }
+    const std::string d = timelineDiff(a, b);
+    if (!d.empty()) return d;
+    if (endA != endB) return "end " + std::to_string(endA) + " vs " + std::to_string(endB);
+    if (initA != initB) return "init lines";
+    return "";
+}
+
+// parseGroupTimeline against the sscanf reader it replaced, on the shapes a line can take: a
+// line cut off mid-write, blanks, signs, a CR, an exponent, inf/nan, hex, a trailing comma, more
+// columns than the format, more digits than the plain path takes, float rounding midpoints -- and
+// 20,000 rows of %.3f the way the recorder writes them, from small to 1e7. Once through a text
+// stream (CRLF, as the mod writes) and once written as bytes (LF only).
+static void groupsParser() {
+    std::string body =
+        "tick,uid,cx,cy,w,h,on,rot\n"
+        "1,7,0,100,30,3,1,0\n"
+        "2,7,0.125,100.5,30.000,3.000,1,45.500\n"
+        "3,8,-0.000,-12.345,1.5,2.5,0,-90.000,1\n"
+        "4,8,1e3,2E-2,3,4\n"
+        "5,9, 7.5, 8.25,9,10,1,0\n"
+        "6,9,.5,1.,+2.5,-.25,0,0\n"
+        "7,10,1.5,2.5,3.5\n"
+        "8,10,1.5,2.5,3.5,4.5,\n"
+        "9,10,1.5,2.5,3.5,4.\n"
+        "10,11,nan,inf,-inf,1,1,0\n"
+        "11,11,123456.789,0.001,99999.999,0.0005,1,359.999\n"
+        "12,11,1.2.3,4,5,6\n"
+        "\n"
+        "13,12,1,2,3,4,5,6,7,8\n"
+        "14,12,0x1p3,2,3,4\n"
+        "init,12,0\n"
+        "init,13,1\n"
+        "15,13,3.14159265358979,2.718281828,1,1\n"
+        "16,13,16777217.000,33554433.5,1,1\n"
+        "17,13,2097152.125,4194303.875,1,1\n"
+        "18,13,0.1,0.2,0.3,0.7,1,0.9\n"
+        "19,14,-5,6,7,8,1,0\r\n"
+        "20,14,  -7.5  ,1,1,1\n"
+        "21 ,15,1,1,1,1\n"
+        "-22,15,1,1,1,1\n"
+        "23,16,1,1,1,1,1,1,1\n"
+        "24,16,1,1,1,1,0,0,0\n"
+        "25,16,-,1,1,1\n"
+        "26,16,1,.,1,1\n"
+        "end,77\n";
+    unsigned long long s = 0x9E3779B97F4A7C15ULL;
+    auto next = [&s]() {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        return (double)(s >> 11) / 9007199254740992.0;
+    };
+    const double scales[] = {1.0, 30.0, 360.0, 5000.0, 40000.0, 2.1e6, 1.0e7};
+    for (int i = 0; i < 20000; ++i) {
+        const double sc = scales[i % 7];
+        char b[256];
+        std::snprintf(b, sizeof b, "%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%.3f%s\n", 30 + i, 100 + i % 97,
+                      (float)((next() - 0.5) * sc), (float)(next() * sc), (float)(next() * 60.0),
+                      (float)(next() * 60.0), i % 2, (float)((next() - 0.5) * 720.0),
+                      i % 5 == 0 ? ",1" : "");
+        body += b;
+    }
+    body += "99999,17,1,2,3,4";   // the last line with no newline
+    const std::string text = writeTmp("dptest_groups_text.txt", body);
+    const std::string bin = (std::filesystem::temp_directory_path() / "dptest_groups_lf.txt").string();
+    {
+        std::ofstream f(bin, std::ios::binary | std::ios::trunc);
+        f << body;
+    }
+    const std::string d1 = groupsReadersDiff(text);
+    const std::string d2 = groupsReadersDiff(bin);
+    if (!d1.empty()) std::printf("  text stream: %s\n", d1.c_str());
+    if (!d2.empty()) std::printf("  bytes: %s\n", d2.c_str());
+    check(d1.empty() && d2.empty(),
+          "parseGroupTimeline reads every line the way the sscanf reader it replaced did");
+
+    // groupLayersFor's first layer is a COPY of a file's parse (the parse stays cached for the
+    // next call), where it used to be the parse itself: the copy has to iterate the same way, and
+    // an overlay laid over it has to come out as it did over the original.
+    long long end = -1;
+    std::unordered_map<int, uint8_t> init;
+    dp::GroupTimeline base = dp::loadGroupTimeline(bin, &end, &init);
+    const dp::GroupTimeline over = dp::loadGroupTimeline(writeTmp("dptest_groups_over.txt",
+        "tick,uid,cx,cy,w,h,on,rot\n"
+        "5,7,1,2,3,4,1,0\n"
+        "6,50000,1,2,3,4,1,0\n"
+        "7,50001,1,2,3,4,1,0\n"
+        "8,150,1,2,3,4,1,0\n"
+        "end,20\n"), &end, &init);
+    dp::GroupTimeline copy = base;
+    const std::string dc = timelineDiff(base, copy);
+    dp::overlayGroupTimeline(copy, over, false, end);
+    dp::overlayGroupTimeline(base, over, false, end);
+    const std::string doverlay = timelineDiff(base, copy);
+    if (!dc.empty()) std::printf("  copy: %s\n", dc.c_str());
+    if (!doverlay.empty()) std::printf("  overlay: %s\n", doverlay.c_str());
+    check(dc.empty() && doverlay.empty(),
+          "a copied parse iterates as the parse does, and so does an overlay laid over it");
+}
+
+// dptest --groups-corpus <file>...: the same comparison on real recordings.
+static int groupsCorpus(int argc, char** argv) {
+    int bad = 0;
+    for (int i = 2; i < argc; ++i) {
+        long long rows = 0;
+        const std::string d = groupsReadersDiff(argv[i], &rows);
+        std::printf("%s: %lld rows %s%s\n", d.empty() ? "ok" : "FAIL", rows, argv[i],
+                    d.empty() ? "" : (" -- " + d).c_str());
+        bad |= !d.empty();
+    }
+    return bad;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 2 && !std::strcmp(argv[1], "--groups-corpus")) return groupsCorpus(argc, argv);
+    groupsParser();
     commaFields();
     overlayReach();
     initLines();

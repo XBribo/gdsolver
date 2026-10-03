@@ -85,11 +85,46 @@ inline bool heapOk(int* heapsOut = nullptr, long long* blocksOut = nullptr) {
 #endif
 }
 
+// Where the section search was when something ended the process (set by hooks_gamelayer's search:
+// the step of an expansion it was in, the layer and the node). 0 = not in a search.
+inline volatile int g_secPhase = 0, g_secPhaseDepth = -1, g_secPhaseNode = -1;
+// ...and what each step is (the numbers the search writes into g_secPhase).
+inline const char* secPhaseName(int p) {
+    switch (p) {
+    case 1: return "layer-start";
+    case 2: return "expand";
+    case 10: return "restore-world";
+    case 11: return "restore-player";
+    case 12: return "restore-effects";
+    case 13: return "restore-state";
+    case 14: return "restore-touch";
+    case 15: return "restore-activation";
+    case 16: return "restore-trail";
+    case 20: return "step-begin";
+    case 21: return "step";
+    case 22: return "after-step";
+    case 30: return "activation-sig";
+    case 31: return "dedupe-key";
+    case 40: return "capture-player";
+    case 41: return "capture-effects";
+    case 42: return "capture-state";
+    case 43: return "capture-touch";
+    case 44: return "capture-world";
+    case 45: return "capture-checkpoint";
+    case 50: return "cap-prune";
+    case 55: return "layer-end";
+    case 60: return "verify";
+    case 70: return "census";
+    default: return "?";
+    }
+}
+
 inline void writeRaw(const char* what) {
     char depths[256];
     hookdepth::format(depths, sizeof(depths));
     char line[1024];
-    snprintf(line, sizeof(line), "FATAL: %s (privateMB=%d)%s", what, privateMB(), depths);
+    snprintf(line, sizeof(line), "FATAL: %s (privateMB=%d)%s secphase=%d d=%d node=%d", what, privateMB(),
+             depths, g_secPhase, g_secPhaseDepth, g_secPhaseNode);
     emit(line);
 }
 
@@ -124,7 +159,7 @@ inline LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = nullptr;
 // Record the crash site as module+offset. On a stack overflow (0xC00000FD) Geode's crash log
 // produces not a single line (there is no stack left to run the handler on).
 // No allocating tool can be used, so CaptureStackBackTrace + fixed buffers only
-inline void writeBacktrace() {
+inline void writeBacktrace(const char* tag = "FATAL:") {
     void* frames[32];
     USHORT n = CaptureStackBackTrace(0, 32, frames, nullptr);
     for (USHORT i = 0; i < n; ++i) {
@@ -137,10 +172,10 @@ inline void writeBacktrace() {
             GetModuleFileNameA(mod, name, sizeof(name));
             const char* slash = strrchr(name, '\\');
             if (slash) memmove(name, slash + 1, strlen(slash + 1) + 1);
-            snprintf(line, sizeof(line), "FATAL:   #%02u %s+0x%llX", i, name,
+            snprintf(line, sizeof(line), "%s   #%02u %s+0x%llX", tag, i, name,
                 (unsigned long long)((char*)frames[i] - (char*)mod));
         } else {
-            snprintf(line, sizeof(line), "FATAL:   #%02u %p (no module)", i, frames[i]);
+            snprintf(line, sizeof(line), "%s   #%02u %p (no module)", tag, i, frames[i]);
         }
         emit(line);
     }
@@ -194,6 +229,22 @@ inline void writeStackScan(EXCEPTION_POINTERS* ep) {
 #endif
 }
 
+// A C++ exception thrown inside a section search (g_secPhase set), seen at the throw -- the search
+// catches it and gives the search up, by which time the frames that threw are gone. The first few of
+// a session print where it was thrown (`secthrow:` lines, module+offset).
+inline volatile LONG g_secThrows = 0;
+inline LONG WINAPI onFirstChance(EXCEPTION_POINTERS* ep) {
+    if (ep && ep->ExceptionRecord && ep->ExceptionRecord->ExceptionCode == 0xE06D7363 && g_secPhase != 0
+        && InterlockedIncrement(&g_secThrows) <= 3) {
+        char line[160];
+        snprintf(line, sizeof(line), "secthrow: a C++ exception thrown in a section search at depth %d, step %d, node %d",
+                 g_secPhaseDepth, g_secPhase, g_secPhaseNode);
+        emit(line);
+        writeBacktrace("secthrow:");
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 inline LONG WINAPI onUnhandled(EXCEPTION_POINTERS* ep) {
     char buf[256];
     snprintf(buf, sizeof(buf), "unhandled SEH 0x%08lX at %p",
@@ -218,6 +269,7 @@ inline void install() {
 #ifdef GEODE_IS_WINDOWS
     _set_invalid_parameter_handler(&onInvalidParameter);
     g_prevFilter = SetUnhandledExceptionFilter(&onUnhandled);
+    AddVectoredExceptionHandler(1, &onFirstChance);
 #endif
 }
 

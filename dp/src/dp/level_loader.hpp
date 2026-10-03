@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdarg>
+#include <limits>
+#include <map>
 #include "dp/triggers.hpp"
 
 namespace dp {
@@ -135,6 +137,97 @@ inline bool isAnticheatSpikeRow(const std::string& row, int maxUid) {
     return v.size() == 17 && v[0] == "8" && v[2] == "0" && v[3] == "105" && v[4] == "6"
            && v[5] == "12" && v[15] == "30" && v[16] == "30" && std::atoi(v[7].c_str()) == maxUid;
 }
+// THE GLITCH-AVOID MODE (g_glitchDeco, thread_pool.hpp): a decoration drawn where a hazard is, and
+// placed somewhere without one, looks like a hazard and kills nothing. A wall edged with them has
+// a hole that only a hitbox reading finds -- lv20's first wave passes the tip of a spike wall at
+// x=1,168 through two edge pieces (id 719, the look of hazard 667) that have no hazard under them.
+// A deco id counts as a hazard's look when at least 90% of its placements (and at least 3) sit on
+// that hazard, same centre and same rotation; each ungrouped placement without one then gets a
+// copy of a hazard row of that id and rotation, at its centre, under a fresh uid. Rows, not objects,
+// so the copy is built by the same parse as the real one. Returns how many were added.
+inline bool g_glitchDeco = false;   // --glitchdeco (the mode's other switches: thread_pool.hpp)
+inline int addHazardLookalikes(std::vector<std::string>& rows, int& maxUid) {
+    struct Row { std::vector<std::string> f; double cx = 0, cy = 0; int rot = 0; };
+    std::vector<Row> rs;
+    rs.reserve(rows.size());
+    for (size_t i = 1; i < rows.size(); ++i) {
+        Row r;
+        std::stringstream ss(rows[i]);
+        std::string f;
+        while (std::getline(ss, f, ',')) r.f.push_back(f);
+        while (!r.f.empty() && !r.f.back().empty()
+               && (r.f.back().back() == '\r' || r.f.back().back() == '\n'))
+            r.f.back().pop_back();
+        if (r.f.size() < 10) { r.f.clear(); rs.push_back(r); continue; }
+        r.cx = std::atof(r.f[2].c_str());
+        r.cy = std::atof(r.f[3].c_str());
+        r.rot = ((int)std::lround(std::atof(r.f[9].c_str())) % 360 + 360) % 360;
+        rs.push_back(std::move(r));
+    }
+    auto key = [](double x, double y) {
+        return ((long long)std::llround(x) << 32) ^ (long long)(std::llround(y) & 0xffffffff);
+    };
+    std::unordered_map<long long, std::vector<size_t>> haz;
+    for (size_t i = 0; i < rs.size(); ++i)
+        if (!rs[i].f.empty() && rs[i].f[1] == "2") haz[key(rs[i].cx, rs[i].cy)].push_back(i);
+    auto onHazard = [&](const Row& d) -> const Row* {
+        auto it = haz.find(key(d.cx, d.cy));
+        if (it == haz.end()) return nullptr;
+        for (size_t hi : it->second) {
+            const Row& h = rs[hi];
+            if (std::fabs(h.cx - d.cx) < 0.5 && std::fabs(h.cy - d.cy) < 0.5 && h.rot == d.rot)
+                return &h;
+        }
+        return nullptr;
+    };
+    std::map<std::string, int> total;
+    std::map<std::string, std::map<std::string, int>> pairedWith;
+    for (const Row& d : rs) {
+        if (d.f.empty() || d.f[1] != "7") continue;
+        ++total[d.f[0]];
+        if (const Row* h = onHazard(d)) ++pairedWith[d.f[0]][h->f[0]];
+    }
+    std::map<std::string, std::string> lookOf;   // deco id -> hazard id
+    for (const auto& kv : pairedWith) {
+        const auto best = std::max_element(kv.second.begin(), kv.second.end(),
+                                           [](const auto& a, const auto& b) {
+                                               return a.second < b.second;
+                                           });
+        if (best->second >= 3 && best->second >= 0.9 * total[kv.first])
+            lookOf[kv.first] = best->first;
+    }
+    // One template row per (hazard id, rotation): the w/h columns are the rotated box's.
+    std::map<std::pair<std::string, int>, const Row*> tmpl;
+    for (const Row& h : rs)
+        if (!h.f.empty() && h.f[1] == "2") tmpl.emplace(std::make_pair(h.f[0], h.rot), &h);
+    int added = 0;
+    std::vector<std::string> extra;
+    for (const Row& d : rs) {
+        if (d.f.empty() || d.f[1] != "7" || d.f[6] != "0") continue;
+        const auto lk = lookOf.find(d.f[0]);
+        if (lk == lookOf.end() || onHazard(d)) continue;
+        const auto t = tmpl.find(std::make_pair(lk->second, d.rot));
+        if (t == tmpl.end()) continue;
+        std::vector<std::string> f = t->second->f;
+        f[2] = d.f[2];
+        f[3] = d.f[3];
+        f[6] = "0";
+        f[7] = std::to_string(++maxUid);
+        std::string line;
+        for (size_t k = 0; k < f.size(); ++k) line += (k ? "," : "") + f[k];
+        extra.push_back(line);
+        ++added;
+    }
+    for (std::string& e : extra) rows.push_back(std::move(e));
+    if (added) {
+        std::string ids;
+        for (const auto& kv : lookOf) ids += " " + kv.first + "~" + kv.second;
+        std::printf("glitchdeco: %d hazard look-alike(s) with no hazard under them are hazards "
+                    "here (deco~hazard:%s)\n", added, ids.c_str());
+    }
+    return added;
+}
+
 inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullptr,
                 const std::vector<TouchTrig>* tt = nullptr,
                 const std::vector<AutoTrig>* at = nullptr) {
@@ -150,6 +243,11 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             for (int k = 0; k < 8 && std::getline(ss, f, ','); ++k)
                 if (k == 7) maxUid = std::max(maxUid, std::atoi(f.c_str()));
         }
+        // The glitch-avoid mode's hazard look-alikes, before the anticheat filter reads maxUid
+        // (the copies' uids are above every real one, so that filter never matches them).
+        const int realMaxUid = maxUid;
+        if (g_glitchDeco && !rows.empty()) addHazardLookalikes(rows, maxUid);
+        maxUid = realMaxUid;
         for (size_t i = 0; i < rows.size(); ++i)
             if (i == 0 || !isAnticheatSpikeRow(rows[i], maxUid)) all += rows[i] + "\n";
         filtered.str(all);
@@ -508,6 +606,48 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             }
         }
     }
+    // --ridebox: does this arm box ride the player, and over which ticks did the recording
+    // see it ride (modifiers.hpp, g_rideBox)? Riding = an autonomous Move reaches it locked
+    // to the player on both axes (the level data). The window = its first recorded row that
+    // leaves the load-time place, to the last row at which it still moved; open (INT_MAX)
+    // when that last move is on the recording's own last tick, i.e. the flight stopped
+    // inside the ride.
+    auto rideWindow = [&](const Obj& ob, const std::vector<ModRow>& live, bool& rides,
+                          int& t0r, int& t1r, const char* kind) {
+        rides = false;
+        t0r = t1r = -1;
+        const auto tit = (ob.uid >= 0) ? trigOf.find(ob.uid) : trigOf.end();
+        if (tit == trigOf.end() || tit->second.alockTrig < 0) return;
+        const TrigOf& e = tit->second;
+        if (e.alock <= 0.0 || e.alockY <= 0.0) {
+            loadPrintf("ridebox: %s uid %d is locked to the player on one axis only "
+                       "(x %.1f, y %.1f ticks) - read as before\n",
+                       kind, ob.uid, e.alock, e.alockY);
+            return;
+        }
+        rides = true;
+        float px = (float)ob.cx, py = (float)ob.cy;
+        for (const ModRow& r : live) {
+            const bool moved = std::fabs(r.cx - px) > 1e-3f || std::fabs(r.cy - py) > 1e-3f;
+            if (moved && r.t > 1) {
+                if (t0r < 0) t0r = r.t;
+                t1r = r.t;
+            }
+            px = r.cx;
+            py = r.cy;
+        }
+        const bool open = t1r >= 0 && g_groupsEndT >= 0 && t1r >= g_groupsEndT - 1;
+        if (open) t1r = std::numeric_limits<int>::max();
+        if (t0r < 0)
+            loadPrintf("ridebox: %s uid %d rides the player (lock %.1f ticks) - the "
+                       "recording has no ride, read at its load-time place\n",
+                       kind, ob.uid, e.alock);
+        else
+            loadPrintf("ridebox: %s uid %d rides the player (lock %.1f ticks) - window "
+                       "t=%d..%s from the recording (end %lld)\n",
+                       kind, ob.uid, e.alock, t0r,
+                       open ? "open" : std::to_string(t1r).c_str(), g_groupsEndT);
+    };
     // Route one object either into its static bucket or into the dynamic set.
     // An object is dynamic when the MOD recorded a timeline for its uid; a
     // grouped object that never actually moves has no rows and stays in the
@@ -766,6 +906,22 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
                     || sm[k].on != sm[0].on) { recFire = sm[k].t; break; }
         }
         L.dyn.trigRecFire.push_back(recFire);
+        // --anchornoop (Dynamics::anchorUnrec): the anchor is a Toggle reaching this object that
+        // moves it nowhere, and the first row already reads the state it switches to.
+        {
+            uint8_t un = 0;
+            if (autoCtl && recFire >= 0 && at && tit->second.aAnchor >= 0
+                && (size_t)tit->second.aAnchor < at->size()
+                && tit->second.andx == 0.f && tit->second.andy == 0.f
+                && tit->second.andur == 0.0 && !L.dyn.samples.back().empty()) {
+                for (const AutoTrig::Tog& g : (*at)[(size_t)tit->second.aAnchor].tog)
+                    if (g.uid == o.uid) {
+                        un = ((int)L.dyn.samples.back()[0].on == (int)g.on) ? 1 : 0;
+                        break;
+                    }
+            }
+            L.dyn.anchorUnrec.push_back(un);
+        }
         // recAuto: is this object's recorded motion a WORLDLINE fact rather
         // than the state's own touch? Undecidable from the summed (mask, dx,
         // dy) -- an earlier direction test was tried and reverted (2026-08-26):
@@ -1673,6 +1829,7 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
                 }
             }
             const size_t nrows = fh.live.size();
+            rideWindow(o, fh.live, fh.rides, fh.rideT0, fh.rideT1, "fliphead");
             g_flipHeadBoxes.push_back(std::move(fh));
             loadPrintf("fliphead: uid %d at (%.0f,%.0f) %.1fx%.1f "
                        "(%zu recorded rows)\n",
@@ -1698,6 +1855,7 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
                 }
             }
             const size_t nrows = ab.live.size();
+            rideWindow(o, ab.live, ab.rides, ab.rideT0, ab.rideT1, "ceilarm");
             g_armBoxes.push_back(std::move(ab));
             loadPrintf("ceilarm: uid %d at (%.0f,%.0f) %.1fx%.1f "
                        "(%zu recorded rows)\n",
@@ -1781,6 +1939,25 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
                 force = std::atof(f[41].c_str());
             }
             g_forceBoxes.push_back({o.cx, o.cy, o.hw, o.hh, force, o.uid, 0});
+            // --forceboxdir (default off): the push points where the box does.
+            // ForceBlockGameObject::calculateForceToTarget (0x4c1ec0), outside the
+            // target mode (+0x74c): angle = (isFlipY ? 180 : 0) + 90 - getRotation()
+            // in degrees, and the force is ccpForAngle(angle) times the strength --
+            // so a box rotated 180 pushes DOWN. Only the y share is modelled; a box
+            // turned off the vertical also pushes in x, which is said, not modelled.
+            // A custom level has one at x=3,315 under a UFO, rot -180, m_force 0.1,
+            // that the model pushed up.
+            {
+                const double dirY = (o.flipY ? -1.0 : 1.0)
+                                    * std::cos(o.rot * 3.14159265358979 / 180.0);
+                g_forceBoxes.back().dirY = dirY;
+                if (std::fabs(dirY) < 0.999)
+                    loadPrintf("forcebox: uid %d is turned %.1f deg - only the y share %.3f "
+                               "of its push is modelled\n", o.uid, o.rot, dirY);
+                else if (dirY < 0.0)
+                    loadPrintf("forcebox: uid %d points down (rot %.1f, flipY %d)\n",
+                               o.uid, o.rot, (int)o.flipY);
+            }
             // The push this box gives a full-size cube / robot / swing at 1x.
             // THROUGH forceUnitFor, not through a second copy of the arithmetic:
             // the first cut of this line used the quantised gravities (0.194 for
@@ -1879,6 +2056,25 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
                                 + (anyRev ? ", reversal" : ", too close to share bits") + ")";
             }
         }
+        // --tplatch: the teleport portals (type 28) take the bits after the gravity portals',
+        // static ones first and then the ones in dyn (a grouped teleport is routed there and
+        // L.portals never holds it). Not on a level already sharing bits, and none past the width.
+        if (nGravAll <= kGravPortalBits) {
+            int nTp = 0, nTpAll = 0;
+            int next = nGrav;
+            for (Obj& p : L.portals)
+                if (p.type == 28) {
+                    ++nTpAll;
+                    if (next < kGravPortalBits) { p.gpBit = (int8_t)next++; ++nTp; }
+                }
+            for (size_t i = 0; i < L.dyn.objs.size(); ++i)
+                if (L.dyn.bucket[i] == Dynamics::PORT && L.dyn.objs[i].type == 28) {
+                    ++nTpAll;
+                    if (next < kGravPortalBits) { L.dyn.objs[i].gpBit = (int8_t)next++; ++nTp; }
+                }
+            loadPrintf("tplatch: %d of %d teleport portals latched (bits %d..%d)\n", nTp, nTpAll,
+                       nGrav, next - 1);
+        }
         // --slopedbg: the uid -> bit map. Nothing else can report it, and
         // without it a portalLatch mask is unreadable from outside: rebuilding
         // the order by hand from the dump's type 3/4 rows sorted by cx gave a
@@ -1921,10 +2117,31 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
     // than derived from the trigger chain: the recording is what this run
     // actually observed, and turnedBox needs the answer before the angle has
     // grown away from zero (see its axis-aligned branch).
+    //
+    // "Rotated" means a recorded angle that leaves the angle the object was
+    // PLACED at (objrects column 9, o.rot -- nothing has seeked yet), not any
+    // angle other than 0. Compared against 0, a portal placed at 90 degrees
+    // records 90 on every row and was counted as trigger-rotated, so the portal
+    // test turned the player's box against it.
+    // On custom level C the gravity portal uid 28482 (id 11, placed at
+    // rot 90, never moved: one recorded row, 37.5 x 12.5) flips p2 at t=3,910 in
+    // GD. p2 was a spinning cube at (5,075.05, 905.15), and the recorded rows
+    // bracket GD's rule. As a plain AABB the contact is -0.84 px at 3,909 and
+    // +1.10 at 3,910: GD fires at 3,910. Turned by the model's angle it is
+    // -1.01 at 3,910, so the model flipped p2 one tick late. Turned by GD's own
+    // angle it is already +1.6 at 3,909. From there p2 reached the ceiling at
+    // 4,008, after the release at 4,007, instead of GD's 4,006. So it sat
+    // where GD jumped, and every plan through there died at t~4,024 with the
+    // model alive.
     L.dyn.everRot.assign(L.dyn.size(), 0);
-    for (size_t i = 0; i < L.dyn.size(); ++i)
-        for (const DynSample& s : L.dyn.samples[i])
-            if (std::fabs((double)s.rot) > 0.001) { L.dyn.everRot[i] = 1; break; }
+    for (size_t i = 0; i < L.dyn.size(); ++i) {
+        const double placed = L.dyn.objs[i].rot;
+        for (const DynSample& s : L.dyn.samples[i]) {
+            double d = std::fmod(std::fabs((double)s.rot - placed), 360.0);
+            if (d > 180.0) d = 360.0 - d;
+            if (d > 0.001) { L.dyn.everRot[i] = 1; break; }
+        }
+    }
     {
         size_t n = 0;
         for (uint8_t v : L.dyn.everRot) n += (v != 0);
@@ -2067,6 +2284,125 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
                        "analytic translation\n",
                        done, worstFit, refusedFit, refusedNoAuto);
     }
+    // ---- stage 1'': carry a turned object past the end of its recording ----
+    //
+    // Unconditional since the 0.4.0 clean-up (it was --rotextend, on in every loop call that
+    // read a recording since d008ee2). The Rotate says where the object is for the whole turn; the
+    // recording says it only as far as the attempt that wrote it lived, and past its last row the
+    // object holds that row. For an armed orbit that the recorded rows fit (stage 1''s fit, the
+    // same 0.1 px), the rows from the last one to the end of the turn are appended from the
+    // formula, one a tick. The centre has to stand still: an object on stage 1' carries the orbit
+    // alone (its translation is analytic), so it does by construction; any other object's rows are
+    // orbit plus centre, and where the centre moved over the recording nothing says where it goes
+    // next, so the object keeps its recording as it was.
+    if (!g_rotSpec.empty()) {
+        size_t done = 0, rows = 0, refusedFit = 0, refusedCentre = 0;
+        std::unordered_map<int, size_t> idx;
+        for (size_t i = 0; i < L.dyn.size(); ++i) idx[L.dyn.objs[i].uid] = i;
+        const double kPi = 3.14159265358979;
+        for (const auto& kv : g_rotSpec) {
+            const RotSpec& R = kv.second;
+            if (R.anchor < 0 || R.centreIdx < 0 || R.durT <= 0.0) continue;
+            const auto io = idx.find(kv.first);
+            if (io == idx.end()) continue;
+            const size_t i = io->second, ci = (size_t)R.centreIdx;
+            std::vector<DynSample>& sm = L.dyn.samples[i];
+            if (sm.size() < 2 || L.dyn.samples[ci].empty()) continue;
+            const double ex = L.dyn.samples[ci][0].cx, ey = L.dyn.samples[ci][0].cy;
+            const bool split = i < L.dyn.rotSplit.size() && L.dyn.rotSplit[i];
+            if (!split) {
+                bool still = true;
+                for (const DynSample& c : L.dyn.samples[ci])
+                    if (std::fabs((double)c.cx - ex) >= kRecEps
+                        || std::fabs((double)c.cy - ey) >= kRecEps) {
+                        still = false;
+                        break;
+                    }
+                if (!still) { ++refusedCentre; continue; }
+            }
+            auto orbit = [&](double tick, double t0, double& gx, double& gy) {
+                const double th = -R.total * gdEase(R.ease, R.erate, (tick - t0) / R.durT)
+                                  * kPi / 180.0;
+                const double c = std::cos(th), sn = std::sin(th);
+                gx = ex + c * R.relX - sn * R.relY;
+                gy = ey + sn * R.relX + c * R.relY;
+            };
+            // The first recorded motion. The Rotate fired no later than that and its turn is over
+            // by that tick plus the duration, so a recording that reaches past it holds the whole
+            // turn already and is not fitted at all -- the fit below is the loader's cost, every
+            // call, and on lv21 fitting every armed orbit over its whole recording took 8.5 s of an
+            // 11.5 s replay. An object whose position never changes turns in place: no orbit.
+            size_t k1 = 1;
+            while (k1 < sm.size() && std::fabs((double)sm[k1].cx - (double)sm[0].cx) < kRecEps
+                   && std::fabs((double)sm[k1].cy - (double)sm[0].cy) < kRecEps)
+                ++k1;
+            if (k1 == sm.size()) continue;
+            const int fm = sm[k1].t;
+            if (sm.back().t >= fm + (int)std::ceil(R.durT) + 5) continue;
+            // The Rotate's fire tick on the recorded timeline, fitted as stage 1' fits it, over the
+            // ticks it can be: from a whole turn before the first motion to the tick after it. The
+            // rows of a candidate stop being walked once its error passes the tick before the
+            // first motion's, which no candidate that passes it can beat; the choice is the one the
+            // plain scan makes (the lowest tick of the least error).
+            auto fitErr = [&](int cand, double bound) {
+                double w = 0.0;
+                for (const DynSample& s : sm) {
+                    double gx, gy;
+                    orbit((double)s.t, (double)cand, gx, gy);
+                    w = std::max(w, std::hypot((double)s.cx - gx, (double)s.cy - gy));
+                    if (w > bound) break;
+                }
+                return w;
+            };
+            const int lo = fm - (int)R.durT - 5, hi = fm + 1;
+            const double seedE = fitErr(fm - 1, 1e18);
+            int t0 = sm[0].t;
+            double bestE = 1e18;
+            for (int cand = lo; cand <= hi; ++cand) {
+                const double w = fitErr(cand, std::min(bestE, seedE));
+                if (w < bestE) { bestE = w; t0 = cand; }
+            }
+            if (bestE > 0.1) { ++refusedFit; continue; }
+            const int tEnd = t0 + (int)std::ceil(R.durT);
+            const DynSample last = sm.back();
+            if (last.t >= tEnd) continue;
+            // The unturned half sizes, from the entry row when it stands on a right angle; the
+            // appended rows' box is then the turned rectangle's bound, as GD's getObjectRect gives
+            // it (lv21 uid 15024 at -334.502: 27|cos| + 26|sin| = 35.564, the recorded w). Any other
+            // entry angle keeps the last row's box.
+            double uhw = -1.0, uhh = -1.0;
+            {
+                const double r0 = std::fmod(std::fabs((double)sm[0].rot), 180.0);
+                if (r0 < 0.001 || r0 > 179.999) { uhw = sm[0].hw; uhh = sm[0].hh; }
+                else if (std::fabs(r0 - 90.0) < 0.001) { uhw = sm[0].hh; uhh = sm[0].hw; }
+            }
+            const double eLast = gdEase(R.ease, R.erate, ((double)last.t - t0) / R.durT);
+            for (int t = last.t + 1; t <= tEnd; ++t) {
+                DynSample s = last;
+                s.t = t;
+                double gx, gy;
+                orbit((double)t, (double)t0, gx, gy);
+                s.cx = (float)gx;
+                s.cy = (float)gy;
+                if (!R.lockrot) {
+                    const double e = gdEase(R.ease, R.erate, ((double)t - t0) / R.durT);
+                    s.rot = (float)((double)last.rot + R.total * (e - eLast));
+                }
+                if (uhw > 0.0 && uhh > 0.0) {
+                    const double a = (double)s.rot * kPi / 180.0;
+                    const double c = std::fabs(std::cos(a)), sn = std::fabs(std::sin(a));
+                    s.hw = (float)(uhw * c + uhh * sn);
+                    s.hh = (float)(uhw * sn + uhh * c);
+                }
+                sm.push_back(s);
+                ++rows;
+            }
+            ++done;
+        }
+        loadPrintf("rotextend: %zu turned objects carried past their recordings (%zu rows), %zu "
+                   "refused on fit, %zu whose centre moved\n",
+                   done, rows, refusedFit, refusedCentre);
+    }
     // --rotcheck: does the COMPUTED orbit reproduce what GD recorded?
     //
     // The corpus-wide form of the harness that measured lv21 uid15367 to
@@ -2169,7 +2505,7 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
     // re-times that no other box reaches -- an object two boxes move first moved for whichever
     // came first, which dates neither. The same objects the re-timing branch serves: an
     // autonomous controller (autoAnchor / recAuto / autoReach) leaves the recording's clock alone.
-    if (g_touchRetimeBox && !L.dyn.objs.empty()) {
+    if (!L.dyn.objs.empty()) {
         L.dyn.boxRecEntry.assign((size_t)kTouchBits, -1);
         std::vector<int> latest((size_t)kTouchBits, -1), n((size_t)kTouchBits, 0);
         std::vector<int> first((size_t)kTouchBits, -1);   // uid giving the entry
@@ -2200,7 +2536,7 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
     // (Dynamics::onEv), starting from the recording's reset snapshot. Only those objects: an
     // x-crossing Toggle alone reaches thousands of objects in a SubZero level, and moving all of
     // them off the recording is a different change from this one.
-    if (g_activators && tt && !L.dyn.objs.empty()) {
+    if (tt && !L.dyn.objs.empty()) {
         std::unordered_set<int> switched;   // uids some activator switches
         for (size_t b = 0; b < tt->size() && b < (size_t)kTouchBits; ++b)
             if ((*tt)[b].activator)

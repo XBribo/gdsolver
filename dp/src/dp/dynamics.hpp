@@ -460,6 +460,27 @@ inline size_t g_rotSeen = 0, g_rotRouted = 0;
 // --no-rotsplit for the A/B. See the block in level_loader.hpp for why this is
 // the insertion point and adding a rotation to placement is not.
 inline bool g_rotSplit = true;
+// --rotextend (default off): an autonomously turned object's samples[] go on past the last row its
+// recordings hold, computed from its Rotate, to the end of the turn (level_loader.hpp, stage 1'').
+// A recording ends where its attempt died, and past its last row an object holds that row, so a
+// blade still sweeping stands still in the model. Measured on lv21 (coins off, the loop's recorder
+// replay of iteration 2, integ f04b889): the bar of group 98 -- eight id 1582 blades turning -720
+// degrees about uid 14886 over 960 ticks -- killed every attempt at t=11,271 and the recording
+// stopped there; the bootstrap that would have carried it on is on another clock and left out. The
+// model killed on the held row a tick late (11,273 against GD's dead row 11,272), and with the turn
+// carried on it kills on 11,272, on the same blade (uid 15024).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --slideparts (default off): past the last row of its recording, an object with two or more
+// autonomous moves goes on by each move's own eased increment from that move's crossing, instead
+// of the recording arm's completion, which reads the moves as one (their summed offset over one
+// duration, from the recording's first motion) and so finishes a sequence as a single slide.
+// Measured on lv21 (coins off, rot-extend d8d3c83 with --rotextend, the recorder's replay of
+// iteration 5): uid 16678 (id 1583, groups 215/216: Move +90 over 144 ticks from x=15,960, then
+// Move -210 over 168 from x=16,138) is recorded to t=12,454 at y=241.614, 21 ticks into the
+// second move; the completion took the -120 as 95% done and put it at 216.406 on the next tick
+// and at 35.550 eight ticks later. GD killed on it at 12,454 (dead row 12,455) and the model flew
+// on to 13,935.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
 
 // GD's rotation, one tick of it. `sign` is the mapping from the dump's angle to
 // a y-up rotation matrix, measured as -1 on both subjects (GD's positive turn
@@ -498,6 +519,24 @@ inline void rotStep(float& x, float& y, double cxPrev, double cyPrev,
 // time axis and a shift of 0 is correct. Without the flag the behaviour is
 // exactly as before.
 inline bool g_trigRaw = false;
+// --anchornoop (on by default since 2026-10): an autonomous object whose ANCHOR is a Toggle that
+// moves it nowhere, and whose recording already shows that Toggle's state on its first row, is read
+// on the recording's own clock (shift 0) and casts no vote for the anchor's fire tick. The shift
+// pairs the anchor's fire tick with the object's first recorded change, which is only the anchor's
+// effect when the anchor's effect is IN the recording. A custom level's 17 pads (group 171) are
+// anchored on a Toggle-OFF at x=-51.5 whose effect precedes the first row (`init,...,0`); the
+// first change on file is the ring at x=5,914 switching them ON at t=4,771, so the pads were read
+// 4,771 ticks ahead and stood at their post-x=12,800 position (+750/-75) from the anchor on.
+// Dynamics::anchorUnrec.
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
+// --xtrack <file> (default none): GD's own x on every tick of the attempt the anchor was taken
+// from, `tick,x` rows (a header naming `tick` and `x`, as gdref's csv has, is honoured). An
+// autonomous trigger behind the anchor is then dated by the first tick at which GD's x reached
+// it -- the definition the x estimate approximates with one dx. That estimate divides the whole
+// distance by the speed the static portals give at x0, which a level whose portals sit in groups
+// (routed to dyn, never in L.speeds) or off the path the player took gets wrong by hundreds of
+// ticks, and no list of portals says which ones GD actually went through.
+inline std::vector<std::pair<int, double>> g_xTrack;
 // Autonomous lag: an object moved by a touch box AND an autonomous
 // trigger (Level::formula) dates that trigger from its recording with the lag of
 // the AUTONOMOUS move (Dynamics::autoLag), not the touch move's (recLag). The
@@ -608,8 +647,7 @@ inline constexpr int kTouchRetimeLat = 2;
 // object keeps its own delay behind it.
 // ON BY DEFAULT since 2026-09-24; --no-touchretimebox restores the per-object
 // latency. kDefTouchRetimeBox is what reset.hpp writes back.
-inline constexpr bool kDefTouchRetimeBox = true;
-inline bool g_touchRetimeBox = kDefTouchRetimeBox;
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
 // The one touch box whose chain locks something to the player's x, and how long
 // the lock lasts in ticks. A per-BOX quantity rather than a per-object one
 // because what a state has to remember is "how far have I travelled since I
@@ -737,6 +775,10 @@ struct Dynamics {
     // and the later controllers ride the same shift (their relative timing is
     // embedded in the recording).
     std::vector<int> autoAnchor;
+    // --anchornoop: 1 = autoAnchor's Toggle switches this object and moves it nowhere, and the
+    // recording's first row already holds the state it switches to, so no recorded change is the
+    // anchor's (see g_anchorNoop). Filled by the loader for every object; read only under the flag.
+    std::vector<uint8_t> anchorUnrec;
     // "This object's touch entry moves it nowhere (dx=dy=0) but it ALSO has a
     // real autonomous mover." Deliberately a SEPARATE flag rather than widening
     // autoAnchor: autoAnchor is read by :632, :710, :853 and cli.hpp:1652/:1981,
@@ -1290,6 +1332,10 @@ struct Dynamics {
                 anchor = f;
                 recAnchor = trigRecFire[i]
                     - (i < autoLag.size() ? autoLag[i] : recLag[i]);
+                // --anchornoop: no recorded change is the anchor's, so nothing to pair its
+                // fire tick with -- the recording on its own clock (shift 0).
+                if (f >= 0 && i < anchorUnrec.size() && anchorUnrec[i])
+                    recAnchor = f;
                 fdx = autoDx[i]; fdy = autoDy[i];
                 fdur = autoDur[i]; lat = 0;
                 fease = autoEase[i]; ferate = autoErate[i];
@@ -1526,7 +1572,32 @@ struct Dynamics {
                                 bease = p.ease; berate = p.erate;
                             }
                     }
-                    if (lo + 1 == sm.size() && tt > s.t && bdur > 0) {
+                    // (Unconditional since the 0.4.0 clean-up; it was --slideparts, on in every
+                    // loop call that read a recording since d008ee2.) An object with two or more
+                    // autonomous moves goes on from its last row by each move's own eased increment,
+                    // every move from its own crossing -- the form stage 1' objects already
+                    // take (below). The completion after this reads the moves as ONE, the
+                    // summed offset over one duration from the recording's first motion,
+                    // which is right for a single slide and not for a sequence.
+                    bool partsDone = false;
+                    if (lo + 1 == sm.size() && tt > s.t && !recAutoObj
+                        && autoParts[i].size() >= 2 && !(i < rotSplit.size() && rotSplit[i])) {
+                        const int tEnd = s.t + (t - tt);   // the last row on this state's clock
+                        for (const AutoPart& p : autoParts[i]) {
+                            const int f = g_autoTrig[(size_t)p.trig].fireT;
+                            if (f < 0) continue;
+                            auto eAt = [&](int tk) {
+                                if (tk < f) return 0.0;
+                                return p.dur > 0.0
+                                    ? gdEase(p.ease, p.erate, (double)(tk - f) / p.dur) : 1.0;
+                            };
+                            const double de = eAt(t) - eAt(tEnd);
+                            cx += p.dx * de;
+                            cy += p.dy * de;
+                        }
+                        partsDone = true;
+                    }
+                    if (!partsDone && lo + 1 == sm.size() && tt > s.t && bdur > 0) {
                         const double full = std::hypot((double)bdx, (double)bdy);
                         const double done = std::hypot((double)s.cx - (double)s0.cx,
                                                        (double)s.cy - (double)s0.cy);
@@ -2091,9 +2162,20 @@ struct Dynamics {
         // separate -- GD fires this portal at t=1,583 on one attempt and
         // t=1,582 on another with the SAME plan, so the object's phase carries
         // across attempts. Re-open it with a per-object gate, not a global one.
-        if (g_rotPort && om <= 0.5 && everRot && o.hw > 0.5 && o.hh > 0.5) {
+        if (om <= 0.5 && everRot && o.hw > 0.5 && o.hh > 0.5) {
             o.oriented = 1;
             o.ohw = o.hw; o.ohh = o.hh;   // axis aligned: the bound IS the box
+            // ...but ohw/ohh are the UNTURNED box's halves, and at an odd quarter turn (`om`, the
+            // angle mod 90, is near 0 at 90 and 270 degrees too) the bound's halves are that box's
+            // swapped. Kept unswapped, the box was turned twice -- here and on every redraw (the
+            // oriented branch above turns it by the whole angle). On custom level C the
+            // gravity portal uid 28482 (id 11, 25x75 at scale 0.5, rot 90, group 1) is 37.5 x 12.5
+            // in GD's getObjectRect, and GD flips both bodies on a 0.7-1.1 px corner contact at
+            // x~5,075, y~905 (t=3,910/3,912); the model tested 12.5 x 37.5, missed it, and every
+            // plan through there died at t~4,024 while the recorder patched vy tick by tick.
+            // --no-rotport tests the bound as an AABB and matches GD there; so does this swap.
+            if (((long long)std::llround(rotDeg / 90.0)) & 1)
+                std::swap(o.ohw, o.ohh);
             const double th0 = rotDeg * 3.14159265358979 / 180.0;
             o.rc = std::cos(-th0); o.rs = std::sin(-th0);
             return;

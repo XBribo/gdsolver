@@ -63,7 +63,15 @@ inline bool uiConfigureSession(int levelId) {
             g_cfg.coinMode = true;
             g_cfg.coinFiles = true;
         }
-        log::info("panel: solve lv{} in-process{}", levelId, g_uiCoins ? " with coins" : "");
+        // Avoid glitches: the searches drop the frame-level routes (Config::glitchPortal).
+        if (g_uiGlitch) {
+            g_cfg.glitchPortal = kGlitchPortalDefault;
+            g_cfg.glitchWave = kGlitchWaveDefault;
+            g_cfg.glitchEmbed = kGlitchEmbedDefault;
+            g_cfg.glitchDeco = true;
+        }
+        log::info("panel: solve lv{} in-process{}{}", levelId, g_uiCoins ? " with coins" : "",
+                  g_uiGlitch ? " avoiding glitches" : "");
     } else {
         const std::string name = uiSolutionPath(levelId, g_uiCoins);
         std::vector<InputCmd> plan;
@@ -95,6 +103,12 @@ inline bool uiConfigureSession(int levelId) {
     stallwatch::start();   // so that on a stall we can say "where"
     updateWindowTitle();   // show the role in the title (reflected the moment the session starts)
     writeResult("session_start (panel)", true);
+    // Say once, plainly, whether the research trail (dp_band_itN/dp_groups_itN and the
+    // recorder's dp_fixin_*/dp_attempt_itN files) is being kept this session -- see
+    // Config::researchCapture for why it defaults off. A panel session never turns it on.
+    writeResult(g_cfg.researchCapture
+        ? "session: research capture on (per-attempt band/groups/recorder-input copies are kept)"
+        : "session: research capture off (per-attempt band/groups/recorder-input copies are not kept)");
     g_started = true;
     g_uiSession = true;
     g_forceCleanStart = true;
@@ -103,6 +117,10 @@ inline bool uiConfigureSession(int levelId) {
 }
 
 inline void endSession(const std::string& why);
+// The session-end line of cfg cpflight (mod/cp_flight.hpp, included after this file): set by every
+// solve's start, the flag on or off (off, its checkpoint and restore counts are 0), printed and cleared
+// by endSession.
+inline std::string (*g_cpFlightSummary)() = nullptr;
 
 // ---- section-solver handoff (cmd `secsolve ...`) ---------------------------
 // Written by pollCommandFileImpl below, consumed by dpsolve::poll() (repair.hpp) at a frame
@@ -119,6 +137,26 @@ inline long long g_secReqCap = -1;       // -1 = keep
 inline long long g_secReqDepth = -1;
 // cfg dpseccoinrung: the coin a rung fired at the coin wall has to take (-1 = none).
 inline int g_secReqCoin = -1;
+// The tick the rung's plan is known to live to in the game (its verified death), -1 = not known.
+// The search's spine follows that plan, so on a faithful search it lives as long; a spine that dies
+// earlier says the player snapshot parts from the game in this window (secsolve::g_spineUntil).
+inline long long g_secReqSpineUntil = -1;
+// ...and a rung asked again on checkpoints after its snapshot search was caught that way.
+inline bool g_secReqForceCp = false;
+inline bool g_secCpRedo = false;   // the rung in flight is such a redo
+// The last rung's window as handed over, for asking it again (a rung is consumed by the handoff).
+struct SecLastReq {
+    long long start = -1, depth = -1, horizon = -1, cap = -1;
+    double target = 0.0;
+    int coin = -1;
+};
+inline SecLastReq g_secLastReq;
+// cfg dpsecstate (repair.hpp stateFire): what a rung asks of player 1's size. The kind is 0 for an
+// ordinary window, 1 for the probe -- its answer is a verdict, never spliced -- 2 for a kept window
+// over the decision, and 3 for an ordinary window that keeps the size the run needs; the size (0
+// normal, 1 mini) is the one the probe forces or the window keeps.
+inline int g_secReqState = 0, g_secReqSize = -1;
+inline int g_secState = 0;           // ...the kind of the rung in flight
 
 // ---- section solve as a RUNG (cmd `secrung ...`) ---------------------------
 // The same search as the one-way `secsolve` handoff above, except that the
@@ -215,6 +253,18 @@ inline void resetSecsolveSession() {
     g_secPinWall = -1;
     g_secReqCoin = -1;
     g_secReqDepth = -1;
+    g_secReqSpineUntil = -1;
+    g_secReqForceCp = false;
+    g_secCpRedo = false;
+    g_secLastReq = SecLastReq{};
+    secsolve::g_spineUntil = -1;
+    if (g_secState) {
+        secsolve::g_forceP1Size = -1;
+        secsolve::g_keepP1Size = -1;
+    }
+    g_secReqState = 0;
+    g_secReqSize = -1;
+    g_secState = 0;
 }
 
 // ---- level swap (cmd `swaplevel <path>`) -----------------------------------
@@ -305,7 +355,7 @@ inline void pollCommandFileImpl(const std::string& cmd) {
                           "dual,p2y,p2vy,p2up,p2ground,p2dead,pmin,pmax,"
                           "snapuid,snapdist,camscale,gframe,ctrlOff,camx,camy,"
                           "p2ground2,p2mode,p2vsize,p2x,rotch,rotidx,rotrev,firedw,"
-                          "bandst,bandmode,camoffy,freemode,bandforce\n";
+                          "bandst,bandmode,camoffy,freemode,bandforce,p2rot\n";
             }
             if (g_trace.is_open()) {
                 g_trace.close();
@@ -422,13 +472,15 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "dpfastvetoall") g_cfg.dpFastVetoAll = (val == "1");
     else if (key == "dprejoinfull") g_cfg.dpRejoinFull = (val == "1");
     else if (key == "dpoffboardkill") g_cfg.dpOffBoardKill = (val == "1");
+    else if (key == "offboardtp") g_cfg.offBoardTp = (val == "1");
     else if (key == "dpmaxiters") cfgNum(key, val, g_cfg.dpMaxIters);
     else if (key == "dptopstop") cfgNum(key, val, g_cfg.dpTopStop);
-    else if (key == "dpwalkgates") g_cfg.dpWalkGates = (val == "1");
     else if (key == "coinmissrev") g_cfg.coinMissRev = (val == "1");
     else if (key == "coinmisspost") g_cfg.coinMissPost = (val == "1");
+    else if (key == "coinmissearly") g_cfg.coinMissEarly = (val == "1");
     else if (key == "coinoverdepth") g_cfg.coinOverDepth = (val == "1");
     else if (key == "coinapproachoff") g_cfg.coinApproachOff = (val == "1");
+    else if (key == "coinapproachreach") g_cfg.coinApproachReach = (val == "1");
     else if (key == "routeprereq") g_cfg.routePrereq = (val == "1");
     else if (key == "routeprereqafter") g_cfg.routePrereqAfter = std::max(0, std::atoi(val.c_str()));
     else if (key == "coinmissmove") g_cfg.coinMissMove = (val == "1");
@@ -438,27 +490,54 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "dpsecnorec") cfgNum(key, val, g_cfg.dpSecNoRec);
     else if (key == "dpsecmargin") cfgNum(key, val, g_cfg.dpSecMargin);
     else if (key == "dpsecchain") g_cfg.dpSecChain = (val == "1");
+    else if (key == "secredoreach") g_cfg.secRedoReach = (val == "1");
+    else if (key == "seccpfallback") g_cfg.secCpFallback = (val == "1");
+    else if (key == "secthrow") {
+        // <length|alloc|both>@<depth>; anything else leaves it off
+        const size_t at = val.find('@');
+        const std::string kind = val.substr(0, at);
+        g_cfg.secThrowKind = kind == "length" ? 1 : kind == "alloc" ? 2 : kind == "both" ? 3 : 0;
+        g_cfg.secThrowDepth = at == std::string::npos ? 0 : std::atoi(val.c_str() + at + 1);
+        if (g_cfg.secThrowDepth <= 0) g_cfg.secThrowKind = 0;
+    }
     else if (key == "dpsecchainspan") cfgNum(key, val, g_cfg.dpSecChainSpan);
     else if (key == "dpsecpinback") cfgNum(key, val, g_cfg.dpSecPinBack);
     else if (key == "dpsecstateprice") cfgNum(key, val, g_cfg.dpSecStatePrice);
     else if (key == "dpseccallprice") cfgNum(key, val, g_cfg.dpSecCallPrice);
     else if (key == "dpseccap") cfgNum(key, val, g_cfg.dpSecCap);
+    else if (key == "dpseccaptiers") cfgNum(key, val, g_cfg.dpSecCapTiers);
+    else if (key == "dpsecstate") g_cfg.dpSecState = (val == "1");
     else if (key == "dpsecsolved") g_cfg.dpSecSolved = (val == "1");
     else if (key == "dpsecreuse") g_cfg.dpSecReuse = (val == "1");
     else if (key == "dpsecrent") g_cfg.dpSecRent = (val == "1");
     else if (key == "dpsecrungprior") cfgNum(key, val, g_cfg.dpSecRungPrior);
+    else if (key == "dpsecwallbudget") cfgNum(key, val, g_cfg.dpSecWallBudget);
     else if (key == "dpseccoinrung") g_cfg.dpSecCoinRung = (val == "1");
     else if (key == "dpendtrigclear") g_cfg.dpEndTrigClear = (val == "1");
     else if (key == "slice") g_cfg.slice = (val == "1");
     else if (key == "slicemin") cfgNum(key, val, g_cfg.sliceMin);
     else if (key == "sliceaddbacks") cfgNum(key, val, g_cfg.sliceAddBacks);
+    else if (key == "slicegiveupcopy") g_cfg.sliceGiveUpCopy = (val == "1");
     else if (key == "slicecount") g_cfg.sliceCount = (val == "1");
     else if (key == "slicenoposition") g_cfg.sliceNoPosition = (val == "1");
     else if (key == "dpseedplan") g_cfg.dpSeedPlan = val;
     else if (key == "dpshow") cfgNum(key, val, g_cfg.dpShow);
     else if (key == "dpfixups") g_cfg.dpFixups = (val == "1");
+    else if (key == "dpcoinwin") g_cfg.dpCoinWin = (val == "0") ? std::string() : val;
+    else if (key == "glitchavoid") {
+        const bool on = (val == "1");
+        g_cfg.glitchPortal = on ? kGlitchPortalDefault : 0.0;
+        g_cfg.glitchWave = on ? kGlitchWaveDefault : 0.0;
+        g_cfg.glitchEmbed = on ? kGlitchEmbedDefault : 0.0;
+        g_cfg.glitchDeco = on;
+    }
+    else if (key == "glitchdeco") g_cfg.glitchDeco = (val == "1");
+    else if (key == "glitchportal") cfgNum(key, val, g_cfg.glitchPortal);
+    else if (key == "glitchwave") cfgNum(key, val, g_cfg.glitchWave);
+    else if (key == "glitchembed") cfgNum(key, val, g_cfg.glitchEmbed);
     else if (key == "dpworld") g_cfg.dpWorld = (val == "1");
     else if (key == "dpgroups") g_cfg.dpGroups = (val == "1");
+    else if (key == "needpinrelease") g_cfg.needPinRelease = (val == "1");
     else if (key == "dpbandtrack") g_cfg.dpBandTrack = (val == "1");
     else if (key == "dprotseed") {
         g_cfg.dpRotSeed = val == "A" ? 1 : val == "E" ? 2 : val == "F" ? 3 : val == "S" ? 4 : 0;
@@ -466,16 +545,19 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
             writeResult("cfg: dprotseed=" + val + " is not one of off|A|E|F|S - left off");
     }
     else if (key == "dprotseedanchor") g_cfg.dpRotSeedAnchor = (val != "0");
+    else if (key == "rotseedpre") g_cfg.rotSeedPre = (val == "1");
     else if (key == "dpsnapshot") g_cfg.dpSnapshot = (val == "1");
     else if (key == "dpcheck") g_cfg.dpCheck = (val == "1");
     else if (key == "dpcheckobs") g_cfg.dpCheckObs = (val == "1");
     else if (key == "dpcheckfirst") g_cfg.dpCheckFirst = (val == "1");
     else if (key == "dpcontenthorizon") cfgNum(key, val, g_cfg.dpContentHorizon);
     else if (key == "dpcapladder") cfgNum(key, val, g_cfg.dpCapLadder);
+    else if (key == "dpplainbeside") cfgNum(key, val, g_cfg.dpPlainBeside);
     else if (key == "dpinputgrid") cfgNum(key, val, g_cfg.dpInputGrid);
     else if (key == "dpphaseprof") g_cfg.dpPhaseProf = (val == "1");
-    else if (key == "dprotqtoggle") g_cfg.dpRotQToggle = (val == "1");
     else if (key == "dpspentpad") g_cfg.dpSpentPad = (val == "1");
+    else if (key == "dpxtrack") g_cfg.dpXTrack = (val == "1");
+    else if (key == "dpfineretry") g_cfg.dpFineRetry = (val == "1");
     else if (key == "dpspentorb") {}   // always on since 2026-09-26; accepted so old cfgs parse
     else if (key == "dpwatchfired") {
         g_cfg.dpWatchFired.clear();
@@ -644,6 +726,14 @@ inline void loadConfig() {
                 {"dptouchentered", "36b14f7", "671e60d"},
                 {"dptouchenteredtick", "36b14f7", "671e60d"},
                 {"dpgroupholddeath", "36b14f7", "671e60d"},
+                // the 0.4.0 clean-up
+                {"dpladderback", "ff5d7a4", "9aed903"},
+                {"dpladderenv", "ff5d7a4", "f95fba6"},
+                {"dpwalkgates", "ff5d7a4", "6cf416c"},
+                {"dprotextend", "ff5d7a4", "d008ee2"},
+                {"dpslideparts", "ff5d7a4", "d008ee2"},
+                {"dpgroupfire", "ff5d7a4", "c6ddea5"},
+                {"dprotqtoggle", "ff5d7a4", "856a833"},
             };
             bool removed = false;
             for (const auto& r : kRemovedCfg)
@@ -662,9 +752,32 @@ inline void loadConfig() {
         // Not in the chain below, which is at MSVC's block-nesting ceiling (C1061).
         if (key == "areaenv") { g_cfg.areaEnv = (val == "1"); continue; }
         if (key == "framebudgetms") { cfgNum(key, val, g_cfg.frameBudgetMs); continue; }
+        if (key == "anticheatpass") { g_cfg.antiCheatPass = (val == "1"); continue; }
+        if (key == "snapplayer") { g_cfg.snapPlayer = (val == "1"); continue; }
+        if (key == "cpflight") { cfgNum(key, val, g_cfg.cpFlight); continue; }
+        if (key == "cpflightprobe") { g_cfg.cpFlightProbe = (val == "1"); continue; }
+        if (key == "cpflightobj") { cfgNum(key, val, g_cfg.cpFlightObj); continue; }
+        if (key == "cpflightprobeat") { cfgNum(key, val, g_cfg.cpFlightProbeAt); continue; }
+        if (key == "cpflightlayerdiff") { g_cfg.cpFlightLayerDiff = (val == "1"); continue; }
+        if (key == "cpflightcarrylog") { g_cfg.cpFlightCarryLog = (val == "1"); continue; }
+        if (key == "cpflightnodewatch") { g_cfg.cpFlightNodeWatch = val; continue; }
+        if (key == "slicenotouch") { g_cfg.sliceNoTouch = (val == "1"); continue; }
+        if (key == "slicetriggers") { g_cfg.sliceTriggers = (val == "1"); continue; }
+        if (key == "sliceuids") { g_cfg.sliceUids = (val == "1"); continue; }
+        if (key == "slicefirstref") { g_cfg.sliceFirstRef = (val == "1"); continue; }
         if (key == "dplearnresets") { cfgNum(key, val, g_cfg.dpLearnResets); continue; }
         if (key == "secsnapact") { psnap::g_snapAct = (val == "1"); continue; }
+        if (key == "secsnapem") { psnap::g_snapEM = (val == "1"); continue; }
+        if (key == "secsnapemfrom") { cfgNum(key, val, psnap::g_snapEMFrom); continue; }
         if (key == "secactkey") { psnap::g_actKey = (val == "1"); continue; }
+        if (key == "seccpplayer") { secsolve::g_cpPlayer = (val == "1"); continue; }
+        if (key == "seccpcheck") { psnap::g_cpCheck = (val == "1"); continue; }
+        if (key == "seccover") { secsolve::g_cover = (val == "1"); continue; }
+        if (key == "secsizefam") { secsolve::g_sizeFam = (val == "1"); continue; }
+        if (key == "secp2key") { secsolve::g_p2Key = (val == "1"); continue; }
+        if (key == "secforcesize") { cfgNum(key, val, secsolve::g_forceP1Size); continue; }
+        if (key == "seckeepsize") { cfgNum(key, val, secsolve::g_keepP1Size); continue; }
+        if (key == "secp2extras") { secsolve::g_p2Extras = (val == "1"); continue; }
         if (key == "secdriftwhere") { g_cfg.secDriftWhere = (val == "1"); continue; }
         if (key == "dpcaptiers") { cfgNum(key, val, g_cfg.dpCapTiers); continue; }
         if (key == "dpsectierfirst") { cfgNum(key, val, g_cfg.dpSecTierFirst); continue; }
@@ -676,7 +789,13 @@ inline void loadConfig() {
         if (key == "secdrift") { secsolve::g_driftLog = (val == "1"); continue; }
         if (key == "secbound") { secsolve::g_boundOn = (val == "1"); continue; }
         if (key == "secshaderskip") { secsolve::g_shaderSkip = (val == "1"); continue; }
+        if (key == "secshadersig") { secsolve::g_shaderSig = (val == "1"); continue; }
         if (key == "seccoins") { secsolve::g_secCoins = (val == "1"); continue; }
+        if (key == "secrungcoinoff") { secsolve::g_rungCoinOff = (val == "1"); continue; }
+        if (key == "secbookfirst") { secsolve::g_bookFirst = (val == "1"); continue; }
+        if (key == "secjbkeep") { secsolve::g_jbKeep = (val == "1"); continue; }
+        if (key == "secheaddash") { secsolve::g_headDash = (val == "1"); continue; }
+        if (key == "secgracedash") { secsolve::g_graceDash = (val == "1"); continue; }
         if (key == "levelfiletype") { g_cfg.levelFileMain = (val == "main"); continue; }
         if (key == "leveldir") { suite::g_levelDir = val; continue; }
         if (key == "enabled") g_cfg.enabled = (val == "1");
@@ -809,13 +928,21 @@ inline void loadConfig() {
         else if (key == "orbtracex") cfgNum(key, val, g_cfg.orbTraceX);
         else if (key == "subringspent") g_cfg.subRingSpent = (val == "1");
         else if (key == "padtrace") g_cfg.padTrace = (val == "1");
-        // Two keys, ONE branch, and not for tidiness: this else-if chain is at
+        // Four keys, ONE branch, and not for tidiness: this else-if chain is at
         // MSVC's block-nesting ceiling, and adding a plain `else if` here is
         // C1061 "nesting level too deep" -- the whole mod stops building. The
         // next key added has to share a branch the same way, or the chain has
         // to be broken into a second function.
-        else if (key == "touchpayload" || key == "portalpayload")
-            (key == "touchpayload" ? g_cfg.touchPayload : g_cfg.portalPayload)
+        else if (key == "touchpayload" || key == "portalpayload" || key == "capture"
+                 || key == "histride" || key == "portalpayloadlt" || key == "dpanchorrotstep"
+                 || key == "dpanchorrot2")
+            (key == "touchpayload" ? g_cfg.touchPayload
+             : key == "portalpayload" ? g_cfg.portalPayload
+             : key == "histride" ? g_cfg.histRide
+             : key == "portalpayloadlt" ? g_cfg.portalPayloadLt
+             : key == "dpanchorrotstep" ? g_cfg.dpAnchorRotStep
+             : key == "dpanchorrot2" ? g_cfg.dpAnchorRot2
+             : g_cfg.researchCapture)
                 = (val == "1");
         else if (key == "snaptrace") g_cfg.snapTrace = (val == "1");
         // `fieldprobe` shares this branch rather than taking one of its own: the chain is at
@@ -1097,7 +1224,8 @@ inline void endSession(const std::string& why) {
     // a solve, so checking the seeding through them would cost a solve per
     // measurement. The whole map comes out of a PLAIN REPLAY -- half a minute --
     // and every anchor's payload is a prefix of it, so the offline check can
-    // build the payload for any t0 itself.
+    // build the payload for any t0 itself. The maps and these counts are per
+    // attempt (cleared when one starts), so after a solve they are the last one's.
     {
         std::string m = "touchseed map:";
         bool first = true;
@@ -1170,6 +1298,9 @@ inline void endSession(const std::string& why) {
     if (g_rngFix) writeResult("rngfix: trigger seed drawn inside a reset " +
                               std::to_string(g_rngDrawnInReset) + " times");
     g_rngDrawnInReset = 0;
+    // cfg cpflight: its tally (mod/cp_flight.hpp comes after this file; the solve's start sets this).
+    if (g_cpFlightSummary) writeResult(g_cpFlightSummary());
+    g_cpFlightSummary = nullptr;
     // Corridor clearance table (cfg clearance=1). Written out from the samples gathered during
     // the run
     clearance::write(g_cfg.levelId);

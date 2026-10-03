@@ -1,0 +1,43 @@
+// The body of outcome() in dp_bridge.cpp and dp_bridge2.cpp: one list of the fields, read from
+// whichever copy of the core `dp` names in the including file.
+SolveOutcome o;
+o.verdict = dp::g_outcome.verdict;
+o.horizonCut = dp::g_outcome.horizonCut;
+o.deepT = dp::g_outcome.deepT;
+o.deepX = dp::g_outcome.deepX;
+o.capHits = dp::g_outcome.capHits;
+o.workStates = dp::g_outcome.workStates;
+o.cancelT = dp::g_outcome.cancelT;
+o.resimDead = dp::g_outcome.resimDead;
+o.resimFirst = dp::g_outcome.resimFirst;
+o.resimWhy = dp::g_outcome.resimWhy;
+o.resimUid = dp::g_outcome.resimUid;
+o.resimObjX = dp::g_outcome.resimObjX;
+o.resimObjY = dp::g_outcome.resimObjY;
+o.resimTrig = dp::g_outcome.resimTrig.word(0);   // the whole mask while kTouchBits <= 64
+o.resimFrame = dp::g_outcome.resimFrame;
+o.replayDiedT = dp::g_outcome.replayDiedT;
+o.rejoinT = dp::g_outcome.rejoinT;
+o.rejoinBadT = dp::g_outcome.rejoinBadT;
+o.rejoinBadWhy = dp::g_outcome.rejoinBadWhy;
+o.needTrigMask = dp::g_outcome.needTrigMask.word(0);
+o.needTrigPassed = dp::g_outcome.needTrigPassed.word(0);
+o.seedRotQ = dp::g_outcome.seedRotQ;
+o.rotQOrder = dp::g_outcome.rotQOrder;
+o.coinGates = dp::g_outcome.coinGates;
+o.coinNoPrune = dp::g_outcome.coinNoPrune;
+o.startRotHit = dp::g_outcome.startRotHit;
+o.startRotGiven = dp::g_outcome.startRotGiven;
+o.startRotMiss = dp::g_outcome.startRotMiss;
+o.trigWinTouch = dp::g_outcome.trigWinTouch;
+o.trigTotal = dp::g_outcome.trigTotal;
+o.trigRelevantN = dp::g_outcome.trigRelevantN;
+o.trigKept = dp::g_outcome.trigKept;
+o.trigDroppedRelevant = dp::g_outcome.trigDroppedRelevant;
+o.trigDroppedBehind = dp::g_outcome.trigDroppedBehind;
+o.trigDroppedAhead = dp::g_outcome.trigDroppedAhead;
+o.trigMaxKeptX = dp::g_outcome.trigMaxKeptX;
+o.trigMapSig = dp::g_outcome.trigMapSig;
+o.unsupported = dp::g_outcome.unsupported;
+o.ladder = dp::g_outcome.ladder;
+return o;

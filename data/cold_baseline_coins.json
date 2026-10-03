@@ -1,18 +1,18 @@
 {
  "1": {
   "coins": "3/3",
-  "fp": "it=1 plan=1095/cb06c9fe att=2 t=18622 x=24207.389 band1=90.0,90.0 fix=0/- horizon=28724 backoff=6 live=- deep=-",
-  "iters": 1
+  "fp": "",
+  "iters": 0
  },
  "10": {
   "coins": "3/3",
-  "fp": "it=1 plan=1653/3bffbb2d att=2 t=3763 x=4887.497 band1=90.0,90.0 fix=0/- horizon=27313 backoff=6 live=- deep=-",
-  "iters": 1
+  "fp": "",
+  "iters": 0
  },
  "11": {
   "coins": "3/3",
-  "fp": "it=5 plan=3956/39e572ce att=6 t=17990 x=23363.520 band1=90.0,390.0 fix=4/494/7dfb561e horizon=3000 backoff=96 live=- deep=-",
-  "iters": 5
+  "fp": "",
+  "iters": 0
  },
  "12": {
   "coins": "3/3",
@@ -31,28 +31,28 @@
  },
  "15": {
   "coins": "3/3",
-  "fp": "it=2 plan=886/b5fe3f05 att=3 t=18847 x=31939.785 band1=90.0,390.0 fix=1/128/92877807 horizon=35055 backoff=6 live=- deep=-",
-  "iters": 2
+  "fp": "",
+  "iters": 0
  },
  "16": {
   "coins": "3/3",
-  "fp": "it=4 plan=820/10342352 att=7 t=12847 x=19436.982 band1=330.0,630.0 fix=3/458/d38818bb horizon=3000 backoff=24 live=- deep=-",
-  "iters": 4
+  "fp": "it=1 plan=230/4b29f07c att=2 t=4057 x=5688.748 band1=90.0,90.0 fix=0/- horizon=33315 backoff=6 live=- deep=-",
+  "iters": 1
  },
  "17": {
   "coins": "3/3",
-  "fp": "it=4 plan=2672/9052828a att=6 t=17683 x=22961.777 band1=90.0,390.0 fix=3/369/8848bcfc horizon=3000 backoff=6 live=- deep=-",
-  "iters": 4
+  "fp": "it=2 plan=2682/47dcc584 att=4 t=8496 x=11033.470 band1=90.0,390.0 fix=1/123/c41ac6de horizon=32985 backoff=6 live=- deep=-",
+  "iters": 2
  },
  "18": {
   "coins": "3/3",
-  "fp": "it=8 plan=1410/145f5276 att=13 t=17325 x=23293.721 band1=120.0,420.0 fix=6/751/aaca4f1e horizon=31091 backoff=6 live=- deep=-",
-  "iters": 8
+  "fp": "it=4 plan=918/5991b57e att=7 t=12733 x=17345.789 band1=90.0,390.0 fix=3/372/115708cf horizon=3000 backoff=6 live=- deep=-",
+  "iters": 4
  },
  "19": {
   "coins": "3/3",
-  "fp": "it=4 plan=1382/5260058e att=9 t=21566 x=30205.916 band1=240.0,540.0 fix=7/871/8eb079da horizon=3000 backoff=24 live=5861256/38eadc8a deep=-",
-  "iters": 4
+  "fp": "it=1 plan=30/a00f0a62 att=3 t=3318 x=4307.735 band1=90.0,90.0 fix=0/- horizon=34415 backoff=6 live=173684/4f7258fc deep=-",
+  "iters": 1
  },
  "2": {
   "coins": "3/3",
@@ -61,18 +61,18 @@
  },
  "20": {
   "coins": "3/3",
-  "fp": "it=22 plan=2466/1bb902c5 att=43 t=22053 x=32198.971 band1=90.0,390.0 fix=20/2496/7012c761 horizon=3000 backoff=24 live=26761344/deb295ca deep=-",
-  "iters": 22
+  "fp": "it=21 plan=2766/cd72316f att=39 t=22061 x=32198.908 band1=90.0,390.0 fix=15/1871/6dba4466 horizon=3000 backoff=96 live=26744074/ae6f81b3 deep=-",
+  "iters": 21
  },
  "21": {
   "coins": "3/3",
-  "fp": "it=12 plan=1126/c9d3cea0 att=24 t=17894 x=23608.125 band1=90.0,390.0 fix=11/1353/42793941 horizon=3000 backoff=96 live=12620612/80db88b0 deep=-",
-  "iters": 12
+  "fp": "it=14 plan=1066/f977ca8e att=29 t=17126 x=22362.578 band1=90.0,360.0 fix=15/1848/2663b464 horizon=3000 backoff=24 live=12617071/af41add8 deep=-",
+  "iters": 14
  },
  "22": {
   "coins": "3/3",
-  "fp": "it=39 plan=1112/827b2a81 att=78 t=19786 x=21655.455 band1=480.0,780.0 fix=47/5791/c51a3483 horizon=3000 backoff=24 live=23379845/f3b0b362 deep=3993803/70004b68",
-  "iters": 39
+  "fp": "it=27 plan=846/a5ff9710 att=52 t=21601 x=21716.760 band1=480.0,780.0 fix=36/4449/bbc6e4a9 horizon=3000 backoff=6 live=23453285/107a6105 deep=-",
+  "iters": 27
  },
  "3": {
   "coins": "3/3",
@@ -112,7 +112,7 @@
  "_meta": {
   "arrangement": "one-session",
   "cfg": "coinroute=1 coins=1",
-  "head": "adeb2cd8b8e9dc3855cc8f66348247ff0f31bd4b",
+  "head": "00173f5ad7ce267c4ee385d7930cb8139005f522",
   "levels": [
    1,
    2,
@@ -137,7 +137,7 @@
    21,
    22
   ],
-  "mod_sha256": "01379ec5fab024b7b588a0606e32aaa84f93919d4d79b3e968a35f476efc80e5",
+  "mod_sha256": "9485b7573c01bca6eb540fea005794e9040f17f2f769548ca64b66a726aa87c0",
   "record": "none on every level",
   "resolution": 25
  }

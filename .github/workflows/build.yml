@@ -1,5 +1,6 @@
-# Windows only, because mod.json declares `gd.win` and nothing else. The other platforms in
-# Geode's example workflow cannot build this and claiming them would be a lie about what runs.
+# Windows, and Android as an experiment (docs/ANDROID.md). The Android job may fail while the
+# port is under way and never decides the run; only the Windows package is attached to a release.
+# The other platforms in Geode's example workflow cannot build this.
 #
 # The point of building here rather than locally is that the binary attached to a release can be
 # traced to a commit of the public tree. The pitfalls page asks for it for that reason ("makes it
@@ -52,3 +53,44 @@ jobs:
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
             "${{ steps.build.outputs.build-output }}"/*.geode --clobber
+
+  android:
+    name: Android64 (experimental)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The solver CLI (leveldp and its test drivers) is a desktop tool; only the mod is built.
+      - name: Build the mod
+        id: build
+        continue-on-error: true
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          target: Android64
+          configure-args: -DGDSOLVER_BUILD_DP=OFF -DCMAKE_CXX_FLAGS=-ferror-limit=0
+
+      # ninja stops at the first failing file. While the port is incomplete, go on through
+      # the same build directory, keep every error, and end the log with each distinct one
+      # once (most frequent first), so one run gives the whole list in its last lines.
+      - name: List every compile error
+        if: steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          set +e
+          cmake --build build -- -k 0 > build-errors.log 2>&1
+          status=$?
+          echo "=== distinct errors (count, place, message) ==="
+          grep -E "error:" build-errors.log | sed -E "s#${GITHUB_WORKSPACE}/##" \
+            | sort | uniq -c | sort -rn
+          echo "=== translation units that failed ==="
+          grep -E "^FAILED:" build-errors.log | sed -E 's#.* -c ##; s#'"${GITHUB_WORKSPACE}"'/##' | sort -u
+          exit $status
+
+      - name: Upload the package
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: geode-package-android64
+          path: ${{ steps.build.outputs.build-output }}

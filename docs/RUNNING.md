@@ -16,14 +16,46 @@ no stored solution of that kind. **Start** (or `Enter`) starts the level in the 
 game's own, so any level can be picked. A platformer level gets no menu: the solver does not play
 platformer mode, so its play button just plays it.
 
-The choice is made per play. The menu opens on Replay when a solution for the level is stored (with Coins ticked when the coin solution is), and on Solve when none is. Turning the mod setting **Choose
-the mode on Play** off removes the menu, and the play button then just plays the level.
+Under Solve there is also an **Avoid glitches** switch (experimental): the searches drop the routes
+that rest on frame-level glitches. That narrows the search on purpose, so it can lose the only
+route there is, and while it is ticked a yellow line says so.
 
-When the level has a Random or Advanced Random trigger, or an area or enter effect with a random
-variance, a line under the modes says so (a spawn delay's or an Advanced Follow's variance is not
-detected yet). While the bot drives, the game's
-random seeds are set to the same values before every attempt, so a solve and a replay meet the
-same draw every time; playing the level yourself is untouched (cfg `rngfix`, on by default).
+The choice is made per play. The menu opens on Replay when a solution for the level is stored (with Coins ticked when the coin solution is), and on Solve when none is. Turning the mod setting **Choose
+the mode on Play** off removes the menu, and the play button then just plays the level. The mod
+setting **Solve faster (not reproducible)**, off by default, lets the plain search start beside the
+cap ladder and be taken as soon as it will do: usually faster, but the same level can take a
+different route and time from one solve to the next. Every plan is still flown and judged by the
+game.
+
+Under Replay and Solve, up to three lines about the level itself sit above the bot note. None of
+them refuses the run.
+
+* **Red — not modelled by the solver:** the level holds something the model cannot express at
+  all, so it plans blind there and only the section solver can get through: such a level is
+  unlikely to be solved.
+  The line names what it found: teleports that move you sideways, keep your height, push you or
+  have several exits; teleport orbs and teleport triggers; the gravity trigger; more gravity
+  portals than the solver can hold (past 128 it shares their slots, which fails in a level that
+  also reverses the player or puts two of them close together); or a level that runs differently
+  from one attempt to the next (an Item Compare or Item Edit that reads the attempt count, or Item
+  Persistence).
+* **Yellow — objects from 2.0 on** (custom levels only): the model is measured against the newer
+  mechanics one at a time and much of that is still to do, so such a level is slower to solve and
+  may not be solved. It counts the objects of types that did not exist before 2.0 (robot, spider,
+  swing, teleports, the newer rings and pads, collision and force blocks, area effects) and the
+  triggers that act on the game (move, rotate, toggle, spawn, item, camera, time and the like);
+  1.8's dual and slopes and 1.9's wave, recoloured blocks, spikes and decoration from the newer
+  versions, and triggers that only change colours, sound or shaders, do not count.
+* **Already solved:** with a solution stored for the Coins choice, red and yellow are left out —
+  the level was solvable. Under Solve a yellow line says instead when that solution was filed by
+  another version of the mod (or before versions were recorded), since solving it again with this
+  one may not succeed. The version sits beside the solution, in `solution_lv<N>_dp.txt.ver`
+  (`_coins.txt.ver` for a coin solution).
+* **Blue — random numbers:** the level has a Random or Advanced Random trigger, or an area or
+  enter effect with a random variance (a spawn delay's or an Advanced Follow's variance is not
+  detected yet). While the bot drives, the game's random seeds are set to the same values before
+  every attempt, so a solve and a replay meet the same draw every time; playing the level
+  yourself is untouched (cfg `rngfix`, on by default).
 
 **It runs fast, dark and silent until it has something to show.** Candidate replays mostly
 die and each one at normal speed would cost the length of the song, so the screen goes to the
@@ -39,19 +71,24 @@ that level started on its next layer, and the next level you pick starts from a 
 ## The overlay
 
 While a level is on screen the mod draws a column down the top-left: a badge naming the run,
-what the solve is doing, and the keys with the current speed:
+what the solve is doing, two progress bars, and the keys with the current speed. The text of a
+solve reads like this (the `coins` line only with Coins on, counting this attempt and the best any
+attempt has had; while no search runs, the last line gives the player's x and the anchor instead):
 
 ```
 iter 3   solving the tail from GD's own state   72s
-level  [########............]  41.2%   best x 11372 / 27985
-search [##############......]  72.4%   tick 18096 / 25000   x 19300   states 16000
+coins 1/3 this attempt   best 2/3
+level   41.2%   best x 11372 / 27985
+search  72.4%   tick 18096 / 25000   x 19300   states 16000
 ```
 
-Two bars, because they answer different questions. **level** is how far into the level the run has
-actually got — the deepest point a replay reached — so it only ever grows, and it is the same
-yardstick as the game's own percentage. **search** is how much of the current search is left;
-reaching its end is the search finishing, which is not the same event as reaching the end of the
-level.
+Under it, the two bars are drawn as the game's own level bar, because they answer different
+questions. The upper one, **level**, is how far into the level the run has actually got — the
+deepest point a replay reached — so it only ever grows, and it is the same yardstick as the game's
+own percentage. The lower one is whatever the solve is doing now that has a measurable end: the
+search (in ticks; reaching its end is the search finishing, which is not the same event as reaching
+the end of the level), a recording of the moving geometry, a section search (in layers), or the
+game flying a plan. It is hidden while the level is held still.
 
 ## The keys
 

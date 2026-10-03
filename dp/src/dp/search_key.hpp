@@ -313,6 +313,9 @@ inline uint64_t keyOf(const State& s, long long t) {
            // ...and the same for a DASH, which is held in exactly the same way
            ^ ((uint64_t)s.dashing << 54)
            ^ ((uint64_t)((s.rHover || s.dashing) ? s.action : 0) << 55)
+           // --dualdash: ...and the second body's dash, which its own step now keeps (0 off)
+           ^ ((s.dual && s.dashing2)
+                  ? (0x5B2E7A1D93C4F086ull ^ ((uint64_t)s.action << 31)) : 0)
            // ...and near a TOGGLE BLOCK it has not fired (g_pressWin), for the
            // same reason: the block fires on the parent's button, so the held
            // child and the released one of an airborne cube -- same y, same vy
@@ -354,6 +357,8 @@ inline uint64_t keyOf(const State& s, long long t) {
            // The flap buffered on the portal's tick (State::pFlap). Same (y,vy)
            // but different behaviour next tick, so it goes in the key.
            ^ (s.pFlap ? 0x9E3779B97F4A7C15ull : 0)
+           // ...and the spider's handed-over press (State::pSpiderTap), same reason
+           ^ (s.pSpiderTap ? 0xC2B2AE3D27D4EB4Full : 0)
            // [D9, REMOVED 2026-09-03] `pBallOff` had a term here for the same
            // reason pFlap does. The rule it keyed is gone (see State), and
            // dropping the term is bit-identical for every state that ever
@@ -374,6 +379,14 @@ inline uint64_t keyOf(const State& s, long long t) {
            // lv16 t=8,913 only, where BOTH halves carry it, so the term costs
            // that level nothing and every other level zero.
            ^ ((s.dual && s.boost2) ? 0x7B7D159C79E2A32Full : 0)
+           // --a1clatch: GD's +0xa1c (State::a1cLatch). Same (y,vy), but whether the next
+           // ramp exit launches or releases differs. 0 without the flag, so every key is
+           // bit-identical there; the second body's bit only counts in a dual.
+           ^ ((s.a1cLatch & 1u) ? 0x6A09E667F3BCC909ull : 0)
+           ^ ((s.dual && (s.a1cLatch & 2u)) ? 0xBB67AE8584CAA73Bull : 0)
+           // --lawcontact (always on since the 2026-10 slope clean-up): a law seat last tick
+           // (State::seatT > 0) makes this tick a continuing contact.
+           ^ ((s.seatT > 0) ? 0x3C6EF372FE94F82Bull : 0)
            // [r93] The slope-exit launch of a ride a warp interrupted
            // (State::pExitVy). Same (y,vy), but whether the launch comes out
            // next tick differs.
@@ -400,8 +413,9 @@ inline uint64_t keyOf(const State& s, long long t) {
            // ticks from now differently. So the flag switches the term to a
            // multiply. Without the flag the byte is still 0/1 and the shift is
            // what it always was, so every key is bit-identical.
-           ^ (g_fgArmLive ? ((uint64_t)s.fgArm * 0xBF58476D1CE4E5B9ull)
-                          : ((uint64_t)s.fgArm << 63))
+           // The riding box's renewal uses the same countdown (and reads its fresh value),
+           // so the term is always the multiply.
+           ^ ((uint64_t)s.fgArm * 0xBF58476D1CE4E5B9ull)
            // --upsidecoyote: a cube whose og is still set can jump from mid-air next tick and
            // one at the same (y, vy) without it cannot. Set only under the flag, so every
            // other key is bit-identical.
@@ -422,6 +436,10 @@ inline uint64_t keyOf(const State& s, long long t) {
            // every existing key stays bit-identical.
            // --bonkarm puts the gate back, so it puts the bit back with it.
            ^ ((s.armT < kArmTicks) ? 0xFF51AFD7ED558CCDull : 0)
+           // --ridebox: inside a riding 1859's ride the two armed ticks do NOT behave
+           // alike -- a fresh arm (armT 0) is renewed on the next tick and a decaying one
+           // lapses -- so the fresh value gets its own term. Set only under the flag.
+           ^ ((s.armT == 0) ? 0x2545F4914F6CDD1Dull : 0)
            // The spider's teleport age while it still spares a side kill (State::spiderJumpT):
            // two spiders at the same (y, vy) answer a wall inside their box differently for the
            // ticks that are left. 0 outside the window, so every other key is bit-identical.
@@ -528,6 +546,62 @@ inline uint64_t keyOf(const State& s, long long t) {
             k ^= ((uint64_t)(s.fireB[b] >> 2) * 0x9E3779B97F4A7C15ull)
                  ^ ((uint64_t)(b + 1) * 0xBF58476D1CE4E5B9ull);
         }
+    }
+    return k;
+}
+
+// --groupfire (off): the search's speed groups are split by WHEN each box whose chain is still
+// moving was entered, not only by which boxes were.
+//
+// A group places its moving geometry once for every member, from the LATEST fire tick of each
+// box (gFireB, cli.hpp). That is conservative for a door, which is less open the later it was
+// punched, and the opposite for a box that brings something DOWN onto the player: the member that
+// punched it first is shown the object where the last one would have it. Measured on lv22's switch
+// band at 1x (2026-09-28, anchor t=2,423): a plan that grazed the red box at x=3,401 passed the
+// search alive, while its own witness walk -- the same inputs, placed from the state's own fire
+// tick -- died on the ceiling at t=2,756, and GD killed it at 2,754.
+//
+// The key already separates these states (the fire-tick term above), so splitting the group merges
+// nothing new; it only stops them sharing one placement. Exact ticks, not the key's 4-tick bucket,
+// which would leave up to three ticks of the same error. A box at rest drops out, as it does from
+// the key: its chain has finished the same way for everyone.
+inline bool g_groupFire = false;
+// --groupxsplit (off): a speed group is also split where its members' x leave a gap across which
+// the two parts' object windows cannot meet, so each part builds its windows from its own x span.
+// The widest window margin is the speed portals' 80 px (cli.hpp, the group's windows), so the
+// windows [lo - 80, hi + dx + 80] of two parts are disjoint exactly when the gap between them is
+// wider than 2 * 80 + |dx| (kGroupWinMargin). Nothing narrower is split: members that could still
+// share an object stay one group, as before.
+//
+// The group key holds dx but not x, on the reasoning that members of one speed differ only by
+// stair snaps. That stops holding once two populations have taken different speed histories and
+// then come back to the same dx: they share the key, one window spans both, and every step walks
+// the objects of the whole gap. Measured on lv16's heavy call (--start 3961, all flags): a lineage
+// that the --ufolawflap flap kept alive ran at 1.30 while the rest ran at 1.61, both then took the
+// 1.05 portal, and from t=19,500 one group spanned 1,700 px (x 31,374, xlo 29,663); those 1,500
+// ticks cost 74 s against 5 s without the flag, with 4.8% more steps in the whole call.
+//
+// Each part's window still covers every member (it is built from that part's own lo..hi), so no
+// state loses an object it could reach. What changes when a split happens is the group-level
+// bookkeeping that is per part now: the latest fire tick and lock offset each part places its
+// geometry from, the order the parts are emitted in, and their separate dedupe maps. Off, or on
+// with no gap over the threshold, every state is part 0 and the layer is processed as before.
+inline bool g_groupXSplit = false;
+constexpr double kGroupWinMargin = 80.0;    // the widest of the group's window margins (speeds)
+inline long long g_groupXSplitLayers = 0;   // layers where some group split (printed at the end)
+inline int g_groupXSplitMax = 0;            // the most parts one group split into
+inline uint64_t groupFireSig(const State& s, long long t) {
+    if (!g_groupFire || !s.trig) return 0;
+    uint64_t k = 0;
+    const size_t n = std::min<size_t>(g_touchMoveTicks.size(), (size_t)kTouchBits);
+    for (size_t b = 0; b < n; ++b) {
+        if (!s.trig.test(b)) continue;
+        const long long moving = g_touchMoveTicks[b];
+        if (moving <= 0 || t - (long long)s.fireB[b] >= moving) continue;
+        uint64_t h = ((uint64_t)(b + 1) << 32) ^ (uint64_t)s.fireB[b];
+        h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ull;
+        h = (h ^ (h >> 27)) * 0x94D049BB133111EBull;
+        k ^= h ^ (h >> 31);
     }
     return k;
 }

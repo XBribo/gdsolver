@@ -300,7 +300,8 @@ inline bool g_shipCeilSet = false;
 // default: on, it cost lv22's cold run 41% -> 15%. Declared here rather than
 // with the other knobs in thread_pool.hpp because dynamics.hpp reads it and
 // comes earlier in the header chain.
-inline bool g_rotPort = false;
+// On by default since 2026-10 (was opt-in).
+// (The switch is gone since the 0.4.0 clean-up; its on behaviour is fixed.)
 // --rotlast: adopt the LAST 2900 that matches on a tick rather than the nearest
 // one on the perpendicular axis. That is the pre-0a1e8b6 rule; with
 // --rotperp 30 it restores that function exactly, which is how the 84% cold run

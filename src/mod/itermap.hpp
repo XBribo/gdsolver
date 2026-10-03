@@ -78,6 +78,14 @@ struct Fixup {
     long long tick = 0;
     float x = 0.f, y = 0.f;
     int kill = 0;             // a fixup that records "GD ends the run at this state"
+    // A kill record for a death the model dies too, on the next tick (repair.hpp fixupPass): the
+    // model was right there, and the round died because the search sent a plan that dies -- the
+    // recorder files it because it compares GD's death row with the model's death, which comes a
+    // tick later for the same event. Counted and drawn apart from the fixups where the model was
+    // wrong. Measured on official lv11 with coins: 4 of the run's 7 fixups, every one on the object
+    // GD named, with the model's state equal to GD's to the last digit. The test itself compares
+    // the state and the tick, not the object (fixupPass says how often the object agreed on a run).
+    int sameDeath = 0;
 };
 
 struct Veto {
@@ -378,10 +386,18 @@ inline void addDeath(int iter, long long tick, float x, float y, int kind,
 
 // Called from the SOLVER THREAD (the fixup pass runs inside the ladder job), which is the whole
 // reason for the mutex above.
-inline void addFixup(int iter, long long tick, float x, float y, bool kill) {
+inline void addFixup(int iter, long long tick, float x, float y, bool kill, bool sameDeath = false) {
     std::lock_guard<std::mutex> lk(g_mu);
-    g_fixups.push_back(Fixup{iter, tick, x, y, kill ? 1 : 0});
+    g_fixups.push_back(Fixup{iter, tick, x, y, kill ? 1 : 0, sameDeath ? 1 : 0});
     ++g_generation;
+}
+
+// Fixups the model was wrong for, and the ones a search sent (Fixup::sameDeath). The caller
+// holds g_mu.
+inline size_t searchFixupsLocked() {
+    size_t n = 0;
+    for (const Fixup& x : g_fixups) n += x.sameDeath ? 1 : 0;
+    return n;
 }
 
 inline void addVeto(int iter, float x0, float x1) {
@@ -447,7 +463,7 @@ inline bool save(int levelId, bool cleared) {
           << d.killerId << ',' << d.killerUid << "\n";
     for (const Fixup& x : g_fixups)
         f << "fixup=" << x.iter << ',' << x.tick << ',' << x.x << ',' << x.y << ','
-          << x.kill << "\n";
+          << x.kill << ',' << x.sameDeath << "\n";
     for (const Veto& v : g_vetoes)
         f << "veto=" << v.iter << ',' << v.x0 << ',' << v.x1 << "\n";
     // round, kind, then x,y pairs every kPathStep ticks. One line per round; long, but a path is
@@ -493,7 +509,9 @@ inline bool load(int levelId) {
             Fixup x;
             double fx = 0, fy = 0;
             long long tick = 0;
-            if (sscanf(v, "%d,%lld,%lf,%lf,%d", &x.iter, &tick, &fx, &fy, &x.kill) >= 4) {
+            // The sixth field (sameDeath) is absent from maps written before it existed: 0.
+            if (sscanf(v, "%d,%lld,%lf,%lf,%d,%d", &x.iter, &tick, &fx, &fy, &x.kill,
+                       &x.sameDeath) >= 4) {
                 x.tick = tick; x.x = (float)fx; x.y = (float)fy;
                 g_fixups.push_back(x);
             }
@@ -568,6 +586,7 @@ struct Hot {
     float x0 = 0.f;      // the bucket's left edge in level coordinates
     int deaths = 0;
     int fixups = 0;
+    int searchFixups = 0;   // of `fixups`, the ones a search sent (Fixup::sameDeath)
     int firstIter = 0, lastIter = 0;
     float yLo = 0.f, yHi = 0.f;
     int dominant = KindRewind;   // the kind most of this bucket's deaths were scored as
@@ -616,6 +635,7 @@ inline void rebuildHotLocked() {
             it = by.emplace(b, h).first;
         }
         ++it->second.fixups;
+        if (x.sameDeath) ++it->second.searchFixups;
     }
     g_hot.reserve(by.size());
     for (auto& kv : by) {
@@ -769,9 +789,12 @@ inline void drawWorld(cocos2d::CCNode* objectLayer) {
     }
     // 4. the fixups: where the MODEL was wrong. These are the cause; the deaths are the symptom,
     //    and on a level whose wall is really a fidelity hole they sit hundreds of pixels apart.
+    //    Grey: a kill record for a death the model dies too (Fixup::sameDeath) -- the search sent
+    //    that plan, the model was not wrong there.
     for (const Fixup& x : g_fixups) {
-        const ccColor4F c = x.kill ? ccColor4F{1.00f, 0.35f, 0.85f, 0.85f}
-                                   : ccColor4F{1.00f, 0.80f, 0.20f, 0.75f};
+        const ccColor4F c = x.sameDeath ? ccColor4F{0.70f, 0.70f, 0.70f, 0.70f}
+                            : x.kill    ? ccColor4F{1.00f, 0.35f, 0.85f, 0.85f}
+                                        : ccColor4F{1.00f, 0.80f, 0.20f, 0.75f};
         n->drawDot({x.x, x.y}, 3.5f, c);
     }
     // 5. the deaths themselves, on top, coloured by how the round was scored
@@ -977,8 +1000,9 @@ inline void drawStrip(cocos2d::CCNode* parent) {
         for (const Fixup& x : g_fixups) {
             const float fx = (float)x.tick * st;
             fillRect(n, fx, kStripH - pad, fx + thin, kStripH,
-                     x.kill ? ccColor4F{1.00f, 0.35f, 0.85f, 0.9f}
-                            : ccColor4F{1.00f, 0.80f, 0.20f, 0.9f});
+                     x.sameDeath ? ccColor4F{0.70f, 0.70f, 0.70f, 0.9f}
+                     : x.kill    ? ccColor4F{1.00f, 0.35f, 0.85f, 0.9f}
+                                 : ccColor4F{1.00f, 0.80f, 0.20f, 0.9f});
         }
     }
     // Where the drag will land, if one is in progress. Amber and full height so it reads as "this
@@ -1081,16 +1105,26 @@ inline void summary(char* out, size_t cap, float px, float levelLen) {
     // it was reported as a drawing bug (2026-08-29) exactly because nothing said otherwise.
     const char* tails = (!g_deaths.empty() && g_paths.empty())
                         ? "   [no tails in this map - rebuilt from a log]" : "";
+    // The fixups split by cause: where the model was wrong, and where a search sent a plan the
+    // model knew dies (Fixup::sameDeath).
+    // A line of its own: the header already runs close to the column's ~80 characters.
+    const size_t searchFx = searchFixupsLocked();
     n += snprintf(out + n, cap - n, "ITERATION MAP  %d rounds  %zu deaths  %zu fixups%s%s%s\n",
                   g_rounds, g_deaths.size(), g_fixups.size(), worst, state, tails);
     if (n < 0 || (size_t)n >= cap) return;
+    if (!g_fixups.empty()) {
+        n += snprintf(out + n, cap - n,
+                      "  fixups: %zu where the model was wrong, %zu a search sent (same death)\n",
+                      g_fixups.size() - searchFx, searchFx);
+        if (n < 0 || (size_t)n >= cap) return;
+    }
     const Hot* here = atLocked(px);
     if (here) {
         n += snprintf(out + n, cap - n,
-                      "  here x=%.0f: %d death%s (%s), %d fixup%s  (rounds %d-%d)\n",
+                      "  here x=%.0f: %d death%s (%s), %d fixup%s (%d search)  (rounds %d-%d)\n",
                       (double)px, here->deaths, here->deaths == 1 ? "" : "s",
                       kindName(here->dominant),
-                      here->fixups, here->fixups == 1 ? "" : "s",
+                      here->fixups, here->fixups == 1 ? "" : "s", here->searchFixups,
                       here->firstIter, here->lastIter);
     } else {
         n += snprintf(out + n, cap - n,
@@ -1105,7 +1139,8 @@ inline void summary(char* out, size_t cap, float px, float levelLen) {
     // beats offering a click that barLive() will refuse.
     snprintf(out + n, cap - n,
              "  deaths: green deeper / cyan followed / violet forced / red rewound / pink wedged\n"
-             "  amber fixup, magenta kill fixup, purple veto   -   %s",
+             "  fixups: amber model / magenta kill / grey search (same death), purple veto\n"
+             "  %s",
              barVisible() ? "click the strip to seek" : "live: the solve is writing this");
 }
 

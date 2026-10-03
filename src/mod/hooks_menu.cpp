@@ -44,6 +44,12 @@ class $modify(P1MenuLayer, MenuLayer) {
                 updateWindowTitle();
                 writeResult("session_start", true);
                 writeResult(dpConfigLine());   // the solver configuration, one line
+                // Say once, plainly, whether the research trail (dp_band_itN/dp_groups_itN and
+                // the recorder's dp_fixin_*/dp_attempt_itN files) is being kept this session --
+                // see Config::researchCapture for why it defaults off.
+                writeResult(g_cfg.researchCapture
+                    ? "session: research capture on (per-attempt band/groups/recorder-input copies are kept)"
+                    : "session: research capture off (per-attempt band/groups/recorder-input copies are not kept)");
                 // Load the plan onto the very first attempt of serve mode too. Relying on
                 // rerun, a session that finishes without dying (nodeath) would never receive
                 // the plan. Start-Serve always writes plan_in.txt before launch (if it is
@@ -65,6 +71,8 @@ class $modify(P1MenuLayer, MenuLayer) {
                     gm->m_customFPSTarget = (float)g_cfg.fps;
                     gm->updateCustomFPS();
                     // vsync is really the GL swap interval. Disable it directly at runtime
+                    // (Windows: WGL; Android keeps the game's own vsync setting only)
+#ifdef GEODE_IS_WINDOWS
                     using SwapIntervalFn = BOOL(WINAPI*)(int);
                     auto ogl = GetModuleHandleA("opengl32.dll");
                     auto getProc = (PROC(WINAPI*)(LPCSTR))GetProcAddress(ogl, "wglGetProcAddress");
@@ -75,6 +83,7 @@ class $modify(P1MenuLayer, MenuLayer) {
                             log::info("phase1: vsync disabled via wglSwapIntervalEXT");
                         }
                     }
+#endif
                     log::info("phase1: forced custom FPS to {}", g_cfg.fps);
                 }
                 this->runAction(CCSequence::create(

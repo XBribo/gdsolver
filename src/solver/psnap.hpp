@@ -646,6 +646,7 @@ inline void restoreTouch(PlayerObject* p, const Touch& in, GJBaseGameLayer* l = 
 // which is all anything reads of an ordered map; only the nodes are not new. Everything else is
 // the plain member-wise assignment, done with the maps moved out of both sides for its duration
 // (a swap: O(1), and it puts the very same nodes back).
+#ifdef GEODE_IS_WINDOWS
 template <class M>
 inline void syncOrderedMap(M& dst, const M& src) {
     auto d = dst.begin();
@@ -697,6 +698,15 @@ inline void assignState(GJGameState& dst, GJGameState& src) {
     syncOrderedMap(dst.m_unkMapPairGJGameEventIntInt, src.m_unkMapPairGJGameEventIntInt);
     syncOrderedMap(dst.m_proximityVolumeRelated, src.m_proximityVolumeRelated);
 }
+#else
+// Android: GD's maps are Geode's GNU STL copies, whose swap does not compile against the NDK's
+// libc++ (and whose iterators std::next does not accept). The plain member-wise assignment
+// gives the same keys and values in the same order, only with new nodes and more time.
+inline void assignState(GJGameState& dst, GJGameState& src) {
+    if (&dst == &src) return;
+    dst = src;
+}
+#endif
 
 inline void captureState(GJBaseGameLayer* l, GJGameState& out) {
     if (l) assignState(out, l->m_gameState);
@@ -722,8 +732,21 @@ inline void restoreState(GJBaseGameLayer* l, GJGameState& in) {
 // two flags).
 // Only the objects within the section's reach are carried: a node costs a byte per object in
 // reach, not the whole level. cfg `secsnapact=0` turns it off for A/B.
+// NOT THE DECORATIONS. A decoration (type 7) is never collided with, so its two flags stay
+// clear through any search and carrying them carries nothing -- but their zero bytes did go into
+// the signature below, and the signature orders the cap's buckets. A level solved on its slice
+// (mod/level_slice.hpp), which drops decorations, therefore capped different branches than the
+// level itself from the same nodes: on a custom level with 13,797 ungrouped decorations dropped,
+// the search from t=24,680 split from the level's own at layer 164 and came back EXHAUSTED at
+// depth 322 where the level's was SOLVED, the plain game being identical on the two on every
+// tick of the route. The decorations in reach are kept aside only to check that none of them is
+// ever activated: their flags are read on every capture and every restore and OR-ed together, so
+// a flag that was set and cleared again between two ends of a search is still seen (`decoEver`
+// on the secsnapact line; `decoUsed` is the same count at the end of the search alone).
 inline bool g_snapAct = true;
 inline std::vector<EnhancedGameObject*> g_actObjs;
+inline std::vector<EnhancedGameObject*> g_actDecos;
+inline std::vector<uint8_t> g_decoSeen;   // per g_actDecos: either flag ever seen set
 // What the carry costs and what it carried, for the `secsnapact:` line at the end of a
 // search: calls, time spent in them, and which objects were ever seen activated by each player
 // in a captured node (the P2 column is the dual sections' half).
@@ -733,6 +756,7 @@ inline std::vector<uint8_t> g_actSeen;
 
 inline void buildActWindow(GJBaseGameLayer* l, double x0, double x1) {
     g_actObjs.clear();
+    g_actDecos.clear();
     g_actSeen.clear();
     g_actCaptures = g_actRestores = 0;
     g_actCapUs = g_actRestUs = 0.0;
@@ -742,9 +766,37 @@ inline void buildActWindow(GJBaseGameLayer* l, double x0, double x1) {
         if (!o) continue;
         const double x = o->getPositionX();
         if (x < x0 || x > x1) continue;
-        if (auto* e = typeinfo_cast<EnhancedGameObject*>(o)) g_actObjs.push_back(e);
+        auto* e = typeinfo_cast<EnhancedGameObject*>(o);
+        if (!e) continue;
+        (o->m_objectType == GameObjectType::Decoration ? g_actDecos : g_actObjs).push_back(e);
     }
     g_actSeen.assign(g_actObjs.size(), 0);
+    g_decoSeen.assign(g_actDecos.size(), 0);
+}
+
+// OR the decorations' flags into g_decoSeen (called on every capture and restore).
+inline void noteDecos() {
+    for (size_t i = 0; i < g_actDecos.size(); ++i) {
+        const auto* e = g_actDecos[i];
+        if (e->m_activatedByPlayer1 || e->m_activatedByPlayer2) g_decoSeen[i] = 1;
+    }
+}
+
+// The decorations in reach that carry either flag now. Anything but 0 at the end of a search
+// means a decoration can be activated after all, and leaving them out of the carry is wrong.
+inline int actDecosUsed() {
+    int n = 0;
+    for (const auto* e : g_actDecos)
+        n += (e->m_activatedByPlayer1 || e->m_activatedByPlayer2) ? 1 : 0;
+    return n;
+}
+
+// ...and the ones seen with a flag at any capture or restore of the search.
+inline int actDecosEver() {
+    noteDecos();
+    int n = 0;
+    for (uint8_t s : g_decoSeen) n += s;
+    return n;
 }
 
 // The activation bytes AND their 64-bit signature, in one pass. The signature is what makes two
@@ -770,6 +822,7 @@ inline uint64_t captureActSig(std::vector<uint8_t>& out) {
         h ^= out[i];
         h *= 1099511628211ull;
     }
+    noteDecos();
     ++g_actCaptures;
     g_actCapUs += std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - t0).count();
@@ -803,6 +856,7 @@ inline int actKeySelfCheck(const std::vector<uint8_t>& base, long long playerKey
 inline void restoreAct(const std::vector<uint8_t>& in) {
     if (in.size() != g_actObjs.size()) return;
     const auto t0 = std::chrono::steady_clock::now();
+    noteDecos();   // what the step before this restore left on them
     for (size_t i = 0; i < g_actObjs.size(); ++i) {
         g_actObjs[i]->m_activatedByPlayer1 = (in[i] & 1) != 0;
         g_actObjs[i]->m_activatedByPlayer2 = (in[i] & 2) != 0;
@@ -835,17 +889,51 @@ inline int actSeenCount(uint8_t bit) {
     return n;
 }
 
-inline void captureEM(GJBaseGameLayer* l, gd::vector<PulseEffectAction>& out) {
-    if (auto* em = l ? l->m_effectManager : nullptr)
-        out = em->m_pulseEffectVector;
-    else
-        out.clear();
+// cfg `secsnapem` (on by default since 2026-10; 0 = off): the effect manager in full, as GD's own
+// checkpoint keeps it (GJEffectManager::saveToState 0x263e80 / loadFromState 0x2644a0, into an
+// EffectManagerState), not only its pulse queue. The group commands in progress live there -- among
+// them the ones a Keyframe Animation trigger (id 3033) runs, created by createKeyframeCommand --
+// and the snapshot carried none of them. Measured on MOAI's ladder window at t=9,628: the step just
+// after the player crossed a 3033 at x=13,995 (target group 736) put decoration uid 47313, a member
+// of that group, at (NaN, NaN).
+inline bool g_snapEM = true;
+// cfg `secsnapemfrom=<tick>` (a probe, 0 = every search): only a search whose head is at this tick or
+// later carries the manager in full, so a run can reach a late window the way it always does and be
+// compared there. g_snapEMActive is set at each search's head (hooks_gamelayer).
+inline long long g_snapEMFrom = 0;
+inline bool g_snapEMActive = false;
+
+struct EMSnap {
+    gd::vector<PulseEffectAction> pulses;
+    std::shared_ptr<EffectManagerState> full;   // cfg secsnapem only
+};
+
+inline void captureEM(GJBaseGameLayer* l, EMSnap& out) {
+    auto* em = l ? l->m_effectManager : nullptr;
+    if (!em) {
+        out.pulses.clear();
+        out.full.reset();
+        return;
+    }
+    out.pulses = em->m_pulseEffectVector;
+    if (g_snapEMActive) {
+        out.full = std::make_shared<EffectManagerState>();   // fresh: saveToState may append
+        em->saveToState(*out.full);
+    } else {
+        out.full.reset();
+    }
 }
 
-inline void restoreEM(GJBaseGameLayer* l,
-                      const gd::vector<PulseEffectAction>& in) {
-    if (auto* em = l ? l->m_effectManager : nullptr)
-        em->m_pulseEffectVector = in;
+// A node is restored once per branch and again by the cross-check, so the state is loaded from a copy
+// (whether loadFromState takes the containers out of what it is given has not been looked at).
+inline void restoreEM(GJBaseGameLayer* l, const EMSnap& in) {
+    auto* em = l ? l->m_effectManager : nullptr;
+    if (!em) return;
+    if (g_snapEMActive && in.full) {
+        EffectManagerState copy = *in.full;
+        em->loadFromState(copy);
+    }
+    em->m_pulseEffectVector = in.pulses;
 }
 
 // Where GD's physics will start the player from on the next update. Not always the node's
@@ -858,12 +946,13 @@ inline void restoreEM(GJBaseGameLayer* l,
 // on restore: on a custom level (2026-09-26), from the tick the player touches the mirror portal at x=13,095,
 // psnap's x ran 0.7, 1.7, 2.7 ... px a tick ahead of GD's own run and every window died short of
 // the wall. Outside a transition the two are the same point, so nothing else moves.
-static_assert(offsetof(PlayerObject, m_position) == 0xa90, "PlayerObject::m_position moved");
+static_assert(offsetof(PlayerObject, m_position) == gdoff::kPlayerPosition,
+              "PlayerObject::m_position moved");
 inline cocos2d::CCPoint physPosition(PlayerObject* p, GJBaseGameLayer* l) {
     if (p && l) {
         const auto* lb = reinterpret_cast<const uint8_t*>(l);
-        const float t = *reinterpret_cast<const float*>(lb + 0x41c);
-        const bool stored = reinterpret_cast<const uint8_t*>(p)[0xa2a] == 0;
+        const float t = *reinterpret_cast<const float*>(lb + gdoff::kLayerLevelFlipping);
+        const bool stored = reinterpret_cast<const uint8_t*>(p)[gdoff::kPlayerLocked] == 0;
         if (t > 0.f && t < 1.f && stored) return p->m_position;
     }
     return p ? p->getPosition() : cocos2d::CCPoint{};
@@ -879,11 +968,10 @@ inline void capturePlayer(PlayerObject* p, uint8_t* dst, GJBaseGameLayer* l = nu
 
 // Layout: player 1, its extras, the layer members, then player 2 and its extras when the layer
 // has one (partner). restore() reads the same layout back under the same condition.
-inline void capture(PlayerObject* p, GJBaseGameLayer* l,
-                    std::vector<uint8_t>& out) {
-    observe(p);
+// captureRaw leaves out the pointer sentinel (observe), whose count a snapshot taken outside the
+// search's own nodes must not move.
+inline void captureRaw(PlayerObject* p, GJBaseGameLayer* l, std::vector<uint8_t>& out) {
     PlayerObject* p2 = partner(p, l);
-    if (p2) observe(p2);
     const size_t one = sizeof(PlayerObject) + kExtra;
     out.resize(one + layerBytes() + (p2 ? one : 0));
     capturePlayer(p, out.data(), l);
@@ -895,6 +983,77 @@ inline void capture(PlayerObject* p, GJBaseGameLayer* l,
     if (p2) capturePlayer(p2, out.data() + o, l);
 }
 
+inline void capture(PlayerObject* p, GJBaseGameLayer* l,
+                    std::vector<uint8_t>& out) {
+    observe(p);
+    if (PlayerObject* p2 = partner(p, l)) observe(p2);
+    captureRaw(p, l, out);
+}
+
+// ---- cfg seccpcheck (print only): what a section search's checkpoint load leaves ----
+// The members a load was measured to leave as the branch before had them (secsolve::g_cpPlayer),
+// read from three snapshots of one point in capture()'s layout: the point's own (origin), the
+// player right after the load (what seccpplayer=0 searches on), and after the write-back.
+inline bool g_cpCheck = false;
+inline const char* const kCpCheckP1[] = {"m_stateRingJump"};
+inline const char* const kCpCheckP2[] = {"m_padRingRelated", "m_stateJumpBuffered", "m_wasRobotJump",
+                                         "m_blackOrbRelated", "m_yVelocityBeforeSlope",
+                                         "m_slopeStartTime"};
+
+inline const Mem* scalarNamed(const char* n) {
+    for (const auto& m : scalars())
+        if (std::strcmp(m.name, n) == 0) return &m;
+    return nullptr;
+}
+
+inline std::string cpValue(const uint8_t* p, size_t n) {
+    char b[40];
+    if (n == 1) snprintf(b, sizeof(b), "%d", (int)p[0]);
+    else if (n == 4) { float f; std::memcpy(&f, p, 4); snprintf(b, sizeof(b), "%.6g", (double)f); }
+    else if (n == 8) { double d; std::memcpy(&d, p, 8); snprintf(b, sizeof(b), "%.9g", d); }
+    else snprintf(b, sizeof(b), "(%zu bytes)", n);
+    return b;
+}
+
+// One player's named members: "name=origin/load/after" each, and the FNV-1a hash of the members'
+// bytes per snapshot. `off` = where that player starts in the layout; false when a snapshot has no
+// such player.
+inline bool cpPlayerPart(const std::vector<uint8_t>* s[3], size_t off, const char* const* names,
+                         size_t n, std::string& out, uint32_t h[3]) {
+    for (int k = 0; k < 3; ++k)
+        if (s[k]->size() < off + sizeof(PlayerObject)) return false;
+    for (int k = 0; k < 3; ++k) h[k] = 2166136261u;
+    for (size_t i = 0; i < n; ++i) {
+        const Mem* m = scalarNamed(names[i]);
+        if (!m) { out += std::string(" ") + names[i] + "=?"; continue; }
+        out += std::string(" ") + names[i] + "=";
+        for (int k = 0; k < 3; ++k) {
+            const uint8_t* p = s[k]->data() + off + m->off;
+            for (size_t j = 0; j < m->size; ++j) { h[k] ^= p[j]; h[k] *= 16777619u; }
+            out += (k ? "/" : "") + cpValue(p, m->size);
+        }
+    }
+    return true;
+}
+
+inline std::string cpCheckLine(const char* site, long long at, const std::vector<uint8_t>& origin,
+                               const std::vector<uint8_t>& load, const std::vector<uint8_t>& after,
+                               bool writeBack) {
+    const std::vector<uint8_t>* s[3] = {&origin, &load, &after};
+    std::string p1, p2;
+    uint32_t h1[3] = {0, 0, 0}, h2[3] = {0, 0, 0};
+    cpPlayerPart(s, 0, kCpCheckP1, sizeof(kCpCheckP1) / sizeof(kCpCheckP1[0]), p1, h1);
+    const bool has2 = cpPlayerPart(s, sizeof(PlayerObject) + kExtra + layerBytes(), kCpCheckP2,
+                                   sizeof(kCpCheckP2) / sizeof(kCpCheckP2[0]), p2, h2);
+    char b[200];
+    snprintf(b, sizeof(b), " | hash origin/load/after p1=%08x/%08x/%08x p2=%08x/%08x/%08x | "
+             "load=origin:%s after=origin:%s", h1[0], h1[1], h1[2], h2[0], h2[1], h2[2],
+             (h1[1] == h1[0] && (!has2 || h2[1] == h2[0])) ? "yes" : "no",
+             (h1[2] == h1[0] && (!has2 || h2[2] == h2[0])) ? "yes" : "no");
+    return std::string("seccp: site=") + site + " at=" + std::to_string(at) + " writeback="
+           + (writeBack ? "1" : "0") + " p1[" + p1 + " ] p2[" + (has2 ? p2 : " none") + " ]" + b;
+}
+
 // Injection of the raw snapshot (the old warp's `injectBytes` itself).
 // CALL AT A FRAME BOUNDARY: called in the middle of a substep, the remaining
 // substeps run on top of the injected state, create a transition impossible in
@@ -903,7 +1062,10 @@ inline void capture(PlayerObject* p, GJBaseGameLayer* l,
 // alternately restoring snapshots taken at different times lets no stale
 // pointer in.
 // One player's whitelisted bytes and extras back from src (see capturePlayer).
+// Raises g_psnapPlayerWritten (config.hpp): the mode flags now hold the snapshot's while the
+// mode sprites stay as they were (repair.hpp tidyPlayerModes).
 inline void restorePlayer(PlayerObject* p, const uint8_t* bytes) {
+    g_psnapPlayerWritten = true;
     const auto& m = mask();
     uint8_t* dst = (uint8_t*)p;
     size_t i = 0;

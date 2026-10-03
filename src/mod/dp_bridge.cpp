@@ -24,6 +24,10 @@
 // path rather than an imitation of it.
 #include "dp/cli.hpp"
 
+#include <atomic>
+#include <filesystem>
+#include <thread>
+
 #include "mod/dp_bridge.hpp"
 
 namespace dpbridge {
@@ -79,46 +83,272 @@ SolveProgress progress() {
 }
 
 SolveOutcome outcome() {
-    SolveOutcome o;
-    o.verdict = dp::g_outcome.verdict;
-    o.horizonCut = dp::g_outcome.horizonCut;
-    o.deepT = dp::g_outcome.deepT;
-    o.deepX = dp::g_outcome.deepX;
-    o.capHits = dp::g_outcome.capHits;
-    o.workStates = dp::g_outcome.workStates;
-    o.cancelT = dp::g_outcome.cancelT;
-    o.resimDead = dp::g_outcome.resimDead;
-    o.resimFirst = dp::g_outcome.resimFirst;
-    o.resimWhy = dp::g_outcome.resimWhy;
-    o.resimUid = dp::g_outcome.resimUid;
-    o.resimObjX = dp::g_outcome.resimObjX;
-    o.resimObjY = dp::g_outcome.resimObjY;
-    o.resimTrig = dp::g_outcome.resimTrig.word(0);   // the whole mask while kTouchBits <= 64
-    o.resimFrame = dp::g_outcome.resimFrame;
-    o.replayDiedT = dp::g_outcome.replayDiedT;
-    o.rejoinT = dp::g_outcome.rejoinT;
-    o.rejoinBadT = dp::g_outcome.rejoinBadT;
-    o.rejoinBadWhy = dp::g_outcome.rejoinBadWhy;
-    o.needTrigMask = dp::g_outcome.needTrigMask.word(0);
-    o.needTrigPassed = dp::g_outcome.needTrigPassed.word(0);
-    o.seedRotQ = dp::g_outcome.seedRotQ;
-    o.rotQOrder = dp::g_outcome.rotQOrder;
-    o.coinGates = dp::g_outcome.coinGates;
-    o.coinNoPrune = dp::g_outcome.coinNoPrune;
-    o.startRotHit = dp::g_outcome.startRotHit;
-    o.startRotGiven = dp::g_outcome.startRotGiven;
-    o.startRotMiss = dp::g_outcome.startRotMiss;
-    o.trigWinTouch = dp::g_outcome.trigWinTouch;
-    o.trigTotal = dp::g_outcome.trigTotal;
-    o.trigRelevantN = dp::g_outcome.trigRelevantN;
-    o.trigKept = dp::g_outcome.trigKept;
-    o.trigDroppedRelevant = dp::g_outcome.trigDroppedRelevant;
-    o.trigDroppedBehind = dp::g_outcome.trigDroppedBehind;
-    o.trigDroppedAhead = dp::g_outcome.trigDroppedAhead;
-    o.trigMaxKeptX = dp::g_outcome.trigMaxKeptX;
-    o.trigMapSig = dp::g_outcome.trigMapSig;
-    o.unsupported = dp::g_outcome.unsupported;
-    return o;
+#include "mod/dp_bridge_outcome.inl"
+}
+
+// ---- the plain search beside the ladder (cli.hpp PlainElsewhere) ---------------------------
+//
+// The second copy of the core (dp_bridge2.cpp) runs it on a thread of its own, writing to side
+// files next to the call's own; the ladder's take() moves them into place and copies the second
+// copy's outcome into this one's g_outcome, so that everything after -- step 5 of the ladder, and
+// the repair loop reading outcome() -- sees what the plain search in this copy would have left.
+namespace {
+
+struct Beside {
+    bool enabled = false;
+    bool gamble = false;               // plainBeside(3): taken as soon as ready() holds
+    std::thread th;
+    int rc = -1;
+    std::string out;                   // the call's --out
+    long long killsAt = 0;             // the second copy's envKillsTotal() when it started
+    // Written by the search's own thread as it finishes, read by the ladder's (ready()).
+    std::atomic<bool> done{false};
+    std::atomic<bool> solved{false};
+    std::atomic<long long> deepT{-1};
+};
+
+// The gamble's test (cli.hpp PlainElsewhere::ready): finished, and solved or no shallower than
+// the ladder's deepest death. A ladder none of whose attempts has died yet may still solve at the
+// first, so a plain search that did not solve is not taken before one has.
+bool gambleHolds(long long bestT);
+Beside g_beside;
+std::atomic<long long> g_besideKills{0};   // env kills of the plain searches that were taken
+
+std::string sidePath(const std::string& out) { return out + ".beside"; }
+
+void removeSideFiles(const std::string& out) {
+    std::error_code ec;
+    std::filesystem::remove(sidePath(out), ec);
+    std::filesystem::remove(sidePath(out) + ".trace.csv", ec);
+}
+
+void adoptOutcome(const SolveOutcome& s) {
+    dp::SearchOutcome& o = dp::g_outcome;
+    o.verdict = s.verdict;
+    o.horizonCut = s.horizonCut;
+    o.deepT = s.deepT;
+    o.deepX = s.deepX;
+    o.capHits = s.capHits;
+    o.workStates = s.workStates;
+    o.cancelT = s.cancelT;
+    o.resimDead = s.resimDead;
+    o.resimFirst = s.resimFirst;
+    o.resimWhy = s.resimWhy;
+    o.resimUid = s.resimUid;
+    o.resimObjX = s.resimObjX;
+    o.resimObjY = s.resimObjY;
+    o.resimTrig = dp::TouchMask{};
+    o.resimTrig.w[0] = s.resimTrig;
+    o.resimFrame = s.resimFrame;
+    o.replayDiedT = s.replayDiedT;
+    o.rejoinT = s.rejoinT;
+    o.rejoinBadT = s.rejoinBadT;
+    o.rejoinBadWhy = s.rejoinBadWhy;
+    o.needTrigMask = dp::TouchMask{};
+    o.needTrigMask.w[0] = s.needTrigMask;
+    o.needTrigPassed = dp::TouchMask{};
+    o.needTrigPassed.w[0] = s.needTrigPassed;
+    o.seedRotQ = s.seedRotQ;
+    o.rotQOrder = s.rotQOrder;
+    o.coinGates = s.coinGates;
+    o.coinNoPrune = s.coinNoPrune;
+    o.startRotHit = s.startRotHit;
+    o.startRotGiven = s.startRotGiven;
+    o.startRotMiss = s.startRotMiss;
+    o.trigWinTouch = s.trigWinTouch;
+    o.trigTotal = s.trigTotal;
+    o.trigRelevantN = s.trigRelevantN;
+    o.trigKept = s.trigKept;
+    o.trigDroppedRelevant = s.trigDroppedRelevant;
+    o.trigDroppedBehind = s.trigDroppedBehind;
+    o.trigDroppedAhead = s.trigDroppedAhead;
+    o.trigMaxKeptX = s.trigMaxKeptX;
+    o.trigMapSig = s.trigMapSig;
+    o.unsupported = s.unsupported;
+}
+
+bool besideStart(const std::vector<std::string>& argv) {
+    if (!g_beside.enabled) return false;
+    // The checkpoint channel flies the plain search's checkpoints while it runs and waits for
+    // their judgement; the second copy has no such channel, so with it on the ladder searches the
+    // plain search itself.
+    if (dp::g_check.enabled.load(std::memory_order_acquire)) return false;
+    std::vector<std::string> a = argv;
+    std::string out;
+    for (size_t i = 0; i + 1 < a.size(); ++i) {
+        // outputs this does not move into place: leave such a call to the ladder
+        if (a[i] == "--bands" || a[i] == "--snaplog" || a[i] == "--histstat") return false;
+        if (a[i] == "--out") {
+            out = a[i + 1];
+            a[i + 1] = sidePath(out);
+        }
+    }
+    if (out.empty()) return false;
+    removeSideFiles(out);
+    g_beside.out = out;
+    g_beside.rc = -1;
+    g_beside.done.store(false);
+    g_beside.solved.store(false);
+    g_beside.deepT.store(-1);
+    second::takeOutput();   // nothing is left from a search before this one
+    second::cancel(false);
+    g_beside.killsAt = second::envKillsTotal();
+    g_beside.th = std::thread([a, csv = dp::g_levelCsv] {
+        g_beside.rc = second::solve(csv, a);
+        const SolveOutcome o = second::outcome();
+        g_beside.solved.store(o.verdict == OutcomeSolved);
+        g_beside.deepT.store(o.deepT);
+        g_beside.done.store(true, std::memory_order_release);
+        // the gamble: stop the ladder's attempt in progress if this is already what it will take
+        if (g_beside.gamble && gambleHolds(dp::g_ladderBestT.load()))
+            dp::g_ladderStop.store(true);
+    });
+    return true;
+}
+
+bool gambleHolds(long long bestT) {
+    if (!g_beside.done.load(std::memory_order_acquire)) return false;
+    if (g_beside.solved.load()) return true;
+    return bestT >= 0 && g_beside.deepT.load() >= bestT;
+}
+
+bool besideReady(long long bestT) { return gambleHolds(bestT); }
+
+int besideTake() {
+    if (g_beside.th.joinable()) g_beside.th.join();
+    // what it printed, where the ladder's own plain search would have printed it
+    const std::string said = second::takeOutput();
+    std::fputs(said.c_str(), stdout);
+    std::fflush(stdout);
+    // Only the files it wrote: a plain search that returned before writing a plan leaves the
+    // last attempt's in place, as it would have in this copy.
+    std::error_code ec;
+    const std::string side = sidePath(g_beside.out);
+    if (std::filesystem::exists(side, ec)) std::filesystem::rename(side, g_beside.out, ec);
+    if (std::filesystem::exists(side + ".trace.csv", ec))
+        std::filesystem::rename(side + ".trace.csv", g_beside.out + ".trace.csv", ec);
+    adoptOutcome(second::outcome());
+    g_besideKills.fetch_add(second::envKillsTotal() - g_beside.killsAt,
+                            std::memory_order_relaxed);
+    return g_beside.rc;
+}
+
+void besideDrop() {
+    second::cancel(true);
+    if (g_beside.th.joinable()) g_beside.th.join();
+    second::cancel(false);
+    second::takeOutput();
+    removeSideFiles(g_beside.out);
+}
+
+// ---- the instrument (plainBeside(2)): the plain search in both copies, compared --------------
+
+bool sameFile(const std::string& a, const std::string& b) {
+    std::error_code ec;
+    const bool ea = std::filesystem::exists(a, ec), eb = std::filesystem::exists(b, ec);
+    if (ea != eb) return false;
+    if (!ea) return true;
+    std::string x, y;
+    return dp::readFileBytes(a, x) && dp::readFileBytes(b, y) && x == y;
+}
+
+bool sameText(const char* a, const char* b) {
+    return (a == nullptr) == (b == nullptr) && (a == nullptr || std::strcmp(a, b) == 0);
+}
+
+// The fields of two outcomes that differ, by name; empty when they agree.
+std::string outcomeDiff(const SolveOutcome& a, const SolveOutcome& b) {
+    std::string d;
+    auto f = [&](bool same, const char* name) {
+        if (!same) d += std::string(d.empty() ? "" : ",") + name;
+    };
+    f(a.verdict == b.verdict, "verdict");
+    f(a.horizonCut == b.horizonCut, "horizonCut");
+    f(a.deepT == b.deepT, "deepT");
+    f(a.deepX == b.deepX, "deepX");
+    f(a.capHits == b.capHits, "capHits");
+    f(a.workStates == b.workStates, "workStates");
+    f(a.cancelT == b.cancelT, "cancelT");
+    f(a.resimDead == b.resimDead, "resimDead");
+    f(a.resimFirst == b.resimFirst, "resimFirst");
+    f(sameText(a.resimWhy, b.resimWhy), "resimWhy");
+    f(a.resimUid == b.resimUid, "resimUid");
+    f(a.resimObjX == b.resimObjX && a.resimObjY == b.resimObjY, "resimObj");
+    f(a.resimTrig == b.resimTrig, "resimTrig");
+    f(a.resimFrame == b.resimFrame, "resimFrame");
+    f(a.replayDiedT == b.replayDiedT, "replayDiedT");
+    f(a.rejoinT == b.rejoinT, "rejoinT");
+    f(a.rejoinBadT == b.rejoinBadT, "rejoinBadT");
+    f(sameText(a.rejoinBadWhy, b.rejoinBadWhy), "rejoinBadWhy");
+    f(a.needTrigMask == b.needTrigMask && a.needTrigPassed == b.needTrigPassed, "needTrig");
+    f(a.seedRotQ == b.seedRotQ, "seedRotQ");
+    f(a.rotQOrder == b.rotQOrder, "rotQOrder");
+    f(a.coinGates == b.coinGates, "coinGates");
+    f(a.coinNoPrune == b.coinNoPrune, "coinNoPrune");
+    f(a.startRotHit == b.startRotHit && a.startRotGiven == b.startRotGiven
+          && a.startRotMiss == b.startRotMiss, "startRot");
+    f(a.trigWinTouch == b.trigWinTouch && a.trigTotal == b.trigTotal
+          && a.trigRelevantN == b.trigRelevantN && a.trigKept == b.trigKept
+          && a.trigDroppedRelevant == b.trigDroppedRelevant
+          && a.trigDroppedBehind == b.trigDroppedBehind
+          && a.trigDroppedAhead == b.trigDroppedAhead && a.trigMaxKeptX == b.trigMaxKeptX
+          && a.trigMapSig == b.trigMapSig, "trig");
+    f(a.unsupported == b.unsupported, "unsupported");
+    return d;
+}
+
+std::mutex g_checkM;
+std::string g_checkLast;   // the last comparison's line, until the caller takes it
+long long g_checked = 0, g_differed = 0;
+
+void besideCheck(int rc) {
+    if (g_beside.th.joinable()) g_beside.th.join();
+    second::takeOutput();   // this copy printed its own
+    std::string d;
+    auto add = [&](const std::string& s) { d += std::string(d.empty() ? "" : " ") + s; };
+    if (rc != g_beside.rc) add("rc " + std::to_string(rc) + "/" + std::to_string(g_beside.rc));
+    const std::string side = sidePath(g_beside.out);
+    // A plain search that writes no plan leaves the last attempt's in this copy's files and none
+    // in the side files: said as such rather than compared.
+    std::error_code ec;
+    if (!std::filesystem::exists(side, ec)) {
+        add("noplan-beside");
+    } else {
+        if (!sameFile(g_beside.out, side)) add("plan");
+        if (!sameFile(g_beside.out + ".trace.csv", side + ".trace.csv")) add("trace");
+    }
+    const std::string od = outcomeDiff(outcome(), second::outcome());
+    if (!od.empty()) add("outcome(" + od + ")");
+    removeSideFiles(g_beside.out);
+    const std::string line = d.empty() ? std::string("capladder: beside check: same")
+                                       : "capladder: beside check: DIFFERS " + d;
+    std::printf("%s\n", line.c_str());
+    std::fflush(stdout);
+    std::lock_guard<std::mutex> g(g_checkM);
+    ++g_checked;
+    if (!d.empty()) ++g_differed;
+    g_checkLast = line + " (" + std::to_string(g_differed) + " of " + std::to_string(g_checked)
+                  + " differ so far)";
+}
+
+}  // namespace
+
+void plainBeside(int mode) {
+    g_beside.enabled = mode > 0;
+    g_beside.gamble = mode == 3;
+    if (mode > 0)
+        dp::g_plainElsewhere = dp::PlainElsewhere{besideStart, besideTake, besideDrop,
+                                                  mode == 2 ? besideCheck : nullptr,
+                                                  mode == 3 ? besideReady : nullptr};
+    else
+        dp::g_plainElsewhere = dp::PlainElsewhere{};
+}
+
+std::string besideCheckTaken() {
+    std::lock_guard<std::mutex> g(g_checkM);
+    std::string s;
+    s.swap(g_checkLast);
+    return s;
 }
 
 void checkSubscribe(bool on) {
@@ -151,9 +381,11 @@ bool passCheckpoint(unsigned long long call, std::size_t index) {
 
 void cancelSearch(bool on) {
     dp::g_check.cancel.store(on, std::memory_order_release);
+    second::cancel(on);   // and the plain search beside the ladder, if one is running
 }
 long long envKillsTotal() {
-    return dp::g_envKills.load(std::memory_order_relaxed);
+    return dp::g_envKills.load(std::memory_order_relaxed)
+           + g_besideKills.load(std::memory_order_relaxed);
 }
 std::string coreVersion() {
     // No version string exists in dp/ yet; the compile stamp of this TU is what identifies

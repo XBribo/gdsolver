@@ -11,7 +11,9 @@ out to carry an extra `dparg` that nobody had meant to keep, and every compariso
 had been read as if the only difference were the flag under test. So the run writes down what
 it was, and the comparison reads that record instead of the folder names:
 
-  head / dirty     the commit the driver ran from, and whether tracked files were modified
+  head / dirty     the commit the package was built from and whether tracked files were
+                   modified -- from the build's provenance.json when it matches the package,
+                   else the checkout the driver ran from (driver_head / driver_dirty keep that)
   mod / sha256     the package the workers loaded (the pinned copy, hashed before the run)
   cfg              every autorun.cfg key the workers were given: the driver's fixed ones and
                    the run's own, in order
@@ -26,6 +28,9 @@ it was, and the comparison reads that record instead of the folder names:
   sources          per level, where it came from and a hash of its content (`levelsource:`:
                    main / file / saved), so the same ID from different level data is not
                    compared as the same run
+  ride_pairing     per level, the anchored solver calls counted by the hist payload's version
+                   (4 carries the slope ride's facts) against dp's ride consumer for that call;
+                   `check` refuses a call where the two disagree
 
 `compare` refuses (exit 2) when the two runs differ in anything but the cfg keys named with
 --allow: a different commit or package (unless --allow-binary), a dirty tree, another
@@ -63,6 +68,11 @@ IMPLIED = {"grouptrace": ("dpsolve", "1")}   # a solve records its moving geomet
 # not, so two runs of the same configuration produce the same record.
 PER_CALL = {"--out", "--start", "--startband", "--anchor-state", "--touchentered", "--spentorb",
             "--startrotq", "--coinmask", "--bandtrackend", "--rejoinafter", "--rejoinwatch"}
+# The anchor's ride facts are one unit in two halves: the mod's cfg histride writes them (hist
+# payload version 4) and dp's --anchorride consumes them. Counted per anchored call, so a run
+# where the two disagree -- a recording nobody reads, or a consumer given a payload without the
+# facts -- is visible in the record rather than inferred from the cfg.
+HIST_VERSION = re.compile(r"--anchor-state \S*?\bhist=(\d+)\|")
 
 
 def _git(*args: str) -> str:
@@ -70,13 +80,40 @@ def _git(*args: str) -> str:
                           cwd=Path(__file__).resolve().parent).stdout.strip()
 
 
+def read_provenance(mod: Path) -> dict | None:
+    """The build's own record of what it was built from (`provenance.json` beside the package:
+    commit, tree, dirty, mod_sha256, leveldp_sha256), or None when there is none or it is not
+    this package's. A package run from another checkout -- an arm's copy, a detached worktree
+    -- keeps its identity this way; the checkout the driver runs from says nothing about it."""
+    p = Path(mod).with_name("provenance.json")
+    try:
+        prov = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    sha = hashlib.sha256(Path(mod).read_bytes()).hexdigest()
+    if str(prov.get("mod_sha256", "")).lower() != sha:
+        print(f"  {p} is not this package's (its mod_sha256 {str(prov.get('mod_sha256'))[:12]}"
+              f" against {sha[:12]}): the manifest keeps the driver's head")
+        return None
+    return prov
+
+
 def start(out_dir: Path, *, mod: Path, cfg: list[str], levels: list[int], arrangement: str,
-          resolution: int | None, coins: bool | None) -> dict:
+          resolution: int | None, coins: bool | None, build: dict | None = None) -> dict:
     """The part known before the run, written at once: the package is hashed here, before a
-    build that lands mid-run could change what a later hash reads."""
+    build that lands mid-run could change what a later hash reads.
+
+    `build` is the package's provenance (read_provenance). With it, head and dirty are the
+    BUILD's, and the checkout the driver ran from is kept apart as driver_head -- so two runs
+    of one package from different checkouts compare as the same package, and a run of another
+    package from the same checkout does not pass as the same commit."""
+    driver_head = _git("rev-parse", "HEAD")
+    driver_dirty = bool(_git("status", "--porcelain", "--untracked-files=no"))
     m = {"written": time.strftime("%Y-%m-%d %H:%M:%S"), "t0": time.time(),
-         "head": _git("rev-parse", "HEAD"),
-         "dirty": bool(_git("status", "--porcelain", "--untracked-files=no")),
+         "head": build["commit"] if build else driver_head,
+         "dirty": bool(build["dirty"]) if build else driver_dirty,
+         "driver_head": driver_head, "driver_dirty": driver_dirty,
+         "build": build,
          "mod": str(mod), "mod_sha256": hashlib.sha256(Path(mod).read_bytes()).hexdigest(),
          "cfg": list(cfg), "coins": {True: "on", False: "off", None: "neither"}[coins],
          "arrangement": arrangement, "resolution": resolution,
@@ -111,6 +148,25 @@ def solver_flags(log: str) -> dict | None:
         else:
             out[t] = keep
         i += 2 if val is not None else 1
+    return out
+
+
+def ride_pairing(log: str, consumer_default: bool) -> dict:
+    """Per anchored solver call: the hist payload's version (4 carries the ride's facts, below
+    4 does not) against whether dp's consumer was on for that call (its built-in default, then
+    --anchorride / --no-anchorride in argv order). Four counts; the two mixed ones must be 0."""
+    out = {"v4_on": 0, "v4_off": 0, "old_on": 0, "old_off": 0}
+    for args in ARGS_LINE.findall(log):
+        v = HIST_VERSION.search(args)
+        if not v:
+            continue
+        on = consumer_default
+        for t in args.split():
+            if t == "--anchorride":
+                on = True
+            elif t == "--no-anchorride":
+                on = False
+        out[("v4" if int(v.group(1)) >= 4 else "old") + ("_on" if on else "_off")] += 1
     return out
 
 
@@ -163,6 +219,8 @@ def finish(out_dir: Path, logs: dict[int, Path]) -> dict:
                 m.setdefault("sources", {})[str(lv)] = {"kind": src[0][1], "sig": src[0][2],
                                                         "bytes": int(src[0][3])}
             e = effective(text)
+            m.setdefault("ride_pairing", {})[str(lv)] = ride_pairing(
+                text, bool(e) and e["dp"].get("g_anchorRide") == "1")
             if e is None:
                 continue
             cfg = {k: v for k, v in e["cfg"].items() if k not in PER_LEVEL_KEYS}
@@ -294,6 +352,17 @@ def check(m: dict, expect: list[str], expect_dp: list[str], allow: set[str]) -> 
             refuse.append(f"lv{lv}: its effective cfg differs from the first level's")
         if e["dp_fnv"] != m.get("dp_fnv"):
             refuse.append(f"lv{lv}: core defaults {e['dp_fnv']} differ from {m.get('dp_fnv')}")
+    ride = m.get("ride_pairing") or {}
+    tot = {k: sum(p[k] for p in ride.values()) for k in ("v4_on", "v4_off", "old_on", "old_off")}
+    print("anchored calls, hist payload x ride consumer: "
+          + " ".join(f"{k}={v}" for k, v in tot.items()))
+    for lv, p in sorted(ride.items(), key=lambda kv: int(kv[0])):
+        if p["v4_off"]:
+            refuse.append(f"lv{lv}: {p['v4_off']} anchored call(s) carried the ride's facts "
+                          "(hist version 4) with dp's consumer off")
+        if p["old_on"]:
+            refuse.append(f"lv{lv}: {p['old_on']} anchored call(s) ran dp's ride consumer on a "
+                          "payload without the ride's facts (cfg histride and --anchorride disagree)")
     wmap = _cfg_map(m["cfg"])
     written = set(wmap)
     unexplained: dict = {}

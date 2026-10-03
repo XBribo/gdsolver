@@ -363,16 +363,24 @@ inline bool rampMayVetoSolid(const Obj* R, const Obj* o) {
 // slopeVetoesSolid over the ramps [rb, re). The answer is "some ramp in the
 // range vetoes", with no other effect, so any range that keeps every ramp
 // passing rampMayVetoSolid gives the same answer as the whole list.
+// `noPartner`: the solid is preSlopeCollision's thin rect, handed over with a null partner
+// object (--preslopesolid) -- GD's bypass of the x filter below reads `partner == NULL`.
+// `notInMap`: a ramp that is not in GD's slope map on this tick, so it cannot veto (see the
+// caller that passes it); null for every other caller.
+// `wasOnSlope`: GD's m_wasOnSlope as the caller knows it (--lawcontact: the slope law seated the
+// body last tick), the bypass's second term below; false for every other caller.
 inline bool slopeVetoesSolidIn(const Obj* o, const Obj* const* rb,
                                const Obj* const* re,
                                double px, double py, double pHalfW, double pHalfH,
                                bool faceIsTop, double prevX, double prevY,
-                               int curSlopeUid) {
+                               int curSlopeUid, bool noPartner = false,
+                               const Obj* notInMap = nullptr, bool wasOnSlope = false) {
     if (o->type != 0) return false;
     const double sx0 = o->cx - o->hw, sx1 = o->cx + o->hw;
     const double sy0 = o->cy - o->hh, sy1 = o->cy + o->hh;
     for (const Obj* const* rp = rb; rp != re; ++rp) {
         const Obj* R = *rp;
+        if (R == notInMap) continue;
         // A spiked ramp is NOT skipped. GD's scan has no kind filter and no
         // direction filter, and slopeYPos already carries the hazard's own +-4
         // shift (0x623748 / 0x622E90) -- which reaches here for free, because
@@ -410,7 +418,7 @@ inline bool slopeVetoesSolidIn(const Obj* o, const Obj* const* rb,
         // partner == NULL || ramp == m_currentSlope`, and the first two are the
         // acquisition of THIS tick and the last one, not a ride window.
         const bool cont = (R->uid == curSlopeUid);
-        if (!(cont
+        if (!(noPartner || cont || wasOnSlope
               || slopeWouldAcquire(R, px, py, pHalfH, cont)
               || slopeWouldAcquire(R, prevX, prevY, pHalfH, cont))) {
             const double rx0 = R->cx - R->hw, rx1 = R->cx + R->hw;
@@ -431,11 +439,12 @@ inline bool slopeVetoesSolidIn(const Obj* o, const Obj* const* rb,
 inline bool slopeVetoesSolid(const Obj* o, const std::vector<const Obj*>* slopes,
                              double px, double py, double pHalfW, double pHalfH,
                              bool faceIsTop, double prevX, double prevY,
-                             int curSlopeUid) {
+                             int curSlopeUid, bool noPartner = false,
+                             const Obj* notInMap = nullptr, bool wasOnSlope = false) {
     if (!slopes) return false;
     return slopeVetoesSolidIn(o, slopes->data(), slopes->data() + slopes->size(),
                               px, py, pHalfW, pHalfH, faceIsTop, prevX, prevY,
-                              curSlopeUid);
+                              curSlopeUid, noPartner, notInMap, wasOnSlope);
 }
 
 // The ramps each solid of a window can be vetoed by, worked out once per
@@ -488,7 +497,6 @@ inline double slopeExitVy(double m, uint8_t mode, float dxF, bool mini) {
     // 7.405 * (1.6142578 / 1.29825044) = 9.2074. The jump's own ratio (1.0215)
     // would have given 7.564, i.e. 1.6 vy short, which is what the model kept
     // planning the rest of lv16's ramp section with.
-    const double sp = dxF / kDxF;
     // THREE ANCHORS, MEASURED DIRECTLY on a purpose-built calibration map
     // (2026-08-17, py/mklevel.py `ramps` + py/calib_extract.py: 48 units, one
     // zero-input run, 48/48 clean exits). The official 22 levels contain only
@@ -505,11 +513,20 @@ inline double slopeExitVy(double m, uint8_t mode, float dxF, bool mini) {
     // mode split (lv22 t=18,568: 10.507 * sp(1.24268) = 13.057 against GD's
     // 13.064, +0.05%, where the swing-derived 10.402 was 1.1% out), so the
     // split is gone and every mode shares one table again.
-    const double cubeExit = (a <= 0.5)
-        ? 3.999 * (a / 0.5) * sp
-        : (a <= 1.0)
-            ? (3.999 + (7.405 - 3.999) * (a - 0.5) / 0.5) * sp
-            : (7.405 + (10.507 - 7.405) * (a - 1.0)) * sp;
+    // --slopevelexact [2026-09-28]: THE FORMULA, read off collidedWithSlopeInternal
+    // (0x390a1e-0x390a82, frozen exe): m_slopeVelocity = 1.4 * rate * min(1.1, 0.8 / theta),
+    // rate = objH / (objW / (playerSpeed * speedMultiplier)) (0x38fa4e) and theta =
+    // atanf(objH / objW) (0x38fcd2), all in float; constants 1.4 / 1.1 / 0.8 at 0x622cd8 /
+    // 0x622c54 / 0x622ba4. playerSpeed * speedMultiplier is 4 * dx per tick (dx at normal
+    // speed 1.29825 = 0.9 * 5.770002 / 4). It reproduces all three anchors below --
+    // 3.99865 / 7.40546 / 10.50661 against 3.999 / 7.405 / 10.507 -- and the fast-speed
+    // 9.2074, so the table was this curve rounded to three digits; the rounding shows as a
+    // 0.001 launch error, which a custom level carried 136 ticks into a 0.033 px offset
+    // that crossed an acquisition edge a tick early.
+    // (The three anchors, scaled by dxF / kDxF, were the curve before --slopevelexact; the
+    // formula is the only one since the 2026-10 slope clean-up.)
+    const double cubeExit = (double)(1.4f * ((float)a * (4.0f * std::fabs(dxF)))
+                                     * std::min(1.1f, 0.8f / std::atan((float)a)));
     if (mode == 2) {
         // BALL = CUBE x 0.75. Disassembled (collidedWithSlopeInternal
         // 0x390AE0, 2.2081): m_slopeVelocity is computed mode-agnostically and

@@ -93,7 +93,7 @@ sys.path.insert(0, str(_PY.parent / "mcp"))
 from gdtas.solveutil import (has_grouped_colliders, grounded_of, held_before,
                              FLYING, MODE_ID)
 from fidelity_diff import groups_args, model_replay, gd_cut_tick, gd_replay
-from gdmcp.data import diff_trace
+from gdmcp.data import best_attempt_rows, diff_trace
 from gdtas import inputguard
 from gdtas import runtmp
 from gdtas.paths import DATA, LEVEL_DATA, LEVELDP_EXE, WORKERS_ROOT
@@ -127,8 +127,10 @@ REF_COLS = ["attempt", "tick", "x", "y", "yvel", "mode", "vsize",
             "snapuid", "snapdist", "gframe", "ctrlOff", "rot"]
 
 
-def ctrlwin_args(level: int) -> list[str]:
+def ctrlwin_args(level: int, gd: dict[int, dict] | None = None) -> list[str]:
     """Build `--ctrlwin t0:t1,...` from the ctrlOff column of the GD reference.
+
+    `gd` is read_ref(level) when the caller already holds it.
 
     THE MODEL CANNOT DERIVE LOSS OF CONTROL (id 2899 / Options trigger) ON ITS
     OWN. Which x crossing makes GD raise it is unsolved (however many times the
@@ -140,7 +142,8 @@ def ctrlwin_args(level: int) -> list[str]:
     GD ignores the button entirely, while the model alone was jumping
     (fixcensus's `m0/mini0/g1/gdg1/sp0.9/air/in1` = edvy -11.180).
     """
-    gd = read_ref(level)
+    if gd is None:
+        gd = read_ref(level)
     wins, t0 = [], None
     for t in sorted(gd):
         on = gd[t].get("ctrlOff") == "1"
@@ -187,6 +190,48 @@ def read_ref(level: int) -> dict[int, dict]:
             except (KeyError, ValueError, TypeError):
                 continue
     return rows
+
+
+class LevelRows:
+    """A level's reference, parsed once and shared by all of that level's sections.
+
+    The section pool used to parse it again for every section: diff_trace read
+    REF/lv<N>.csv from disk for each of the ~1,100 sections, ~70 ms of pure
+    Python apiece, and the GIL serialises that across the pool. Measured
+    2026-09-30 (22 levels, 6 threads): 586 s of thread time in a 210 s run, as
+    much as the solver calls themselves. One level's rows are ~35 MB (lv20), so
+    they are not all held at once: the first section that asks loads the level,
+    and its last section's release drops it. With the jobs in level order that
+    keeps two or three levels in memory.
+
+    The rows are only read -- every section of a level gets the same dict.
+    """
+
+    def __init__(self, load, sections: dict[int, int]):
+        self._load = load
+        self._left = dict(sections)      # level -> sections that have not released
+        self._rows: dict[int, dict] = {}
+        self._loading = {lv: threading.Lock() for lv in self._left}
+        self._lock = threading.Lock()
+
+    def get(self, level: int) -> dict:
+        with self._loading[level]:
+            rows = self._rows.get(level)
+            if rows is None:
+                rows = self._rows[level] = self._load(level)
+            return rows
+
+    def release(self, level: int) -> None:
+        """Called once per section, whether or not it asked for the rows."""
+        with self._lock:
+            self._left[level] -= 1
+            if self._left[level] == 0:
+                self._rows.pop(level, None)
+
+
+def ref_rows(level: int) -> dict[int, dict]:
+    """What diff_trace reads out of REF/lv<N>.csv, for LevelRows to hold."""
+    return best_attempt_rows(REF / f"lv{level}.csv")
 
 
 def robot_hover_left(t: int, r: dict, ref: dict, held: int) -> int:
@@ -718,7 +763,7 @@ def seg_jobs(level: int, a) -> tuple[dict, list]:
     if obb.exists():
         common += ["--obb", str(obb)]
     common += groups_args(plan)
-    common += ctrlwin_args(level)
+    common += ctrlwin_args(level, gd)
     # ...and whatever arm this run is. deathref has carried one of these since
     # it started measuring flags; this one did not, so an arm that only shows
     # up at an ANCHOR -- the auto-window gate, the rotation seed, anything
@@ -746,6 +791,11 @@ def seg_jobs(level: int, a) -> tuple[dict, list]:
             args += band_track_args(level, gd)
             args += rot_anchor_args(level, t)
             args += pad_anchor_args(level, t, gd)
+            # --xtrack-ref: the reference run's own x per tick, for dp's --xtrack (the loop
+            # passes the anchor attempt's rows; the sections are anchored on this file's rows,
+            # and the first crossing of any x behind the anchor lies at or before t0).
+            if getattr(a, "xtrack_ref", False):
+                args += ["--xtrack", str(REF / f"lv{level}.csv")]
             jobs.append({"level": level, "t0": t, "args": args,
                          "t1": min(t + a.seg_len, cut),
                          "trace": Path(str(base) + ".trace.csv")})
@@ -754,8 +804,11 @@ def seg_jobs(level: int, a) -> tuple[dict, list]:
     return out, jobs
 
 
-def run_seg(job: dict, a) -> tuple[int, int, int, int]:
+def run_seg(job: dict, a, refs: LevelRows | None = None) -> tuple[int, int, int, int]:
     """Run one section and return (level, t0, TICKS IT HELD OUT, exit code).
+
+    `refs` hands over the level's reference rows already parsed; without it the
+    reference is read from disk for this section alone.
 
     What is measured is not "the number of diverging ticks" but "THE NUMBER OF
     TICKS UNTIL THE FIRST DIVERGENCE". The former saturates at the window
@@ -788,7 +841,8 @@ def run_seg(job: dict, a) -> tuple[int, int, int, int]:
         err = (p.stderr or b"").decode("utf-8", "replace").strip()
         err = " | ".join(err.splitlines()[-3:])[-300:]
     d = diff_trace(job["trace"], REF / f"lv{job['level']}.csv", t0=job["t0"],
-                   t1=job["t1"], tol=a.tol, limit=10 ** 9)
+                   t1=job["t1"], tol=a.tol, limit=10 ** 9,
+                   dump_rows=refs.get(job["level"]) if refs else None)
     span = job["t1"] - job["t0"]
     if "error" in d or not d["rows"]:
         return job["level"], job["t0"], span, (p.returncode, err)
@@ -1023,9 +1077,16 @@ def run_segments(a, extra=None):
     by_lv = {r["level"]: r for r in now}
     holds: dict[int, list] = {lv: [] for lv in by_lv}
     extras: list = []
+    per_level: dict[int, int] = {}
+    for j in jobs:
+        per_level[j["level"]] = per_level.get(j["level"], 0) + 1
+    refs = LevelRows(ref_rows, per_level)
 
     def one(j):
-        res = run_seg(j, a)
+        try:
+            res = run_seg(j, a, refs)
+        finally:
+            refs.release(j["level"])
         return res, (extra(j) if extra else None)
 
     crashed: dict[int, list] = {lv: [] for lv in by_lv}
@@ -1101,6 +1162,9 @@ def main(argv=None) -> int:
                     help="extra leveldp flag for every section, repeatable; "
                          "write it as --extra-flag=--trigwinsel, or argparse "
                          "reads the value as an option of its own")
+    ap.add_argument("--xtrack-ref", action="store_true",
+                    help="give every section dp's --xtrack from the reference csv: the "
+                         "autonomous triggers behind the anchor are dated by GD's own x")
     ap.add_argument("--with-fixups", action="store_true")
     ap.add_argument("--tmp", default=None,
                     help="where the section traces are written. THE DEFAULT IS "

@@ -1,5 +1,6 @@
 // The play menu: the popup a level's play button opens, where the session's mode is chosen.
 #include "mod/playlayer_helpers.hpp"
+#include "mod/level_warnings.hpp"
 #include <Geode/modify/LevelInfoLayer.hpp>
 #include <Geode/modify/LevelPage.hpp>
 #include <Geode/modify/EditLevelLayer.hpp>
@@ -45,6 +46,12 @@ struct LevelFacts {
     bool platformer = false;
     int coins = 0;
     bool random = false;   // uses the game's random numbers (isRandomObject)
+    // What the model cannot express (red) and whether it holds objects from 2.0 on (yellow,
+    // custom levels only) -- see level_warnings.hpp.
+    uint32_t unmodelled = 0;
+    bool newer = false;
+    bool official = false;   // a main level (GJLevelType::Main), where the yellow note is not shown
+    std::string newerIds = "none";   // which objects from 2.0 on, for the log (newerSummary)
 };
 
 // The key's value in a "k,v,k,v" run, or empty.
@@ -88,6 +95,7 @@ inline bool isRandomObject(std::string_view obj, std::string_view id) {
 
 inline LevelFacts readLevel(GJGameLevel* level, bool mainLevel) {
     LevelFacts f;
+    f.official = level->m_levelType == GJLevelType::Main;
     // The main-level wheel builds its levels without their string (LevelSelectLayer::init asks
     // getMainLevel for none); LevelPage::playStep3 fetches it from LocalLevelManager just before
     // the level starts, and so does this.
@@ -121,6 +129,10 @@ inline LevelFacts readLevel(GJGameLevel* level, bool mainLevel) {
         if (!f.random && isRandomObject(obj, id)) f.random = true;
         pos = end;
     }
+    const auto w = levelwarn::scan(all, f.platformer);
+    f.unmodelled = w.unmodelled;
+    f.newer = w.newer;
+    f.newerIds = levelwarn::newerSummary(w);
     return f;
 }
 
@@ -141,6 +153,12 @@ inline const char* describe(int mode, bool coins) {
 inline const cocos2d::ccColor3B kWhite{255, 255, 255};
 inline const cocos2d::ccColor3B kDim{110, 110, 110};
 inline const cocos2d::ccColor3B kRefused{255, 140, 140};
+// The notes under the Coins row: red for what the model cannot express, yellow for the newer
+// objects it is still being measured against, and a plain blue for the random-number line, which
+// states a fact rather than warning.
+inline const cocos2d::ccColor3B kWarnRed{255, 100, 100};
+inline const cocos2d::ccColor3B kWarnYellow{255, 215, 70};
+inline const cocos2d::ccColor3B kInfoBlue{160, 205, 255};
 
 class Popup : public geode::Popup {
 public:
@@ -162,24 +180,90 @@ protected:
     cocos2d::CCLabelBMFont* m_desc = nullptr;
     CCMenuItemToggler* m_coinToggle = nullptr;
     cocos2d::CCLabelBMFont* m_coinLabel = nullptr;
+    bool m_glitch = false;
+    CCMenuItemToggler* m_glitchToggle = nullptr;
+    cocos2d::CCLabelBMFont* m_glitchLabel = nullptr;
     cocos2d::CCLabelBMFont* m_note = nullptr;
     cocos2d::CCLabelBMFont* m_rngNote = nullptr;
+    cocos2d::CCLabelBMFont* m_redNote = nullptr;
+    cocos2d::CCLabelBMFont* m_yellowNote = nullptr;
+    cocos2d::CCLabelBMFont* m_versionNote = nullptr;
+    cocos2d::CCLabelBMFont* m_glitchNote = nullptr;
+    int m_levelId = 0;
     ButtonSprite* m_startSpr = nullptr;
     CCMenuItemSpriteExtra* m_startBtn = nullptr;
 
-    // The layout, top to bottom, as offsets from the popup's centre (260 high): the title and
-    // the level's name, the mode row, the description, the Coins row, the bot note, Start. Each
-    // row keeps clear of the next at its tallest -- the description is two lines, the checkbox
-    // is taller than its label -- which the first cut (230 high) did not: the checkbox sat on
-    // the bot note.
-    static constexpr float kW = 340.f, kH = 260.f;
-    static constexpr float kModeY = 42.f, kDescY = 2.f, kCoinY = -34.f;
+    // The layout, top to bottom: the title and the level's name, the mode row, the description,
+    // the Coins row (offsets from the top edge), then from the bottom edge up Start, the bot note
+    // and the level's notes, one row each. Each row keeps clear of the next at its tallest -- the
+    // description is two lines, the checkbox is taller than its label -- which the first cut (230
+    // high) did not: the checkbox sat on the bot note. With one note the popup is 260 high; each
+    // further note adds a row to it, so the notes never climb into the checkbox rows. The "Avoid
+    // glitches" row under Coins (Solve only) adds one more row of height, 26 below (284).
+    // The "Solve faster (not reproducible)" row that sat between them is gone from the menu (the
+    // user's call, 2026-10-01); the mod setting solve-gamble still sets it, on the settings page.
+    // Even so the popup can be taller than the screen -- GD's design height is 320, and with
+    // three notes this is 284 + 2 x 14 -- so shrinkToFit scales it down to fit.
+    static constexpr float kW = 340.f, kH = 284.f;
+    static constexpr float kModeY = -88.f, kDescY = -128.f, kCoinY = -164.f;   // from the top edge
+    static constexpr float kGlitchY = -190.f;                                  // ...likewise
     static constexpr float kNoteY = 64.f, kStartY = 32.f;   // from the bottom edge
-    static constexpr float kRngNoteY = 78.f;   // just above the bot note, below the Coins row
+    static constexpr float kNoteRow = 14.f;   // the level's notes stack up from the bot note
+
+    static std::string modVersion() { return Mod::get()->getVersion().toVString(); }
+
+    // The version that filed the stored solution for these coins when it is not this one ("an
+    // earlier version" for a solution filed before versions were written), or "" -- no solution,
+    // or this version's (see solvedWithPath).
+    std::string olderSolve(bool coins) const {
+        const std::string path = uiSolutionPath(m_levelId, coins);
+        std::vector<InputCmd> plan;
+        if (!loadInputsFile(path, plan)) return {};
+        const std::string v = readSolvedWith(path);
+        if (v == modVersion()) return {};
+        return v.empty() ? std::string("an earlier version") : v;
+    }
+
+    // The most notes the menu can show at once: the random-number line, and either red and
+    // yellow (no stored solution for the Coins choice) or the version line (one stored by another
+    // version).
+    int noteCount() const {
+        const int unsolved = (m_facts.unmodelled ? 1 : 0)
+                             + (m_facts.newer && !m_facts.official ? 1 : 0);
+        const int solved = (!olderSolve(false).empty()
+                            || (m_facts.coins > 0 && !olderSolve(true).empty())) ? 1 : 0;
+        // ...and a row kept for the Avoid glitches warning, which comes and goes with its box.
+        return std::max(unsolved, solved) + (m_facts.random ? 1 : 0) + 1;
+    }
+
+    cocos2d::CCLabelBMFont* makeNote(const std::string& text, const cocos2d::ccColor3B& color,
+                                     const char* id) {
+        using namespace cocos2d;
+        auto* l = CCLabelBMFont::create(text.c_str(), "chatFont.fnt");
+        l->setScale(.55f);
+        geode::cocos::limitNodeWidth(l, kW - 30.f, .55f, .3f);
+        l->setColor(color);
+        l->setID(id);
+        m_mainLayer->addChildAtPosition(l, Anchor::Bottom, ccp(0, kNoteY + kNoteRow));
+        return l;
+    }
 
     bool init(GJGameLevel* level, LevelFacts facts, std::function<void()> play) {
         using namespace cocos2d;
-        if (!geode::Popup::init(kW, kH)) return false;
+        m_facts = facts;
+        m_levelId = level->m_levelID.value();
+        if (!geode::Popup::init(kW, kH + kNoteRow * (float)std::max(0, noteCount() - 1)))
+            return false;
+        // ...and the stored solutions the version line is decided from.
+        auto solution = [this](bool coins) -> std::string {
+            const std::string path = uiSolutionPath(m_levelId, coins);
+            std::vector<InputCmd> plan;
+            if (!loadInputsFile(path, plan)) return "none";
+            const std::string v = readSolvedWith(path);
+            return v.empty() ? std::string("stored, version not recorded") : "stored by " + v;
+        };
+        log::info("play menu: lv{} solutions: plain {}, coins {} (this is {})", m_levelId,
+                  solution(false), solution(true), modVersion());
         this->setID("play-menu"_spr);
         m_level = level;
         m_facts = facts;
@@ -221,14 +305,14 @@ protected:
                                                       menu_selector(Popup::onMode));
             btn->setTag(m);
             btn->setID(ids[m]);
-            m_buttonMenu->addChildAtPosition(btn, Anchor::Center,
+            m_buttonMenu->addChildAtPosition(btn, Anchor::Top,
                                              ccp(-100.f + 100.f * m, kModeY));
         }
 
         m_desc = CCLabelBMFont::create("", "chatFont.fnt", 300.f, kCCTextAlignmentCenter);
         m_desc->setScale(.75f);
         m_desc->setID("description"_spr);
-        m_mainLayer->addChildAtPosition(m_desc, Anchor::Center, ccp(0, kDescY));
+        m_mainLayer->addChildAtPosition(m_desc, Anchor::Top, ccp(0, kDescY));
 
         // The checkbox and its label, centred as a pair: the label is one of two lengths.
         const bool haveCoins = m_facts.coins > 0;
@@ -245,9 +329,9 @@ protected:
         // popup, 2026-09-26) -- the toggler's own content size is not the scaled sprite's.
         const float boxW = 18.f, gap = 6.f;
         const float left = -(boxW + gap + m_coinLabel->getScaledContentWidth()) / 2.f;
-        m_buttonMenu->addChildAtPosition(m_coinToggle, Anchor::Center,
+        m_buttonMenu->addChildAtPosition(m_coinToggle, Anchor::Top,
                                          ccp(left + boxW / 2.f, kCoinY));
-        m_mainLayer->addChildAtPosition(m_coinLabel, Anchor::Center,
+        m_mainLayer->addChildAtPosition(m_coinLabel, Anchor::Top,
                                         ccp(left + boxW + gap, kCoinY));
         if (!haveCoins) {
             // Refused, and shown to be: the box greys out and the label says why.
@@ -257,6 +341,24 @@ protected:
                     spr->setColor(kDim);
             m_coinLabel->setColor(kDim);
         }
+        // Avoid glitches: a choice about how Solve searches, so it is only shown there. It keeps
+        // the last Start's choice, like Coins. Under the Coins row.
+        m_glitch = g_uiGlitch;
+        m_glitchToggle = CCMenuItemToggler::createWithStandardSprites(
+            this, menu_selector(Popup::onGlitch), .6f);
+        m_glitchToggle->toggle(m_glitch);
+        m_glitchToggle->setID("glitch-toggle"_spr);
+        m_glitchLabel = CCLabelBMFont::create("Avoid glitches", "bigFont.fnt");
+        m_glitchLabel->setScale(.45f);
+        m_glitchLabel->setAnchorPoint({0.f, .5f});
+        m_glitchLabel->setID("glitch-label"_spr);
+        {
+            const float gLeft = -(boxW + gap + m_glitchLabel->getScaledContentWidth()) / 2.f;
+            m_buttonMenu->addChildAtPosition(m_glitchToggle, Anchor::Top,
+                                             ccp(gLeft + boxW / 2.f, kGlitchY));
+            m_mainLayer->addChildAtPosition(m_glitchLabel, Anchor::Top,
+                                            ccp(gLeft + boxW + gap, kGlitchY));
+        }
 
         // The promise the safety gate makes, where the choice is made (see botDriving).
         m_note = CCLabelBMFont::create("The bot drives: nothing is recorded.", "chatFont.fnt");
@@ -264,12 +366,23 @@ protected:
         m_note->setOpacity(150);
         m_note->setID("bot-note"_spr);
         m_mainLayer->addChildAtPosition(m_note, Anchor::Bottom, ccp(0, kNoteY));
-        m_rngNote = CCLabelBMFont::create("This level uses random numbers: fixed while the bot drives.",
-                                          "chatFont.fnt");
-        m_rngNote->setScale(.55f);
-        m_rngNote->setColor({255, 230, 150});
-        m_rngNote->setID("random-note"_spr);
-        m_mainLayer->addChildAtPosition(m_rngNote, Anchor::Bottom, ccp(0, kRngNoteY));
+        m_rngNote = makeNote("This level uses random numbers: fixed while the bot drives.",
+                             kInfoBlue, "random-note"_spr);
+        // What the model cannot express, named (red); and, on a custom level, objects from 2.0 on
+        // (yellow). Neither refuses the run: see level_warnings.hpp.
+        m_redNote = makeNote("Not modelled by the solver: " + levelwarn::describe(m_facts.unmodelled)
+                                 + ". Unlikely to be solved.",
+                             kWarnRed, "unmodelled-note"_spr);
+        m_yellowNote = makeNote("It uses objects from 2.0 on, where the solver is still being "
+                                "matched to the game: slower, and it may not be solved.",
+                                kWarnYellow, "newer-objects-note"_spr);
+        // A level already solved needs neither; solving it again with another version than the one
+        // that did may still fail, and that is said instead (refresh fills it in).
+        m_versionNote = makeNote("", kWarnYellow, "solved-version-note"_spr);
+        // Avoid glitches narrows the search on purpose, so it can lose the only route there is.
+        m_glitchNote = makeNote("Avoid glitches is experimental: the level is more likely "
+                                "not to be solved.",
+                                kWarnYellow, "glitch-note"_spr);
 
         m_startSpr = ButtonSprite::create("Start", "goldFont.fnt", "GJ_button_01.png", .9f);
         m_startBtn = CCMenuItemSpriteExtra::create(m_startSpr, this,
@@ -280,6 +393,37 @@ protected:
         refresh();
         return true;
     }
+
+    // A popup taller than the screen loses its title and its Start button off the edges: GD's
+    // design height is 320 whatever the window, and the notes add rows to the popup. The scale
+    // that fits it with a margin, about its centre (m_mainLayer's anchor); 1 when it fits. The
+    // close button sits on the top-left corner, 3 below and so mostly above the frame (Popup::init),
+    // and counts: fitting the frame alone left a sliver of it off the top (2026-10-01).
+    float fitScale() const {
+        const float winH = cocos2d::CCDirector::sharedDirector()->getWinSize().height;
+        const float h = m_mainLayer->getContentSize().height;
+        const float btnH = m_closeBtn ? m_closeBtn->getScaledContentSize().height : 30.f;
+        const float over = std::max(0.f, btnH / 2.f - 3.f);   // how far the button rises above
+        const float half = h / 2.f + over;                     // centre to the highest point
+        const float room = winH / 2.f - 6.f;
+        return (half > room && half > 0.f) ? room / half : 1.f;
+    }
+
+public:
+    // FLAlertLayer::show runs the popup's own entrance, an elastic scale from 0.1 to 1 on
+    // m_mainLayer, which would undo any scale set before it. So the same entrance is run again,
+    // to the scale that fits.
+    void show() override {
+        geode::Popup::show();
+        const float s = fitScale();
+        if (s >= 1.f) return;
+        using namespace cocos2d;
+        m_mainLayer->stopAllActions();
+        m_mainLayer->setScale(0.1f * s);
+        m_mainLayer->runAction(CCEaseElasticOut::create(CCScaleTo::create(0.5f, s), 0.6f));
+    }
+
+protected:
 
     // Replay needs a file it can play: one that is there and holds at least one input, which is
     // the test the session itself applies (loadInputsFile).
@@ -294,13 +438,39 @@ protected:
         const bool bot = m_mode != UI_MODE_NORMAL;
         m_coinToggle->setVisible(bot);
         m_coinLabel->setVisible(bot);
+        m_glitchToggle->setVisible(m_mode == UI_MODE_SOLVE);
+        m_glitchLabel->setVisible(m_mode == UI_MODE_SOLVE);
         m_note->setVisible(bot);
         // Saying so here, rather than letting the session find out after the level has loaded,
         // is the point of asking before the level starts.
         const bool ok = m_mode != UI_MODE_REPLAY || hasSolution();
         // A level that draws on the game's random numbers is solved and replayed with them fixed
         // (rngfix): said here, so a replay outside the mod that goes differently is no surprise.
-        m_rngNote->setVisible(bot && m_facts.random);
+        // Above it, what the model cannot express (red) and, on a custom level, objects from 2.0 on
+        // (yellow) -- for a level with no stored solution for the Coins choice. One that has one
+        // was solvable; Solve then says only when another version solved it. The ones shown stack
+        // up from the bot note, red on top.
+        const bool solved = hasSolution();
+        const std::string older = (m_mode == UI_MODE_SOLVE && solved) ? olderSolve(m_coins)
+                                                                      : std::string();
+        if (!older.empty()) {
+            m_versionNote->setString(("Solved with " + older + ". Solving it again with "
+                                      + modVersion() + " may not succeed.").c_str());
+            geode::cocos::limitNodeWidth(m_versionNote, kW - 30.f, .55f, .3f);
+        }
+        float y = kNoteY;
+        for (auto [label, show] :
+             {std::pair{m_rngNote, m_facts.random},
+              std::pair{m_glitchNote, m_mode == UI_MODE_SOLVE && m_glitch},
+              std::pair{m_versionNote, !older.empty()},
+              std::pair{m_yellowNote, !solved && m_facts.newer && !m_facts.official},
+              std::pair{m_redNote, !solved && m_facts.unmodelled != 0}}) {
+            label->setVisible(bot && show);
+            if (bot && show) {
+                y += kNoteRow;
+                label->updateAnchoredPosition(Anchor::Bottom, cocos2d::CCPoint(0.f, y));
+            }
+        }
         m_desc->setString(ok ? describe(m_mode, m_coins)
                              : (m_coins ? "No stored coin solution for this level yet.\n"
                                           "Solve it with Coins on first."
@@ -323,16 +493,26 @@ protected:
         refresh();
     }
 
+    // Same order as onCoins: the toggler has not flipped yet.
+    void onGlitch(CCObject*) {
+        m_glitch = !m_glitchToggle->isToggled();
+        refresh();
+    }
+
     void onStart(CCObject*) {
         if (!m_startBtn->isEnabled()) return;
         g_uiMode = m_mode;
         g_uiCoins = m_coins;
+        // Only a Solve asks; the choice itself is kept for the next one either way.
+        g_uiGlitch = m_mode == UI_MODE_SOLVE && m_glitch;
         g_uiArmedLevel = m_level.data();
         Mod::get()->setSavedValue<int>("play-mode", m_mode);
         if (m_facts.coins > 0) Mod::get()->setSavedValue<bool>("play-coins", m_coins);
-        log::info("play menu: {} lv{}{} ({} coins in the level)", uiModeName(m_mode),
+        if (m_mode == UI_MODE_SOLVE) Mod::get()->setSavedValue<bool>("play-glitch", m_glitch);
+        log::info("play menu: {} lv{}{}{} ({} coins in the level)", uiModeName(m_mode),
                   m_level->m_levelID.value(),
-                  (m_mode != UI_MODE_NORMAL && m_coins) ? " with coins" : "", m_facts.coins);
+                  (m_mode != UI_MODE_NORMAL && m_coins) ? " with coins" : "",
+                  g_uiGlitch ? " avoiding glitches" : "", m_facts.coins);
         // Close first: the game's onPlay may open an alert of its own (no song, high object
         // count), and that alert must not end up underneath this popup.
         auto play = std::move(m_play);
@@ -366,6 +546,11 @@ template <class Layer>
 bool open(Layer* layer, GJGameLevel* level, CCObject* sender, bool mainLevel) {
     const LevelFacts facts = readLevel(level, mainLevel);
     if (facts.platformer) return false;
+    // What the notes were decided from, so a note can be traced back to the objects behind it.
+    log::info("play menu: lv{} checked: not modelled: {}; objects from 2.0 on: {}{}; random "
+              "numbers: {}", level->m_levelID.value(), levelwarn::describeAll(facts.unmodelled),
+              facts.newerIds, facts.official ? " (a main level: yellow not shown)" : "",
+              facts.random ? "yes" : "no");
     Ref<Layer> self = layer;
     Ref<CCObject> from = sender;
     auto* p = Popup::create(level, facts, [self, from] { self->onPlay(from.data()); });
@@ -384,16 +569,17 @@ $on_mod(Loaded) {
     g_uiMode = std::clamp(Mod::get()->getSavedValue<int>("play-mode", UI_MODE_NORMAL),
                           0, UI_MODE_COUNT - 1);
     g_uiCoins = Mod::get()->getSavedValue<bool>("play-coins", false);
+    g_uiGlitch = Mod::get()->getSavedValue<bool>("play-glitch", false);
 }
 
 // The early-outs below are the first tests each onPlay makes, by the offsets the 2.2081 binary
 // tests them at. The asserts tie each to the member the bindings give that offset, so a
 // bindings update that moves one fails here instead of opening the menu over a dead press.
-static_assert(offsetof(LevelInfoLayer, m_isBusy) == 0x1e0);
-static_assert(offsetof(LevelInfoLayer, m_enterTransitionFinished) == 0x275);
-static_assert(offsetof(LevelPage, m_isBusy) == 0x1a0);
-static_assert(offsetof(EditLevelLayer, m_exiting) == 0x1e0);
-static_assert(offsetof(GJGameLevel, m_requiredCoins) == 0x434);
+static_assert(offsetof(LevelInfoLayer, m_isBusy) == gdoff::kLevelInfoBusy);
+static_assert(offsetof(LevelInfoLayer, m_enterTransitionFinished) == gdoff::kLevelInfoTransitionDone);
+static_assert(offsetof(LevelPage, m_isBusy) == gdoff::kLevelPageBusy);
+static_assert(offsetof(EditLevelLayer, m_exiting) == gdoff::kEditLevelExiting);
+static_assert(offsetof(GJGameLevel, m_requiredCoins) == gdoff::kLevelRequiredCoins);
 
 // Online or downloaded levels. onPlay returns at once while busy or before the page has finished
 // coming in, and hands a level that is not downloaded yet to the download; none of those start

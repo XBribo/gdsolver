@@ -51,6 +51,11 @@ UNRESOLVED = {
 SHARED = {
     "touchpayload": ["g_cfg.touchPayload"],
     "portalpayload": ["g_cfg.portalPayload"],
+    "capture": ["g_cfg.researchCapture"],
+    "histride": ["g_cfg.histRide"],
+    "portalpayloadlt": ["g_cfg.portalPayloadLt"],
+    "dpanchorrotstep": ["g_cfg.dpAnchorRotStep"],
+    "dpanchorrot2": ["g_cfg.dpAnchorRot2"],
     "hitboxtrace": ["g_cfg.hitboxTrace"],
     "fieldprobe": ["g_cfg.fieldProbe"],
     "killersite": ["g_cfg.killerSite"],

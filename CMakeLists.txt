@@ -35,15 +35,17 @@ if (GDSOLVER_BUILD_MOD)
     add_library(${PROJECT_NAME} SHARED ${SOURCES})
     # src/mod/*.hpp include each other and the solver/ headers by path from src/
     target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    # ...and dp/src for the solver core (src/mod/dp_bridge.cpp is the only TU that uses it).
+    # ...and dp/src for the solver core (src/mod/dp_bridge.cpp and its second copy,
+    # dp_bridge2.cpp, are the only TUs that use it).
     # Plain signature on purpose: Geode's setup_geode_mod links without keywords, and CMake
     # refuses to mix the two forms on one target.
     target_link_libraries(${PROJECT_NAME} gdsolver_dp)
-    # Match the CLI's code generation for the solver TU. The mod's DP must behave exactly like
+    # Match the CLI's code generation for the solver TUs. The mod's DP must behave exactly like
     # the dev CLI -- that equality is an acceptance criterion, not an aspiration -- so it is
     # compiled with the same inlining budget rather than the mod's default.
     if (MSVC)
         set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/mod/dp_bridge.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/mod/dp_bridge2.cpp
             PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:RelWithDebInfo>:/Ob2>")
     endif()
 

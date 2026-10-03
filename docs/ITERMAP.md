@@ -45,6 +45,26 @@ Where several rounds took the same line the faint tails overlap into a brighter 
 disagreed. This is **where the model was wrong**, and it is the cause the deaths are the symptom of.
 The two are routinely hundreds of pixels apart.
 
+**Search fixup** (grey). A kill record for a death the model dies too: the model is where the game
+was on the tick before the game's death row (within 0.3 px in y and 0.3 px/tick in vy, both
+bodies) and dies on the tick after it, which is when the model reports the same event. The model
+was right there. The round died because the search sent a plan that dies — its own `[SOLVED]` line
+often says so already (`resimdie=`) — and the loop flies such plans on purpose, since flying them
+is how the ladder gets past a stretch. It is counted apart: when there are fixups, the map's
+second line reads `fixups: M where the model was wrong, S a search sent (same death)`. On official
+lv11 with coins, four of the
+run's seven fixups are grey.
+
+The test compares the state and the tick, not the object that killed. On one official run without
+coins, 35 of the 38 grey records where the game named its killer had the model die on the same
+object, 2 on the neighbouring spike of the same row (the player overlaps both on that tick), and 1
+on a neighbouring moving object, left unresolved; for the other 19 the game named no object (a
+solid collision), and the model's cause was a solid's side or the inside of a slope for all 19.
+
+The record is filed all the same, and it is not idle. Keeping it off file was measured: most
+levels flew the same rounds, but official lv22 with coins died ten rounds running at one grey
+tick, where the record ends it in one.
+
 **Veto.** A phantom veto box: a stretch where a tail the model had SOLVED died in the game
 repeatedly, so the loop declared it not a route and forbade the search from planning through it.
 Only the x extent is drawn — the real box also constrains y and mode, but drawing that shape would
@@ -78,7 +98,8 @@ The order matters: find the pillar first, then decide what kind of pillar it is.
    generally poor; concentrated means a specific wall.
 2. **Find the red pillars.** Green and cyan ones cost rounds but made progress.
 3. **Are there amber dots *at* the pillar?** Then the wall itself is a fidelity hole — the model is
-   wrong right there.
+   wrong right there. Grey dots are not: there the model agreed with the game, and the rounds were
+   the search working its way through.
 4. **If not, where are the amber dots?** Fixups well upstream with none at the pillar mean the wall
    is downstream of a drift, and the wall is a symptom. The cause not being at the place you want
    to fix is the normal case, not the exception.
@@ -162,10 +183,12 @@ level=22
 rounds=62
 cleared=1
 death=<round>,<tick>,<x>,<y>,<kind>,<anchorTick>,<anchorX>,<backoff>,<killerId>,<killerUid>
-fixup=<round>,<tick>,<x>,<y>,<kill>
+fixup=<round>,<tick>,<x>,<y>,<kill>,<sameDeath>
 veto=<round>,<x0>,<x1>
 path=<round>,<kind>,<x>,<y>,<x>,<y>,...      one point every 8 ticks
 ```
 
 `kind` is 0 deeper, 1 followed, 2 forced, 3 rewound, 4 wedged. `killerId` / `killerUid` are GD's own
-verdict on the death, latched at `destroyPlayer`.
+verdict on the death, latched at `destroyPlayer`. `sameDeath` is 1 for a search fixup (grey); maps
+written before it existed have no sixth field and read as 0, and so does a map rebuilt from a log
+that predates the `same-death` marker on the `[fixup]` line.

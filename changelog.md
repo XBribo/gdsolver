@@ -1,3 +1,75 @@
+# v0.4.0
+
+ * **Fewer repairs, in about half the time.** Against the one-session runs made
+   before v0.3.2's release, the 22 main levels went from 98 to 54 repairs and from
+   1,215 to 780 s without coins, and from 104 to 70 repairs and 2,065 to 1,057 s
+   with every coin; the 17 spin-off levels from 116 to 80 repairs without coins,
+   and their six coin levels from 204 to 112 repairs and 3,396 to 792 s. Every
+   level still clears cold, with every coin in the coin runs. The results (now in
+   docs/RESULTS.md) split each repair into a divergence (the model and the game came
+   apart before the death) and a search (they agreed, and the plan was wrong):
+   on the main levels more than four in five are search.
+ * **The model rides ramps the way the game does.** Much of this release's model
+   work is on ramps: where two ramps of one surface meet, how a body falling onto a
+   descending ramp is seated, a ship's ride across a seam and onto the band's
+   floor, flipped ships and cubes on ceiling ramps, the launch off a ramp's end,
+   a ball under a ramp's underside, a UFO flapping off a ramp it rode, and the
+   kill rules of spiked ramps. Each was measured against the game first. Dual
+   sections keep each body's own flip and mode clocks, dash and slide; a spider
+   resting on the band's face is supported as the game supports it; a teleport
+   portal fires once per attempt.
+ * **Replays fly from a checkpoint.** The loop's replays take a checkpoint every
+   600 ticks, and a plan that agrees with an earlier attempt up to one of them
+   flies from there instead of from the start (cfg `cpflight`, `cpflight=0` turns
+   it off). A restore puts back the camera, the area effects and the other state
+   a fresh attempt from the checkpoint would see, and a checkpoint is flown only
+   when its attempt started from what an attempt starts from now.
+ * **Most switches the release runs with are no longer switches.** 276 of
+   `leveldp`'s spellings and seven of the mod's `autorun.cfg` keys are gone, so
+   most of the rules v0.4.0 is measured with have no off arm any more (a few older
+   ones keep theirs: docs/ARCHITECTURE.md, section 4.1). The removed ones are
+   refused by name, not ignored: `leveldp` stops with "<spelling> was removed in <commit>; the
+   behaviour is fixed (since <commit>)", and an `autorun.cfg` that names a removed
+   key makes the game refuse to solve, with both commits in `result.txt`.
+ * **The play menu warns before a solve.** A red line names what the model cannot
+   express at all — teleports that move you sideways, keep your height, push you
+   or have several exits, teleport orbs and triggers, the gravity trigger, more
+   gravity portals than the solver can hold, a level that changes from one attempt
+   to the next — and a yellow one marks a custom level that uses objects from 2.0
+   on (in a survey of 300 custom levels, 206 of the 215 that use nothing newer
+   cleared). A level that already has a solution gets neither, and Solve says when
+   another version of the mod filed it. The menu fits the screen.
+ * **The overlay draws its progress bars** as the game's own level bar: how far the
+   run has got, and how far whatever the solve is doing now has got (a search, a
+   recording of the moving geometry, a section search, a flight). A coin solve
+   shows its best coin count. The rows of the overlay column are placed so that
+   none draws over another. The bot badge, which neither F1 nor `hud=0` hides, now
+   names the mod's version (`GDSOLVER BOT v0.4.0 - REPLAY`), so a recording says
+   what produced the run.
+ * **Avoid glitches** (experimental, on the play menu under Solve): the search
+   drops routes that rest on frame-level glitches. It narrows the search on
+   purpose, so it can lose the only route there is, and the menu says so.
+ * **Solve faster (not reproducible)**, in the mod's settings and off by default:
+   the plain search starts beside the cap ladder and is taken as soon as it will
+   do. Usually faster, but the same level can take a different route and time
+   from one solve to the next. Every plan is still flown and judged by the game.
+ * **Level slicing keeps every object's id.** The copy a heavy level is solved on
+   puts a placeholder where each left-out object was, so every object keeps the
+   id it has in the level; area effects that depend on the id order now behave on
+   the copy as they do on the level.
+ * **A section search no longer takes the game down.** An exception inside one
+   gives up that search, not the game, and says where it was thrown; an object at
+   a non-finite position ends the search there.
+ * **An Android build** (android64, GD 2.2081) is published on the releases page as
+   a separate pre-release, as an experiment. It is not supported: the model's physics is Windows GD's, and
+   whether Android GD behaves the same has not been measured. See
+   [docs/ANDROID.md](docs/ANDROID.md).
+ * **For developers.** `py/cold_regress.py --one-session` keeps a per-level
+   deadline and a memory floor inside its game launch (`--level-deadline`,
+   `--mem-floor-gb`), and the run's manifest names what they stopped and the
+   commit its package was built from. The cold baselines are re-taken from the
+   v0.4.0 one-session runs.
+
 # v0.3.2
 
  * **Solving a heavy level from its online page no longer stalls, and Escape no

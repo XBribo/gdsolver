@@ -26,7 +26,9 @@ and GD's own verdicts; the coins and what gates them come out of the level at lo
   passing a coin says nothing and no state is dropped for it.
 - **The few lineages that took a coin are kept.** When the frontier is thinned to the cap, the
   collected set (and which activators have fired) is a class of its own, so a minority that went
-  for a coin is not thinned at the majority's stride.
+  for a coin is not thinned at the majority's stride. In the last 700 px before each coin a state
+  still lacks, the classes are split by (y, vy) cell too (60 px of y by 2 of vy), so a minority
+  route *to* the coin is not thinned away either (cfg `dpcoinwin=60,2,700`, dp `--coinwin`).
 - At a horizon, memory or PARTIAL cut, the emitted state is the first one holding the most coins,
   not simply the first (coin pick).
 
@@ -43,6 +45,10 @@ and GD's own verdicts; the coins and what gates them come out of the level at lo
   died earlier.
 - cfg `coinapproachoff`: the closest approach is also taken over the ticks the coin's group was
   switched off, and the later of the two is used (a route can switch a coin back on).
+- cfg `coinapproachreach`: among the passes made while the coin was off, the *last* one within
+  pickup reach is ranked, not the closest. Official lv22's third coin is off until six presses
+  after a Tap; a route passes it at 1.9 px while it is still off, and again at 23.6 px later, when
+  those presses can already have happened.
 - cfg `dpseccoinrung`: the *coin wall* — where the plan was last cut for a coin — is where the
   section-solve rung goes, and a rung fired there must take that coin.
 - cfg `groupsretime`: the recording of the moving geometry is indexed by tick, and a route that
@@ -64,6 +70,15 @@ have nothing to act on).
   with no gameplay rotation since the head — and only for a coin whose passing is final. A Camera
   Rotate turns the view, not the travel, and its angle is not wrapped: over official lv22's second
   coin it stands at 360.0 in frame 0.
+- **A coin passed while its group is off is not taken.** Passing it is no miss — it is not there
+  to take — but for the coin a rung was started for, it does not count as taken either, per step or
+  at the head (cfg `secrungcoinoff`). SubZero 4003's third coin is off until a Count sees four
+  presses, and without this every leaf of six spliced rungs had "taken" it where GD credited none.
+- **The loop's coin records go back before the level is reset.** A search keeps the loop's
+  per-attempt coin records (pickups, GD's credits, item counters, the miss latch) aside and puts
+  them back when it hands the window back — before the hand-back resets the level, so the reset
+  clears them and the next attempt starts with its own, not the searched attempt's (cfg
+  `secbookfirst`).
 
 ## 4. What a coin needs first
 
@@ -112,10 +127,11 @@ at all past the second key and gave up — that is the case the fallback is for.
 
 ### Defaults
 
-`routeprereq` is off. Only a coin session builds the census, and until a coin is engaged nothing
-reads it: the loop and the solver's arguments are the old ones. With the rest of the coin set on
-by default, SubZero 4001's coin-on run took the same 33 rounds with it on and off, and none of
-the official 22 engaged it; the chain rig below is where it decides the outcome.
+`routeprereq` is on. Only a coin session builds the census, and until a coin is engaged nothing
+reads it: the loop and the solver's arguments are what they are without it. It used to be off:
+with the rest of the coin set on, SubZero 4001's coin-on run took the same 33 rounds with it on
+and off, and none of the official 22 engaged it. The chain rig below is where it decides the
+outcome. It is on now because the release's cold runs ran with it.
 
 ### How the bounds were chosen
 
@@ -156,12 +172,18 @@ At full horizon the search plans the detours itself; planned 1,200 ticks at a ti
 | `coinroute` | 0 | coins are part of the objective (dp `--coins`); the play menu's Coins switch |
 | `coinmissmove` | 1 | the attempt cut spares a coin a Move ahead can still carry (§2) |
 | `coinmisspost` | 1 | a refused clear is filed at the missed coin (§2) |
+| `coinmissearly` | 1 | a coin whose box the attempt went past unopened is filed as missed at that attempt's death, without waiting for a refused clear |
 | `coinoverdepth` | 1 | a plan with a coin the deepest missed is progress |
 | `coinapproachoff` | 1 | closest approach also over the ticks the coin was off |
+| `coinapproachreach` | 1 | of the passes while the coin was off, the last within reach is ranked (§2) |
+| `dpcoinwin` | `60,2,700` | the cap's (y, vy) cells before a coin still lacked (dp `--coinwin`; 0 = off) (§1) |
 | `dpseccoinrung` | 1 | section-solve rungs go to the coin wall and must take the coin |
 | `groupsretime` | 1 | a shallower replay's moving-geometry recording replaces an out-of-phase one |
-| `routeprereq` | 0 | rank a missed coin at its prerequisite's box (§4) |
+| `routeprereq` | 1 | rank a missed coin at its prerequisite's box (§4) |
 | `routeprereqafter` | 10 | rounds after the filing before §4 engages (0 = at once) |
+| `secrungcoinoff` | 1 | a rung's coin passed while its group is off is not taken (§3) |
+| `secbookfirst` | 1 | a section search puts the coin records back before it resets the level (§3) |
 
-dp flags: `--coins`, `--needtrig-uid <uid>`. Activators, spawn roots and coin pick are on by
-default (`--no-activators`, `--no-spawnroots`, `--no-coinpick` turn them off).
+dp flags: `--coins`, `--needtrig-uid <uid>`. Activators, spawn roots and coin pick have no
+switch any more (the 0.4.0 clean-up removed `--no-activators`, `--no-spawnroots` and
+`--no-coinpick`).

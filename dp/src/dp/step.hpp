@@ -138,7 +138,7 @@ struct StepCtx {
 // gives the same answer.
 inline bool vetoOf(const StepCtx& K, const Obj* const& o, double px, double py,
                    double pHalfW, double pHalfH, bool faceIsTop, double prevX,
-                   double prevY, int curSlopeUid) {
+                   double prevY, int curSlopeUid, bool wasOnSlope = false) {
     const SlopeVetoIndex* V = K.veto;
     if (V && K.near && V->near == K.near && V->slopes == K.slopes) {
         const uintptr_t a = (uintptr_t)&o, b = (uintptr_t)K.near->data();
@@ -150,11 +150,11 @@ inline bool vetoOf(const StepCtx& K, const Obj* const& o, double px, double py,
             const Obj* const* rs = V->ramps.data();
             return slopeVetoesSolidIn(o, rs + V->off[i], rs + V->off[i + 1], px, py,
                                       pHalfW, pHalfH, faceIsTop, prevX, prevY,
-                                      curSlopeUid);
+                                      curSlopeUid, false, nullptr, wasOnSlope);
         }
     }
     return slopeVetoesSolid(o, K.slopes, px, py, pHalfW, pHalfH, faceIsTop, prevX,
-                            prevY, curSlopeUid);
+                            prevY, curSlopeUid, false, nullptr, wasOnSlope);
 }
 
 // Why the last `dead = true` fired, and on what. "The frontier died at x=N" on
@@ -412,7 +412,7 @@ inline const gdapprox::UfoParams& ufoParamsFor(float dxF, bool mini,
 inline bool spiderTargetGd(const StepCtx& K, double x, double fromY, bool flip,
                            double pHalf, double searchHalfX, double& outY,
                            bool worldFloor, bool* outHaz, bool rev, bool bandWall,
-                           double bandLo, double bandHi) {
+                           double bandLo, double bandHi, double hazStrip = 4.0) {
     const double gs = flip ? -1.0 : 1.0;
     // A CIRCLE hazard enters the damaging query through its RADIUS box, not
     // through the rect. Swept on 4002 by injecting the player's x before a tap
@@ -447,7 +447,7 @@ inline bool spiderTargetGd(const StepCtx& K, double x, double fromY, bool flip,
         const double lo = o->cx - o->hw, hi = o->cx + o->hw;
         if (o->type != 0) {
             const double hx = hazHalfX(o);
-            if (o->cx + hx < x - 4.0 || o->cx - hx > x + 4.0) continue;
+            if (o->cx + hx < x - hazStrip || o->cx - hx > x + hazStrip) continue;
             if (!haz || (o->cy - haz->cy) * gs < 0.0) haz = o;   // nearest first
             continue;
         }
@@ -526,6 +526,17 @@ inline bool spiderTargetY(const StepCtx& K, double x, double fromY, bool flip,
     if (frame % 2 == 0 && !mini)
         return spiderTargetGd(K, x, fromY, flip, pHalf, searchHalfX, outY, worldFloor,
                               outHaz, rev, bandWall, bandLo, bandHi);
+    // --spiderminigd: ...and at mini size the same search, with the widths GD queried for a mini
+    // spider (hitboxtrace srect:/drect:, a custom level's dual section, a teleport at x=724.428,
+    // pHalf 8.1): the solid strip o=724.428 w=9.100 (the centre to half + 1, the
+    // +1 unscaled -- kSpiderSearchHalfXMini's 14.5 x 0.6 = 8.7 scaled it); the hazard strip
+    // o=722.028 w=4.800 (+-4 x 0.6); with the strip empty and hazards in it, the wide query
+    // o=716.328 w=20.200 (x - half .. x + half + 4, the +4 unscaled) returned block uid5429, and
+    // GD landed the spider on its top (1,020 + 8.1). The legacy window below takes nothing that
+    // far right of the spider, so the model teleported to the band floor 240 px lower.
+    if (frame % 2 == 0 && mini)
+        return spiderTargetGd(K, x, fromY, flip, pHalf, pHalf + 1.0, outY, worldFloor,
+                              outHaz, rev, bandWall, bandLo, bandHi, 4.0 * 0.6);
     double bestY = 0.0;
     bool found = false, bestHaz = false;
     // HAZARDS are searched too, but through their OWN rect. Straight off
@@ -1327,7 +1338,9 @@ inline bool flyRingContact(const Obj* ob, double px, double py, double ph) {
         return false;
     if (ob->oriented) {
         const double rx = px - ob->cx, ry = py - ob->cy;
-        const double lx = rx * ob->rc - ry * ob->rs, ly = rx * ob->rs + ry * ob->rc;
+        // onto the ring's own axes at -rot (see the late ring loop)
+        const double lx = rx * ob->rc + ry * ob->rs;
+        const double ly = -rx * ob->rs + ry * ob->rc;
         const double oph = ph * (std::fabs(ob->rc) + std::fabs(ob->rs));
         if (std::fabs(lx) >= ob->ohw + oph || std::fabs(ly) >= ob->ohh + oph) return false;
     }
@@ -1486,6 +1499,13 @@ inline void applyFlyEarlyRing(State& c, const Obj* ob, float useDx) {
         const double dv = (c.mode == 3) ? kRingDropUfo : kRingDropFly;
         if ((double)c.vy * (c.flip ? -1.0 : 1.0) >= 2.0) c.pNoTerm = 1;
         c.vy = (float)(c.flip ? dv : -dv);
+        // --boostcarry: ringJump's type-0x20 branch ends by raising the velocity-limit exemption
+        // (+0x952 = 1 after the setYVelocity, every mode), so a UFO slammed at 11.2 is not clamped
+        // back to 6.4 on the next tick, and falls on unclamped until the head of the flying branch
+        // finds it inside the band again. A custom level, the 09-30 cold run's attempt 23: a
+        // flipped dual UFO takes a drop ring on t=1,383 (vy 11.2) and GD's rows run 11.286,
+        // 11.372, 11.458 ...; the model clamped at 6.4 from 1,384.
+        c.boost = 1;
     } else if (ob->type == 35 || ob->type == 29) {
         const bool green = (ob->type == 29);
         const double r = green ? ((c.mode == 1) ? kRingGreenShip : kRingGreen)
@@ -1494,7 +1514,7 @@ inline void applyFlyEarlyRing(State& c, const Obj* ob, float useDx) {
         if (green) c.flip = c.flip ? 0 : 1;
         const double ov = g_rawValues ? rawQ(kOrbYellow * r * ms) : kOrbYellow * r * ms;
         c.vy = (float)(c.flip ? -ov : ov);
-        if (!green && boostLatchMode(c.mode)) c.boost = 1;
+        if (!green && true) c.boost = 1;
     } else {
         const double ratio = (ob->type == 12) ? pinkRingRatio(c.mode) : 1.0;
         const double ov = g_rawValues ? rawQ(kCubeJump * ratio * ms) : kOrbYellow * ratio * ms;
@@ -1502,6 +1522,9 @@ inline void applyFlyEarlyRing(State& c, const Obj* ob, float useDx) {
     }
     c.grounded = 0;
     c.rHover = 0;
+    // --a1clatch: ringJump raises +0xa1c for every ring but the drop ring (0x3991f5-0x3991fe).
+    // The ring fired at the end of the previous tick, so this tick's updateJump may lower it again.
+    if (ob->type != 32) c.a1cLatch = (uint8_t)(c.a1cLatch | 1u);
     noteRingFired(c, ob);
     c.ringHold = 1;
     c.pressSpent = 1;
@@ -1509,6 +1532,22 @@ inline void applyFlyEarlyRing(State& c, const Obj* ob, float useDx) {
     // gate (`input && !s.action`) stays shut, as ringJump's spent +0x986 keeps GD's shut.
     c.action = 1;
     c.jumpBuf = 0;
+}
+
+// --a1clatch: PlayerObject::playerIsFallingBugged (0x39a430, the whole function), which updateJump
+// asks on every tick +0xa1c is up (0x38c115, and on the flying branch 0x38cb26 on every tick) and
+// which lowers the byte when it answers true. Two arms, vy in world terms and g2 the speed's
+// doubled gravity (accelSwitchVyForSpeed):
+//   fixed   (m_isSideways, platformer, swing or +0x561)   upright vy < g2    flipped vy > -g2
+//   classic                                                upright vy < g2    flipped vy > g2
+// and in a dual (+0xa99) the classic arm's upright side compares against -g2. The classic flipped
+// side does not negate g: a flipped body counts as falling only once it drops toward its ceiling
+// faster than 2g, so one that lands on a ceiling from a slow rise keeps the byte for as long as it
+// stays there. +0x561 is read as the level's fixGravityBug and a rotated frame as m_isSideways,
+// the reading --dropfall takes.
+inline bool a1cFallingBugged(double vy, bool flip, bool dual, bool fixedArm, double g2) {
+    if (fixedArm) return flip ? (vy > -g2) : (vy < g2);
+    return flip ? (vy > g2) : (vy < (dual ? -g2 : g2));
 }
 
 // `linkFlip`, when given, comes back true if a gravity portal actually changed
@@ -1519,6 +1558,64 @@ inline void applyFlyEarlyRing(State& c, const Obj* ob, float useDx) {
 // way for the same reason.
 inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                      bool* linkFlip = nullptr) {
+    // --balltapexit (frames.hpp): a ball that presses on the tick it leaves a ramp with the
+    // uphill launch does not tap. The game handles the buttons after the collision pass, and
+    // postCollision's launch (boostPlayer) has cleared m_isOnGround by then, so the press finds no
+    // ground: the launch stands and gravity is not flipped -- the order the exit already applies
+    // to the cube's jump (exitLoses). The model taps first, from the support the ball stood on at
+    // the start of the tick, and the exit later in the step then reads the flipped gravity and
+    // fires nothing. Three recorded attempts of one plan on a custom level: a flipped mini ball
+    // rides a ceiling ramp (m=-2) to its corner and presses at t=10,075; GD stays upside down with
+    // vy -3.970 (the ball's exit 6.352 x the ramp's 15/24) and y 231.029 (the tick's gravity step
+    // on 231.000), where the model tapped it upright at vy -3.025 and let it fall.
+    // So a fresh press by a ball riding a ramp first steps the tick with the ball's fresh-press
+    // taps held back -- the collision pass as the game runs it, before the buttons -- and keeps
+    // that step when the uphill launch fires in it; otherwise the tick is stepped as before. A
+    // buffered tap (s.jumpBuf) is updateJump's, before the collisions, and is not held back.
+    // The same order may hold for other presses that meet a launch; this is the measured one.
+    if (!g_ballTapNested && s.mode == 2 && input && !s.action
+        && s.onSlope && s.rideLanded && !(!g_ctrlWin.empty() && ctrlOffAt(K.t))) {
+        // the per-tick diagnostics as the caller left them, put back when the re-run is dropped
+        const char* const clampWhy0 = g_clampWhy;
+        const int clampUid0 = g_clampUid;
+        const float clampCx0 = g_clampCx, clampCy0 = g_clampCy;
+        const char* const deadWhy0 = g_deadWhy;
+        const Obj* const deadObj0 = g_deadObj;
+        const float deadCx0 = g_deadCx, deadCy0 = g_deadCy;
+        const uint8_t nearOrb0 = g_nearOrb, dashVySet0 = g_dashVySet;
+        const double dashVy0 = g_dashVy;
+        const bool preBtnSet0 = g_preBtnSet;
+        const double preBtnY0 = g_preBtnY;
+        const int tcBranch0 = g_tcBranch;
+        g_ballTapNested = 1;
+        g_ballTapLaunch = 0;
+        bool deadN = false, flipN = false;
+        State n = stepOne(s, input, K, deadN, linkFlip ? &flipN : nullptr);
+        const bool launched = g_ballTapLaunch != 0;
+        g_ballTapNested = 0;
+        g_ballTapLaunch = 0;
+        if (launched) {
+            dead = deadN;
+            if (flipN) *linkFlip = true;
+            return n;
+        }
+        g_clampWhy = clampWhy0;
+        g_clampUid = clampUid0;
+        g_clampCx = clampCx0;
+        g_clampCy = clampCy0;
+        g_deadWhy = deadWhy0;
+        g_deadObj = deadObj0;
+        g_deadCx = deadCx0;
+        g_deadCy = deadCy0;
+        g_nearOrb = nearOrb0;
+        g_dashVySet = dashVySet0;
+        g_dashVy = dashVy0;
+        g_preBtnSet = preBtnSet0;
+        g_preBtnY = preBtnY0;
+        g_tcBranch = tcBranch0;
+    }
+    // ...and inside that re-run, every site that taps the ball on a fresh press stands down.
+    const bool freshTapHeld = g_ballTapNested != 0;
     // Per STEP, not per tick: the search runs many states through the same tick,
     // and a counter carried between them would report whichever ran last. Zeroed
     // here so `g_vyWrites == 0` means this step wrote vy nowhere -- which is a
@@ -1532,6 +1629,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     g_vpWrites = 0;
     g_impCount = 0;
     g_impulseSite = 0;
+    g_ballTapped = false;   // --repelland: set again below if this step's ball taps
     // ...and the (frame, rev) the step ran in. Counted for EVERY step, not only
     // the ones that consult a fixup, so the fixup census below it has a
     // denominator: "frame 2 never reached a lookup" and "frame 2 never happened"
@@ -1563,7 +1661,14 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     if (!g_ctrlWin.empty() && ctrlOffAt(K.t)) input = 0;
     // The ring a ship or UFO takes fired at the end of the previous tick (speed.hpp, the fly
     // rings), so this tick runs from the state it left.
-    if (!g_flyRingNested && (s.mode == 1 || s.mode == 3) && !s.dual && input
+    // --dualflyring: ...in a dual as well. pushButton runs per player and each body walks its own
+    // touched rings, so a dual ship or UFO takes its ring on the press's own tick like a single one.
+    // A custom level, the 09-30 cold run's attempt 23: a dual UFO (since t=1,264) presses on 1,297
+    // with both bodies in the yellow ring uid 269's box, and GD's row 1,298 has p1 at vy 11.18 and
+    // p2 at -11.18; the model, gated out here, fired it through the late loop on 1,299 and left GD
+    // there (y 234.04 against 234.30 at 1,299). A ring that turns the body's gravity reports it to
+    // the partner under --dualorbflip, as the late loop does.
+    if (!g_flyRingNested && (s.mode == 1 || s.mode == 3) && input
         && !s.jumpBuf && !s.pressSpent && K.orbs) {
         const float ringDx = (s.dx > 0.f) ? s.dx : K.dxF;
         const double stepDx = (double)ringDx * timeWarpAt((double)s.xAbs) * (s.rev ? -1.0 : 1.0);
@@ -1573,6 +1678,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             g_flyRingNested = 1;
             State r = stepOne(s2, input, K, dead, linkFlip);
             g_flyRingNested = 0;
+            if (s.dual && linkFlip && s2.flip != s.flip)
+                *linkFlip = true;
             return r;
         }
     }
@@ -1583,23 +1690,27 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // `action`. Consumers below clear it where GD clears it (the ball's tap, a
     // ring that spends the press).
     c.jumpBuf = (uint8_t)(input ? 1 : 0);
+    bool spawnRingJumpNow = false;   // --spawnringjump: set where a spawn ring takes the press
+    // --ballstake: the ball's stake as it stood before a ring re-staked it this tick, which is what
+    // this tick's spin still turns at (the ball branch)
+    bool ringStakedNow = false;
+    float preRingStep = 0.f;
+    uint8_t preRingNeg = 0;
     // --heldall (speed.hpp): the button level every mode came in with, not only the flying ones
     if (g_heldAll) c.held = (uint8_t)input;
     // --holdlatch: a release, or a fresh press (pushButton sets +0x985), makes the hold live again
     if (!input || !s.action) c.holdDead = 0;
     c.pFlap = 0;   // 1-tick lifetime (see the note on State::pFlap)
+    c.lawSv = 0.f;   // same (State::lawSv)
+    // --portalspidertap: the handed-over press lives while the button stays down
+    c.pSpiderTap = (uint8_t)((s.pSpiderTap && input) ? 1 : 0);
     c.pExitVy = 0.f;  // same (State::pExitVy, r93)
     c.pNoTerm = 0;    // same (State::pNoTerm, r102)
-    // The velocity-limit exemption (State::boost) is carried by the three modes
-    // whose updateJump branch reads GD's byte: ship, UFO and swing
-    // (boostLatchMode, which has the addresses). Outside them nothing here
-    // maintains it, so drop it rather than let a stale bit cross a mode portal.
-    // LEAF: GD does NOT drop it on a mode change. Its byte has no mode test at
-    // any writer and survives a cube section untouched; only the flying band
-    // test and the five other clearers put it down. Nothing in the corpus
-    // enters a cube out of band and comes back to a ship still out of band, so
-    // the two readings are indistinguishable here.
-    if (!boostLatchMode(c.mode)) c.boost = 0;
+    // The velocity-limit exemption (State::boost) is NOT dropped on a mode change: GD's byte has no
+    // mode test at any writer; only the flying band test and the five other clearers put it down.
+    // A custom level, the 09-30 cold run's attempt 4: a flipped spider takes a red pad at t=107, falls
+    // to vy 13.158, and at t=212 takes a UFO portal, halved to 6.644 -- out of the band, so GD's UFO
+    // runs on unclamped (6.730, 6.816, 6.902 ...).
     // ONE float x per state, advanced and snapped exactly as GD does it.
     // It used to be `shared double base + per-state xAdj`, which cannot be exact:
     // GD writes the stair snap straight into the same float it accumulates into,
@@ -1618,6 +1729,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // handed 1.1's constants to states that were still at 0.7.
     const float useDx = (s.dx > 0.f) ? s.dx : K.dxF;
     c.dx = useDx;
+    // --bandfloorunstick: fly/bandcarry put a grounded ship back on the band's floor this tick.
+    bool bandFloorHeld = false;
     // TIME WARP (id 1935). A pure TIMESCALE, not a speed: the x advance, the y
     // integration and the velocity increment are all multiplied by the same
     // factor, while the dump's `speed` column does not move at all. Read off x
@@ -1663,11 +1776,19 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // Used only when a gravity portal at the end of the tick returns to upright,
     // to apply GD's landing on the spot.
     bool rodeFlipped = false;
+    // --portalslopeorder: the gravity portal that flipped this body in the portal pass, if any
+    // (read at the end of the step).
+    int gravFiredUid = -1;
+    // --speedafterseat: the y the ramp pass seated the body at on this tick and the uid of
+    // that ramp (-1: no ramp moved it).
+    double ySeatSp = 0.0;
+    int seatUidSp = -1;
     // [2026-08-21 r66] Whether a ceiling-ramp push-down (upceil) took effect on
     // this tick. Read by the release test at the end of the tick (ceil/release).
     bool ceilPressedNow = false;
     double ceilPressM = 0.0;
     uint8_t ceilPressMode = 0;   // --ceilreleasemode: c.mode at the press site
+    int ceilPressUid = -1;       // --portalpressorder: the ramp that pressed, by uid
     // Reverse travel (State::rev) decreases x. `useDx` is a speed (positive), so
     // the sign is applied to the state-side advance as well. Drop this and only the
     // replay's local `x` goes negative while the state's xAbs keeps growing: it
@@ -1882,6 +2003,12 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // ...and whether that call came from a PAD, which additionally turns the
     // sprite one full step on the tick itself (measurements at the use site).
     bool rotPadSpin = false;
+    // --sloperot: this tick's ramp launch was boostPlayer's, which stakes the cube's spin itself
+    // (State::rotBoost) and turns it on the same tick.
+    bool rotBoostNow = false;
+    // --sloperot: ...and this tick's ramp exit was the downhill release, which stakes the full
+    // spin through runNormalRotation and also turns it on the same tick.
+    bool rotReleaseNow = false;
     // ...and the gravity that pad's call saw. Its own, not rotWriteFlip's: a
     // ring or orb later in the same tick overwrites rotWriteFlip (the assignment
     // inside applyOrb), and the pad's step has to keep the value from its own
@@ -2001,6 +2128,11 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // A blanket "landing site counts from the next tick" breaks lv20; a blanket
     // "same tick" breaks lv21. uid order explains both.
     int teleUid = -1;
+    // --teleoldpos: ...and where it was before it moved -- c.y and the pass's yFree at the
+    // teleport -- for the smaller-uid portals the pass judged first (see the gate in the portal pass).
+    float teleFromY = 0.f, teleFromYFree = 0.f;
+    // ...and where it landed (the portal seat's previous edge under --tponce, see there).
+    double teleLandY = 0.0;
     // The SPIDER's tap moves y discontinuously, and GD's collision pass never
     // looks at the path it did not travel. Set where the teleport lands, read
     // by the hazard sweep below (which otherwise samples s.y -> c.y and kills
@@ -2057,6 +2189,38 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // not the UFO's flap 6.871, and not that flap halved by the portal (3.4355,
     // which is what the model produced). The DP was buying a boost GD refuses.
     bool impulsedThisTick = false;
+    // --jumpafterland: a cube's jump off its support this tick, and vy before it (step.hpp,
+    // the solid landing reads them)
+    bool cubeGroundJumpNow = false;
+    float vyPreGroundJump = 0.0f;
+    // --a1clatch (State::a1cLatch, bit 0 = this body). GD's tick is update -> collisions ->
+    // buttons, and the byte is written in all three, so it is tracked in that order:
+    //   a1cNow      the byte as postCollision reads it at a ramp's exit: last tick's value, then
+    //               this tick's updateJump (its jump block raises it, otherwise the fall test may
+    //               lower it), then the collision pass's head-hit flip
+    //   a1cVyUpd    vy (world) as updateJump leaves it, before the collision pass; the fall test
+    //               reads it. A body that starts the tick on its support takes one gravity step
+    //               of about 0.2 there, which no arm's threshold (+-2g) can tell from 0, so 0
+    //   a1cNoFall   updateJump took its jump block or the spider's tap (a held or buffered press on
+    //               the ground) instead of the path with the fall test
+    //   a1cEarlySet raised before postCollision: that jump block (not the spider's tap, which
+    //               does not write the byte), didHitHead's flip
+    //   a1cJumpLate / a1cLate  raised after the ramp's exit: a jump from a press made on this tick
+    //               (pushButton), a ring, a pad, the ramp's own launch, a gameplay rotation
+    bool a1cNow = (s.a1cLatch & 1) != 0;
+    double a1cVyUpd = 0.0;
+    bool a1cUpUpd = (s.flip != 0);   // the polarity the fall test reads (a swing's flip lands first)
+    bool a1cNoFall = false, a1cEarlySet = false, a1cJumpLate = false, a1cLate = false;
+    // a cube / ball / robot jump made on this tick: from a fresh press (the buttons phase) or from
+    // the level updateJump reads (a held button, the buffer)
+    auto a1cJump = [&]() {
+        if (input && !s.action) {
+            a1cJumpLate = true;
+        } else {
+            a1cNoFall = true;
+            a1cEarlySet = true;
+        }
+    };
     // --portalpress: the grounded press action this tick took (1 cube jump, 2 ball tap), and
     // whether a mode portal undid it for the new mode to redo.
     int pressAction = 0;
@@ -2069,6 +2233,17 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // --lawseatonslope: the --slopelaw seat wrote this body's y on a floor ramp this
     // tick (read where slopeT is computed; see State::seatT).
     bool lawSeatedNow = false;
+    // --lawcontact: the slope law seated this upright body on a floor ramp last tick, so GD's
+    // m_wasOnSlope is set now (the acquisition wrote m_isOnSlope at 0x390750 and checkCollisions
+    // copies it at 0x21388a). State::seatT is that record. Upright, not flying, frame 0: the
+    // measured case.
+    const bool lawWasOn = s.seatT > 0 && !s.onSlope && !s.flip
+                          && s.frame == 0
+                          && (s.mode == 0 || s.mode == 2 || s.mode == 5 || s.mode == 6);
+    // ...and a continuing law contact dropped this tick because its target equals the last one
+    // (0x390425-0x390488), with that ramp's gradient: the exit releases off it.
+    bool lawRepeatDrop = false;
+    double lawDropM = 0.0;
     // --mpushlaunch: GD's m_c6 for this tick as the push-out wrote it (0 when
     // nothing did -- postCollision zeroes it at every tick's end).
     double c6Now = 0.0;
@@ -2079,6 +2254,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // flipped first, which then made its own pad test look at the wrong side and
     // skip the pad entirely, so it read -3.354 where GD had -9.600.
     bool ballFlippedThisTick = false;
+    // --thinsupport: a ramp's flat-edge strip holds the body this tick, so the cube family's
+    // hazards wait for the ramp pass (see the second hazard walk and the ramp pass's end).
+    bool thinSupHaz = false;
     // mode 0 = cube, 1 = ship, 2 = ball. Cube and ball share this branch: the
     // ball is a cube with a weaker gravity whose tap flips gravity instead of
     // jumping. Everything else (support, landing, hazards) is identical.
@@ -2141,6 +2319,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         YSET(c.y) = (float)((double)s.y + dy);
         yFree = c.y;
         VYSET(c.vy) = (float)(dyDir * useDx * 4.0);
+        a1cVyUpd = (double)c.vy;   // --a1clatch (the fall test, 0x38cb26)
         c.held = (uint8_t)input;
         c.grounded = 0;
         // SPRITE ROTATION. The dart eases toward the angle it is travelling at,
@@ -2336,6 +2515,35 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             c.grounded = 1;
             CLAMP0("wave/slide");
         }
+        // THE GLITCH-AVOID MODE (g_glitchWave, thread_pool.hpp): a wave that ends the tick within
+        // this many px of something that would kill it is not flying the level, it is threading a
+        // gap no hand can hold. The same two kill tests as above with the player's box grown by
+        // the margin, at the tick's end position only (the sweep is for the real kill). Solids
+        // it is seated on (the 1755 slide) are exempt, and the level's floor and ceiling are not
+        // objects. Off (0) is the model untouched.
+        if (!dead && g_glitchWave > 0.0) {
+            const double gw = g_glitchWave;
+            const double yEnd = (double)c.y;
+            for (const Obj* o : *K.near) {
+                if (dead) break;
+                if (outOfSweepReach(o, x, yEnd, x, yEnd, std::max(wHazHalf, kWaveKillHalf) + gw))
+                    continue;
+                if (o->type == 0) {
+                    if (o->slope || o->oriented) continue;
+                    if (waveSeat > -1e17 && std::fabs(yEnd - waveSeat) < 1e-3
+                        && yEnd >= o->cy + o->hh)
+                        continue;
+                    if (std::fabs(yEnd - o->cy) <= o->hh + kWaveKillHalf + gw
+                        && std::fabs(x - o->cx) <= o->hw + kWaveKillHalf + gw)
+                        DIE("glitch/wave-hug", o);
+                } else if (hazardHit(o, x, yEnd, wHazHalf + gw, kHazMargin, kSawMargin + gw, 4,
+                                     c.mini)
+                           && (!o->obbOk || s.mode != 4
+                               || obbOverlap(*o, x, yEnd, wHazHalf + gw, (double)s.rot))) {
+                    DIE("glitch/wave-hug", o);
+                }
+            }
+        }
         // ...and RAMPS, which live in their own array and so were invisible to
         // the loop above. A plain ramp lifts a cube or a ball out (see the
         // slope block below), but the wave has no such resolution -- it just
@@ -2366,9 +2574,19 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // The clamp to the box is what makes the boundary go flat
                 // around a corner instead of following the line out of it.
                 const bool toRight = ceilRamp ? (sm < 0.0) : (sm > 0.0);
-                const double sxc = std::min(std::max(x + (toRight ? wsR : -wsL),
-                                                     sx0), sx1);
+                const double sxRaw = x + (toRight ? wsR : -wsL);
+                const double sxc = std::min(std::max(sxRaw, sx0), sx1);
                 const double surf = sp->sy0 + sm * (sxc - sx0);
+                // --waveslopelowend [2026-09-29]: a sample that falls past the ramp's THIN end
+                // (where the line meets the box's flat face, so the wedge has no height) is
+                // over empty space, and the clamp that makes the thick corner go flat would
+                // pin it to that face instead. lv20: a wave diving at 45 degrees past the
+                // low end of floor ramp uid 3541 (box x 5070..5100, line 270 -> 240), 0.08 px
+                // into the box's x range and 3.68 above its bottom, lives in the game; the
+                // measured perpendicular-distance test below puts it 6.08 from the line.
+                if (sxRaw != sxc
+                    && std::fabs(surf - (ceilRamp ? sp->cy + sp->hh : sp->cy - sp->hh)) < 1e-6)
+                    continue;
                 if (ceilRamp) {
                     // above the box entirely: clear of it (measured -- the
                     // sweep comes back alive at y >= 315 over a 280..310 box)
@@ -2452,16 +2670,25 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             && bandIsWall(s.bandBranch,
                           std::fabs(bandC - std::round(bandC / 30.0) * 30.0) < 0.01
                           && !bandTrackIsCamera());
+        // --dualcubeband [2026-09-29]: in a dual the game draws the band's floor and ceiling and
+        // a CUBE (or robot) stands on them too, not only a ball or spider. Measured on a custom
+        // level's dual cube section (band [300, 570]): the upright body falling at -15 lands at
+        // 315.000 = 300 + 15 with onGround 1, and its flipped partner rising at +15 lands at
+        // 555.000 = 570 - 15 with onGround 1, with nothing but decoration there; the model let
+        // both fly on. Only those two sides are measured: a flipped body on the band's ceiling and
+        // an upright one on its floor. An upright cube against the ceiling or a flipped one
+        // against the floor keeps the old behaviour.
+        const bool dualCubeBand = s.dual && (s.mode == 0 || s.mode == 5);
         const double ceilHere = std::min(
             playerCeilAt(x),
-            ((isBall || isSpider) && bandUsable) ? bandC : 1e9);
+            ((isBall || isSpider || (dualCubeBand && s.flip)) && bandUsable) ? bandC : 1e9);
         // --tpbandskip / --ballceilpos [2026-09-19]: whether this tick's ceiling
         // is the BAND's (not the level's own ceiling), and whether a teleport on
         // the previous tick has GD skip the band block this tick (State::tpSkip).
         // lv20 t=9,233..9,235 (mini ball, 747 to y=505, band [270,510]): GD
         // leaves 9,234 at 503.361 unclamped and puts 9,235 at 501.000 = 510 - 9
         // with vy -7.414 kept -- a POSITION clamp that does not look at vy.
-        const bool ceilIsBand = (isBall || isSpider) && bandUsable
+        const bool ceilIsBand = (isBall || isSpider || (dualCubeBand && s.flip)) && bandUsable
             && bandC <= playerCeilAt(x);
         const bool tpSkipBand = s.tpSkip != 0;
         const CubePhys cph = cubePhysFor(useDx);
@@ -2614,7 +2841,12 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 if (o->type == 0
                     && std::fabs(x - o->cx) <= o->hw + pHalf + kContactEps
                     && std::fabs((double)s.y - gsign * pHalf - faceOf(o))
-                           < kSupportTol + std::fabs(o->dcy)) {
+                           < kSupportTol + std::fabs(o->dcy)
+                    // --lawcontact: a face the ramp vetoes lands nothing this tick, so it
+                    // holds nothing either (the veto's m_wasOnSlope term, slopes.hpp).
+                    && !(lawWasOn
+                         && vetoOf(K, o, x, (double)s.y, pHalf, pHalf, gsign > 0, xPrev,
+                                   (double)s.y, s.slopeUidNow, true))) {
                     sup = true;
                     if (gsign * o->dcy >= 0.0) seamHold = true;
                     if (o->uid == s.groundUid
@@ -2689,6 +2921,12 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // ceiling over one wall and has to drop before the next one.
             if (!sup && s.flip
                 && std::fabs((double)s.y + pHalf - ceilHere) < 0.6)
+                sup = true;
+            // --dualcubeband: ...and so does the band's floor under an upright dual cube.
+            if (!sup && dualCubeBand && !s.flip && bandFT > kGroundY + 0.01 && bandFT < 1e8
+                && bandIsWall(s.bandBranch,
+                              std::fabs(bandFT - std::round(bandFT / 30.0) * 30.0) < 0.01)
+                && std::fabs((double)s.y - pHalf - bandFT) < 0.6)
                 sup = true;
             // ...and so does a RAMP. Slopes are a separate list, so this loop
             // never saw them: a ball riding a ramp lost `grounded` on the tick
@@ -2770,6 +3008,85 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     sup = true;
                     break;
                 }
+            }
+            // --thinsupport (needs --preslopesolid): ...and so does the 1-px strip along a
+            // ramp's flat edge that --preslopesolid resolves as a solid. The game's collision
+            // pass lands the body on it and the buttons phase, which runs after, sees it
+            // grounded; this scan did not know the strip, so a ball standing on one kept
+            // groundedNow at 0 and its press did nothing. Measured on a custom level (ball
+            // upright on the top strip of a ceiling ramp, box top 428.5, y 443.5): GD taps
+            // on the press tick (upsideDown 0 -> 1, vy +3.426), the model never flipped.
+            // The strip is the one the preslopegate block builds -- top-type dirs {1,3,5,6}
+            // along maxY, the others along minY, inset as the wall branch sets it, never for
+            // the ramp the body is on -- and it supports from the side that block snaps to.
+            // --spikebottom: a spiked ramp's strip too, since that block now builds it.
+            if (!sup && s.frame == 0 && K.slopes) {
+                const bool goingLeftT = (double)K.dxF < 0.0 || s.rev != 0;
+                const bool fbT = s.mode == 1 || s.mode == 2 || s.mode == 3 || s.mode == 7;
+                for (const Obj* sp : *K.slopes) {
+                    if (sp->uid == s.slopeUidNow) continue;
+                    if (sp->sy1 == sp->sy0) continue;
+                    const double sx0 = sp->cx - sp->hw, sx1 = sp->cx + sp->hw;
+                    const uint8_t dT = sp->slopeDir;
+                    const bool wallLeftT = dT == 2 || dT == 3 || dT == 4 || dT == 6;
+                    const bool topT = dT == 1 || dT == 3 || dT == 5 || dT == 6;
+                    double insetT = 0.0;
+                    bool wallT = false;
+                    double wx0T = 0.0, wx1T = 0.0;
+                    if (wallLeftT && sx0 > x) {
+                        insetT = s.rev ? 1.0 : 0.0;
+                        wallT = true; wx0T = sx0; wx1T = sx0 + 1.0;
+                    } else if (!wallLeftT && goingLeftT && x > sx1) {
+                        insetT = s.rev ? 0.0 : 1.0;
+                        wallT = true; wx0T = sx1 - 1.0; wx1T = sx1;
+                    }
+                    const double sMinYT = sp->cy - sp->hh, sMaxYT = sp->cy + sp->hh;
+                    // ...and the WALL the same block builds, [wx0T, wx1T] x [minY + inset,
+                    // maxY - inset]: its top holds an upright body, its bottom a flipped one.
+                    // preSlopeCollision hands the wall (0x38f5a6) and the strip (0x38f7fb) to
+                    // collidedWithObjectInternal with the same arguments -- the ramp in r8, a
+                    // zero byte at [rsp+0x20], dt in xmm1 -- and only the rect differs, so the
+                    // wall grounds a body exactly as the strip does. In the callee a top-face
+                    // resolution moves the body (0x39258a) and calls hitGround (0x3925d0) when
+                    // it is upright; a flipped body there takes hitGroundNoJump (0x39276a),
+                    // which saves and restores m_isOnGround (0x39bedf / 0x39bf1c). A bottom
+                    // face calls hitGround for a flipped body (0x392bd4) and hitGroundNoJump
+                    // for an upright one (0x392d8e). hitGround sets m_isOnGround (0x39c431)
+                    // unless the body leaves at more than 5.0 in its gravity frame (0x39bfc0,
+                    // 5.0 at 0x622e98), and m_isOnGround is the only gate on the ball's tap in
+                    // pushButton (0x397f40), which the next tick runs before its update and
+                    // collision pass (processQueuedButtons, 0x239d51). Measured on a custom
+                    // level: a dual ball, one half on a floor ramp's wall top (y 311.000 =
+                    // 296 + 15) and the other under its mirror's wall bottom (161.000 =
+                    // 176 - 15) for t=4,352..4,355; both tap on t=4,356 in the game, and the
+                    // model, which found no support, never tapped.
+                    if (wallT && !(wx0T > x + pHalf || x - pHalf > wx1T)) {
+                        const bool onW = s.flip
+                            ? std::fabs((double)s.y + pHalf - (sMinYT + insetT)) < kSupportTol
+                            : std::fabs((double)s.y - pHalf - (sMaxYT - insetT)) < kSupportTol;
+                        if (onW) { sup = true; break; }
+                    }
+                    if (sx0 + insetT > x + pHalf || x - pHalf > sx1 - insetT) continue;
+                    const bool onT = topT
+                        ? ((!s.flip || fbT)
+                           && std::fabs((double)s.y - pHalf - sMaxYT) < kSupportTol)
+                        : (s.flip
+                           && std::fabs((double)s.y + pHalf - sMinYT) < kSupportTol);
+                    if (onT) { sup = true; thinSupHaz = true; break; }
+                }
+            }
+            // --spiderbandsup: a spider standing on the band's own face (the band a wall, as the
+            // tap's search reads it) is on the ground: the floor clamp seated it there last tick
+            // with onGround set, and nothing in the solid scan stands for that face. SubZero 4002
+            // t=24,629 (the RC9m cold's stalled plan): a spider resting on the band floor 1,754.5
+            // presses; GD teleports it to the ceiling (y 2,065), where the model, finding no
+            // support, dropped the tap and stayed at 1,768.
+            if (!sup && isSpider && s.frame == 0
+                && bandFT > kGroundY + 0.01 && bandCT < 1e8 && bandFT < bandCT
+                && bandIsWall(s.bandBranch, false)) {
+                const double faceB = s.flip ? bandCT : bandFT;
+                const double footB = s.flip ? (double)s.y + pHalf : (double)s.y - pHalf;
+                if (std::fabs(footB - faceB) < kSupportTol) sup = true;
             }
             groundedNow = sup;
         }
@@ -2954,6 +3271,51 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             && !((double)s.vy > gdapprox::accelSwitchVyForSpeed(speedMulForDx(useDx)));
         bool ogLingerJump = false;
         cubeContact = groundedNow;
+        // --orbspawn: a fresh press inside a spawn ring that has not fired goes to the ring.
+        // pushButton offers the press to every touched ring first and runs `ringJump();
+        // m_jumpBuffered = 0; return;` when one takes it, so no jump or tap reads it -- every
+        // cube / ball / robot site below that fires on `input && !s.action` carries
+        // `!ringTookPress` (a press on the tick the cube lands on a block took the landing
+        // branch's jump, x <= 5,912 on the staircase); a toggle ring gives no impulse of its own. Measured on the custom level
+        // with the pad staircase: GD pressed there with the cube on the ground and its y
+        // did not move (dy -0.005, dvy 0) where the model jumped (edvy -11.42), and the pads
+        // the ring switched on launched it on the next tick. The button held on after it is
+        // read off the same pushButton line, not measured: m_jumpBuffered (+0x985) is 0 until
+        // a new press, which is State::holdDead, so the held cube does not jump on the next
+        // tick either.
+        // ...and the ring's bit is set on THIS tick, the way markTouched sets it (which, reading
+        // the parent's button, would set it a tick later). Chosen on GD's trajectory, not on a
+        // reading of its tick order, which is not settled: GD's y by x is 194.786 / 194.781 /
+        // 197.351 / 199.643 at x = 5,921.5 / 5,923.1 / 5,924.7 / 5,926.3 (press at the first);
+        // with the bit here the model reads 194.786 / 194.738 / 197.029 / 199.321 and climbs
+        // parallel 0.32 px low, with it a tick later 194.786 / 194.781 / 194.733 / 197.024 --
+        // 2.6 px low. GD's launch step moves 2.570 where every later one moves 2.292; that
+        // extra 0.28 is what neither form has.
+        bool ringTookPress = false;
+        if (input && !s.action && K.trigs && (s.mode == 0 || s.mode == 2)) {
+            const double half = playerHalf(s.mode, s.mini != 0);
+            for (const auto& tb : *K.trigs) {
+                const TouchTrig* T = tb.first;
+                if (!T->spawnRing || (s.trig & tb.second)) continue;
+                if (std::fabs(x - T->cx) < T->hw + half
+                    && std::fabs((double)s.y - T->cy) < T->hh + half) {
+                    ringTookPress = true;
+                    c.trig |= tb.second;
+                    c.trigT = (int32_t)K.t;
+                    const int b = touchBitIndex(tb.second);
+                    if (g_touchFireT[b] < 0) g_touchFireT[b] = (int)K.t;
+                    c.fireB[b] = (uint16_t)K.t;
+                    break;
+                }
+            }
+            if (ringTookPress) {
+                c.pressSpent = 1;
+                c.ringHold = 1;
+                c.jumpBuf = 0;
+                c.holdDead = 1;
+                spawnRingJumpNow = (s.mode == 0);   // --spawnringjump (the end of this function)
+            }
+        }
         // the ceiling pin is re-earned every tick (see "cube/ceilstop")
         c.ceilPin = 0;
         // A player standing on a BLOCK carries that tick's gravity step in y.
@@ -2978,8 +3340,19 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         bool ballFlipped = false;
         // (`gravPortalThisTick` is decided ABOVE the support scan -- the whole
         // note, and the reason it has to sit there, is at its declaration.)
-        if (groundedNow && input && !s.action && !gravPortalThisTick
+        // --spiderairbuffer [2026-09-29]: a spider's press made in the AIR is kept
+        // while the button stays down and teleports it on the first grounded tick.
+        // calib_spiderairhold (a yellow pad, no portal): presses at pad+30 (rising)
+        // and +60 / +100 (falling), held -> GD lands at +148 and teleports at +149,
+        // all three; the same press released after one tick -> nothing. The model
+        // teleported only on a fresh press while grounded, so the three held cells,
+        // and calib_portalspider's ship -> spider cell whose press starts a tick
+        // after the portal, never teleported.
+        if (isSpider && input && !s.action && !groundedNow)
+            c.pSpiderTap = 1;
+        if (groundedNow && input && (!s.action || s.pSpiderTap) && !gravPortalThisTick
             && isSpider) {
+            c.pSpiderTap = 0;   // --portalspidertap: the handed-over press is spent here
             // SPIDER: teleport to the surface on the other side and flip.
             // The search is the mirror of the support test above -- the same
             // x-overlap rule, and the face that matters is the one the player
@@ -3008,6 +3381,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             if (hazTgt) DIE("spider/tp-hazard", nullptr);
             impulsedThisTick = IMPULSE();
             spiderWarpedThisTick = true;
+            // --a1clatch: updateJump's spider arm (0x38bbb0 -> spiderTestJump) skips the fall
+            // test and writes nothing to +0xa1c; a fresh press taps from pushButton instead
+            if (!(input && !s.action)) a1cNoFall = true;
             c.spiderJumpT = 0;   // GD's +0x820 (State::spiderJumpT)
             if (g_touchCensus) g_tcBranch |= 1;
             // ...and the block-pin has to let go. `pinnedOnBlock` was armed
@@ -3167,7 +3543,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // clears it when it jumps. See the block above for the whole reading.
         } else if (groundedNow
                    && (input || ((s.mode == 0 || s.mode == 2) && s.jumpBuf))
-                   && !gravPortalThisTick
+                   && !gravPortalThisTick && !ringTookPress
+                   && !(freshTapHeld && input && !s.action)   // --balltapexit's re-run
                    && (!s.action
                        // the cube's gate is +0x985 alone (speed.hpp, the hold latch), which a
                        // ring fired by a cube leaves set (a custom level t=12,551: yellow ring 2314 at
@@ -3195,6 +3572,11 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // the model's resolution (the gd-shrinking-gap class). Per-run
             // fixup records are the only honest carrier for it.
             impulsedThisTick = IMPULSE();
+            if (c.mode == 0 && !isBall && !isSpider) {   // --jumpafterland
+                cubeGroundJumpNow = true;
+                vyPreGroundJump = c.vy;
+            }
+            if (!isSpider) a1cJump();   // --a1clatch: updateJump's jump block (0x38bbda)
             // --portalpress (speed.hpp): which press action this was, so a mode portal that
             // fires later in this tick can hand the press to the new mode instead.
             if (input && !s.action && (s.mode == 0 || s.mode == 2) && !isSpider)
@@ -3362,6 +3744,22 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 //   robot same -> +1.000 / +1.851 / **+2.236 (cap)**,
                 //          mini up to +1.789 (cap) at both |m|=1,2
                 // The exit gate (uphillExit) already has the same mirror.
+                // --rampjumptick [2026-09-28]: the jump reads the ramp factor ONE
+                // TICK FURTHER ON than an exit on the same tick (slopeT + 2, not
+                // slopeRampFactor's slopeT + 1). Every table above sits on the 0.4
+                // floor or at factor 1, where the tick cannot show; the linear part
+                // was first met on a custom level at speed 0.806 (a 21/24 bonus where
+                // the model gave 20/24, 0.062 vy). Re-measured on the rampjump rig
+                // by pressing k ticks into the ride, 8 units:
+                //   cube     m=1  k 8/12/16/20  GD 11.951 12.260 12.569 12.877
+                //                              model 11.920 12.183 12.491 12.800
+                //   mini cube m=1 k 12/20      GD 10.024 10.641  model  9.947 10.564
+                //   mini cube m=2 k 16         GD 10.914         model 10.805
+                //   mini robot m=1 k 14        GD  5.706         model  5.629
+                // each GD value is the bonus at the model's count plus one tick, to
+                // the dump's three decimals (k=8 is the model's floor against GD's
+                // 10/24). The saturated (k=23) and capped (mini robot m=2) units agree
+                // either way.
                 const double mTravJ =
                     (double)s.slopeM
                     * (((double)K.dxF < 0.0 || s.rev != 0) ? -1.0 : 1.0);
@@ -3371,7 +3769,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         kSlopeJumpBonus
                         * slopeExitVy(std::fabs((double)s.slopeM), 0,
                                       useDx, c.mini != 0)
-                        * slopeRampFactor((int)s.slopeT + 1);
+                        * slopeRampFactor((int)s.slopeT + 2);
                     VPSET(vpNew) += std::min(bonus,
                                       kSlopeJumpBonusCap * std::fabs(vpNew));
                 }
@@ -3447,6 +3845,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 yFree = c.y;
             } else if (isRobot && s.rHover && s.action) {
                 VPSET(vpNew) = vp;
+                a1cVyUpd = vp * gsign;   // --a1clatch: before the force, as updateJump leaves it
                 // FORCE BOX (id 2069): the field applies during hover too, at the
                 // ROBOT's strength -- this branch is gated on isRobot, so `s.mode`
                 // is 5 by construction and the mode-less lookup could only ever
@@ -3505,6 +3904,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // r102: the tick after hitting a black orb on a fast climb has no terminal
                 VPSET(vpNew) = s.pNoTerm ? qVy(vp + acc * tScale)
                                   : qVy(std::max(vp + acc * tScale, gTerm));
+                // --a1clatch: the fall test reads vy after the gravity step and before the force
+                // (updateJump's +0xa1c path has no clamp; past the clamp the answer is the same)
+                a1cVyUpd = qVy(vp + acc * tScale) * gsign;
                 VPSET(vpNew) += forceAcc * tScale;
                 if (isRobot) c.rHover = 0;
                 YSET(c.y) = (float)((double)s.y + kYScale * vpNew * gsign * tScale);
@@ -3515,7 +3917,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // The ball's tap is its ground tap exactly (a custom level, mini ball: every press at
                 // k=1..11 left with vy -2.6832 = the mini tap, gravity flipped, y moved by the
                 // step), so it is written the way the grounded branch writes it.
-                if (ogLingerGate && input && !s.action) {
+                if (ogLingerGate && input && !s.action && !ringTookPress && !freshTapHeld) {
                     if (isBall) {
                         c.flip = c.flip ? 0 : 1;
                         c.rotStep = (float)ballRotRate(c.mini != 0, true, useDx);
@@ -3529,6 +3931,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                               : cph.jump;
                     }
                     impulsedThisTick = IMPULSE();
+                    a1cJump();   // --a1clatch: the jump block, from pushButton
                     c.pressSpent = 1;
                     ogLingerJump = true;
                 }
@@ -3574,49 +3977,39 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // the player, so the contact never ends there) and the decay stops the
         // arm from reaching t=11,342, 12,000 px past any 2866. Either alone is
         // worse than neither: see the note at g_fgArmLive.
-        if (g_fgArmLive) {
-            c.fgArm = (!g_flipHeadBoxes.empty()
-                       && flipHeadArms(modX, modY, pHalf, (int)K.t))
-                          ? (uint8_t)kArmTicks
-                          : (uint8_t)(s.fgArm ? s.fgArm - 1 : 0);
-        } else if (!c.fgArm && !g_flipHeadBoxes.empty()
-                   && flipHeadArms(modX, modY, pHalf, (int)K.t))
-            c.fgArm = 1;
+        // A box that rides the player renews inside its ride exactly when it renewed on the
+        // previous tick (modifiers.hpp, flipHeadArmsRide). Same counter as --fgarmlive.
+        c.fgArm = (!g_flipHeadBoxes.empty()
+                   && flipHeadArmsRide(modX, modY, pHalf, (int)K.t,
+                                       s.fgArm == (uint8_t)kArmTicks))
+                      ? (uint8_t)kArmTicks
+                      : (uint8_t)(s.fgArm ? s.fgArm - 1 : 0);
         // CEILING ARM (id 1859) -- the same start-of-tick position the 2866 arm
         // and the force field read, and unlike fgArm it DECAYS: GD's counter is
         // set to 2 by the touch and stepped down every tick. The box is where the
         // recording has it on this tick (it can ride the player).
-        c.armT = (!g_armBoxes.empty() && armBoxTouch(modX, modY, pHalf, (int)K.t))
+        // --ridebox: the same ride rule for a riding 1859 (armT counts up, 0 = fresh).
+        c.armT = (!g_armBoxes.empty()
+                  && armBoxTouchRide(modX, modY, pHalf, (int)K.t, s.armT == 0))
                      ? 0
                      : (uint8_t)std::min<int>(kArmTicks, (int)s.armT + 1);
-        // Dual anti-collision bounce. Measured on lv16's second dual (mini
-        // ball, 11 point probes): a body moving
-        // TOWARD its partner that ends the tick within 23 px of it while the
-        // partner is GROUNDED is flipped away with vy = +/-2.000 EXACTLY
-        // (not mini-scaled), y not clamped. Input-independent; inactive
-        // while the partner is airborne (fires the tick after it lands);
-        // a body moving AWAY sails through the zone untouched.
-        // 23 = 2*half + 5 is a guess at the shape -- only the mini sum
-        // (9+9+5) is measured, and only for the ball. The partner side here
-        // is the START-of-tick y2/grounded2, which matches the measured
-        // "fires the tick AFTER the partner lands".
-        if (s.dual && isBall && !c.grounded && s.grounded2) {
-            const double sep = (double)c.y - (double)s.y2;
-            const double moved = (double)c.y - (double)s.y;
-            if (std::fabs(sep) < 2.0 * pHalf + 5.0 && moved * sep < 0.0) {
-                c.flip = (sep > 0.0) ? 1 : 0;
-                VYSET(c.vy) = (sep > 0.0) ? 2.0f : -2.0f;
-                c.grounded = 0;
-            }
-        }
+        // The dual anti-collision bounce (lv16's second dual: a body within 2*half + 5 of a grounded
+        // partner is flipped to vy +/-2.000) is decided once in stepBoth (fixup.hpp), after both
+        // bodies' collisions; GD's checkRepellPlayer gates it on polarity (0x2398d0).
         // invisible ceiling: a flipped ball rides it exactly like ground
         const double pCeil = ceilHere;
         // r75: whether this tick's grounding comes from the "invisible ceiling" (no
         // actual object supporting). Read by the reach-back gate in the landing
         // loop below.
         bool groundedInvCeil = false;
+        // --dualcubeband: ...not a dual cube that is leaving it. Its jump sets vy and freezes y on the
+        // edge tick, so the body is still at the band's ceiling with vy pointing away; the ball's
+        // taps come after this clamp, a cube's jump comes before it and was zeroed here (a custom
+        // level's dual: GD jumps the flipped cube off 555.000 at -10.620 on the press tick, the
+        // model a tick later). The floor side already clamps only a body moving into it.
         if (c.flip && (double)c.y + pHalf >= pCeil
-            && !(tpSkipBand && ceilIsBand)) {
+            && !(tpSkipBand && ceilIsBand)
+            && !(dualCubeBand && c.vy < 0.0f)) {
             YSET(c.y) = (float)(pCeil - pHalf);
             VYSET(c.vy) = 0; CLAMP0("ground/flipceil");
             c.grounded = 1;
@@ -3629,13 +4022,37 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // dual t=12,494: GD clamps p2 to 621 and it leaves with the
             // mirrored tap (-2.7408) in the SAME tick; the model froze it
             // at 621 with the plan holding, and the pair never re-mirrored.
-            if (isBall && input && !s.action
-                && !gravPortalThisTick) {
+            // --ceiltaponce: ...but only a press this tick has not spent yet, as the floor-side
+            // mirror below always required. A ball tapped from upright to flipped on a ramp's
+            // top strip above the band's ceiling (y + pHalf > pCeil) comes through here flipped
+            // on the same tick, and without the gate the one press tapped it straight back.
+            // Measured on a custom level (ball at 443.5 on a strip whose top is 428.5, band
+            // ceiling 450): GD goes upsideDown 0 -> 1 with vy +3.426 and stays on the strip,
+            // flipped, until it leaves it and hangs at 435; the model stayed upright and fell.
+            if (isBall && input && !s.action && !freshTapHeld
+                && !gravPortalThisTick && !ringTookPress
+                && !(impulsedThisTick)) {
                 impulsedThisTick = IMPULSE();
+                a1cJump();   // --a1clatch: the jump block, from pushButton
                 ballFlippedThisTick = true;
                 c.flip = 0;
                 VYSET(c.vy) = (float)(-ballFlipFor(useDx)
                                * (c.mini ? kMiniImpulse : 1.0));
+                c.grounded = 0;
+            }
+            // --ceilcubejump: ...and a flipped CUBE that lands here with a press not yet spent jumps
+            // on the landing tick, the mirror of the ground-plane cube jump below. Custom level C
+            // t=4,006, p2 flipped at the band's ceiling 1,050: press at 4,005 airborne (y
+            // 1,033.533, vy +15); GD's landing tick carries y=1,035.000 (= 1,050 - 15) AND
+            // vy=-11.180, never a vy=0 tick. The model sat at 1,035 with vy 0 and jumped at 4,007,
+            // one gravity step behind for the whole arc (0.87 px by 4,024).
+            if (c.mode == 0 && input && !s.action
+                && !impulsedThisTick && !ringTookPress && !gravPortalThisTick) {
+                impulsedThisTick = IMPULSE();
+                a1cJump();   // --a1clatch
+                const CubePhys jph = cubePhysFor(useDx);
+                VYSET(c.vy) = (float)(-jph.jump
+                               * (c.mini ? (kCubeJumpMini / kCubeJump) : 1.0));
                 c.grounded = 0;
             }
         }
@@ -3683,7 +4100,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             && bandIsWall(s.bandBranch,
                           std::fabs(bandF - std::round(bandF / 30.0) * 30.0) < 0.01);
         const double floorHere =
-            ((isBall || isSpider) && bandFUsable) ? bandF : kGroundY;
+            ((isBall || isSpider || (dualCubeBand && !c.flip)) && bandFUsable) ? bandF : kGroundY;
         // [2026-08-21 r90] **The ground does not catch on a tick the player
         // warped.** Calibration rig ceilhold's 6 spider cells (pressing while hung
         // from a ceiling ramp = teleport to the opposite face, landing on this
@@ -3769,8 +4186,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // ROBOT ONLY: the cube's ground-plane case is unmeasured (its
             // block-landing branch below IS measured, lv20 t=1,224).
             if (c.mode == 5 && !c.flip && input && !s.action
-                && !impulsedThisTick) {
+                && !impulsedThisTick && !ringTookPress) {
                 impulsedThisTick = IMPULSE();
+                a1cJump();   // --a1clatch
                 const CubePhys jph = cubePhysFor(useDx);
                 VYSET(c.vy) = (float)(jph.jump
                                * (c.mini ? (kCubeJumpMini / kCubeJump) : 1.0)
@@ -3780,8 +4198,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             }
             // ...and the CUBE the same, now measured (speed.hpp, the ground cube jump)
             if (c.mode == 0 && !c.flip && input && !s.action
-                && !impulsedThisTick) {
+                && !impulsedThisTick && !ringTookPress) {
                 impulsedThisTick = IMPULSE();
+                a1cJump();   // --a1clatch
                 const CubePhys jph = cubePhysFor(useDx);
                 VYSET(c.vy) = (float)(jph.jump
                                * (c.mini ? (kCubeJumpMini / kCubeJump) : 1.0));
@@ -3797,8 +4216,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // impulse is in **the new gravity's direction**, so upward +ballFlipFor
             // (the ceiling side is -).
             if (isBall && !c.flip && input && !s.action && !impulsedThisTick
-                && !gravPortalThisTick) {
+                && !gravPortalThisTick && !ringTookPress && !freshTapHeld) {
                 impulsedThisTick = IMPULSE();
+                a1cJump();   // --a1clatch
                 ballFlippedThisTick = true;
                 c.flip = 1;
                 VYSET(c.vy) = (float)(ballFlipFor(useDx)
@@ -3967,7 +4387,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // ticks were scored with; a player entering a face against its own
             // gravity would part them.
             if (vetoOf(K, o, x, (double)c.y, pHalf, pHalf,
-                       gsign > 0, xPrev, (double)s.y, c.slopeUidNow))
+                       gsign > 0, xPrev, (double)s.y, c.slopeUidNow, lawWasOn))
                 continue;
             double landTol = c.onSlope ? 0.001 : kLandTol;
             // Counting the fossil (--slopedbg). If this branch stops being taken
@@ -4077,6 +4497,25 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // re-seats of a player standing on an actual object, even while
             // grounded.
             const double dHangL = (prevFoot - face) * gsign;
+            // --jumpafterland: GD resolves the solids before it handles the buttons, so a cube that
+            // jumps off its support on the tick its box first reaches a face within the landing
+            // tolerance is put on that face first, at the velocity it had, and the jump then leaves
+            // from there (vy the jump's, onGround 0). Custom level H t=475: a cube on the
+            // ground (foot 90) presses as its box enters uid45 (a solid, top 98); GD y=113.000
+            // (98 + 15) with vy 11.18, where the model's jump went first and the landing test,
+            // seeing it rise, let the box into the solid.
+            // Only a face above the foot (a real intrusion) and only the position: the landing's
+            // own writes (vy 0, onGround, the landed-this-tick marks) are the jump's to undo.
+            if (cubeGroundJumpNow && c.mode == 0 && !c.onSlope
+                && (double)vyPreGroundJump * gsign <= 0.0
+                && dHangL < 0.0 && dHangL >= -landTol && (newFoot - face) * gsign < 0.0) {
+                if (!landedThisTick || (face - landFaceBest) * gsign > 0.0) {
+                    landFaceBest = face;
+                    YSET(c.y) = (float)(face + gsign * pHalf);
+                    CLAMP0O("solid/jumpafterland", o);
+                }
+                continue;
+            }
             if (vpNow <= 0 && dHangL >= -landTol
                 && (dHangL >= 0.0 || !groundedInvCeil)
                 && (newFoot - face) * gsign <= 0) {
@@ -4125,8 +4564,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // measurement" cube landing rule cost 7 levels (see below).
                 // not on a gravity portal's firing tick (speed.hpp, the gravity-portal landing tap)
                 if (isBall && input && !s.action && !ballFlippedThisTick
-                    && !gravPortalThisTick) {
+                    && !gravPortalThisTick && !ringTookPress && !freshTapHeld) {
                     impulsedThisTick = IMPULSE();
+                    a1cJump();   // --a1clatch
                     ballFlippedThisTick = true;
                     c.flip = c.flip ? 0 : 1;
                     // A tap on the tick of a corner landing carries the slope
@@ -4175,8 +4615,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // branch already does. The edge here is what distinguishes the
                 // two -- same as the cube.
                 else if ((c.mode == 0 || c.mode == 5) && input && !s.action
-                         && !impulsedThisTick) {
+                         && !impulsedThisTick && !ringTookPress) {
                     impulsedThisTick = IMPULSE();
+                    a1cJump();   // --a1clatch
                     const CubePhys jph = cubePhysFor(useDx);
                     double vj = jph.jump
                                 * (c.mini ? (kCubeJumpMini / kCubeJump) : 1.0);
@@ -4195,6 +4636,10 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                        && ((double)c.y + pHalf) - (o->cy - o->hh) > 0.0) {
                 // --ballceil (speed.hpp): the landing's mirror on an underside, one-way
                 // plates included -- the ball is on GD's unconditional ceiling list.
+                // --ballceilveto: the landing's slope veto holds here too (below).
+                if (vetoOf(K, o, x, (double)c.y, pHalf, pHalf, false,
+                           xPrev, (double)s.y, c.slopeUidNow, lawWasOn))
+                    continue;
                 YSET(c.y) = (float)((o->cy - o->hh) - pHalf);
                 VYSET(c.vy) = 0; CLAMP0O("ball/ceil", o);
                 c.grounded = 1;
@@ -4203,6 +4648,18 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                        && ((double)s.y - pHalf) - (o->cy + o->hh) >= -kLandTol
                        && (o->cy + o->hh) - ((double)c.y - pHalf) > 0.0) {
                 // --ballceilflip (speed.hpp): the same on a flipped ball's head side, a top
+                // --ballceilveto [2026-09-29]: GD resolves no solid whose face a ramp governs
+                // (slopeVetoesSolid, 0x392520 / 0x392a9b), and the ball's ceiling list is no
+                // exception; the landing above already asks, the two ball ceilings did not.
+                // lv16 t=13,265 (dual, p2 a flipped mini ball pushed along floor ramp uid
+                // 6639's top toward its high end at (20114,450), where a block's top carries
+                // the same face on): GD keeps p2 on the ramp's line (458.449), seats it on
+                // the ramp's clamped end 459 the next tick and launches it off at 2.762; the
+                // model lifted it onto the block's top a tick early and lost the ride. The
+                // velocity of that tick is the ramp's (--undersidev3).
+                if (vetoOf(K, o, x, (double)c.y, pHalf, pHalf, true,
+                           xPrev, (double)s.y, c.slopeUidNow, lawWasOn))
+                    continue;
                 YSET(c.y) = (float)((o->cy + o->hh) + pHalf);
                 VYSET(c.vy) = 0; CLAMP0O("ball/ceilflip", o);
                 continue;
@@ -4439,6 +4896,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                             VYSET(c.vy) = 0; CLAMP0O("cube/fliphead", o);
                             c.grounded = 1;
                             c.ceilPin = 0;
+                            a1cEarlySet = true;   // --a1clatch: didHitHead (0x393c7f)
                             // every gravity flip negates the cube's spin
                             c.rotNeg = c.flip;
                             continue;
@@ -4561,12 +5019,21 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // 2026-09-20: K.near has no length bound (cli.hpp collects every static and dynamic
         // object in the x window), so past the 64th hazard the overflow went back to the old
         // order silently, and the rule's meaning would have varied with object density.
-        if (K.t > 14) {
+        // --thinsupport: not yet when a ramp's strip holds the body -- the ramp pass has not
+        // placed it (the same walk runs at the end of that pass instead).
+        if (K.t > 14 && !thinSupHaz) {
             for (const Obj* o : *K.near) {
                 if (dead) break;
                 if (o->type == 0) continue;
                 const bool hazDbg = (g_hazDbgUid >= 0 && o->uid == g_hazDbgUid);
-                if (std::fabs(x - o->cx) > o->hw + pHalf + kContactEps) {
+                // --radreach: a circle reaches its radius, which can be wider than its rect
+                // (the reach outOfSweepReach already uses on the flying and wave branches).
+                // Measured on a custom level (the cold run's attempt 129): a mini ball rolls
+                // into uid 14720 (id 1705, rect 44x85, radius 32.3) and GD kills it at
+                // x=27,934.707 (|dx| 40.29, corner distance 31.4 < 32.3); the window below
+                // held the circle out until |dx| < 22 + 9, and the model rolled on nine ticks.
+                const double reachX = (o->radius > o->hw) ? o->radius : o->hw;
+                if (std::fabs(x - o->cx) > reachX + pHalf + kContactEps) {
                     if (hazDbg) std::printf("hazdbg t=%lld uid=%d dropped=xwindow\n",
                                             (long long)K.t, o->uid);
                     continue;
@@ -4661,6 +5128,18 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             }
             groundedNow = sup;
         }
+        // --ridenoblockrest: a ship riding a floor ramp upright stands on the ramp, and its vy is
+        // the ride's own (2.000 on acquisition, then the hold's steps -- the slope block's note),
+        // which every riding tick carries into this integration because the scan above finds no
+        // block under it. A block that starts at the ramp's high end, its face level with the
+        // end, comes within the scan's 0.6 px on the last riding tick, and the resting slide then
+        // restarted the hold from 0. Custom level A t=9,679: a held ship on uid4156 (m 1,
+        // vy 2.086) meets the block past x1; GD steps y on 2.172 and leaves the ramp (165.208,
+        // then the exit launch 6.906), where the model stepped on 0.108 and was seated at the
+        // end's flat.
+        if (groundedNow && s.onSlope && !s.flip
+            && s.mode == 1 && c.mode == 1 && s.vy != 0.0f && !flyRide)
+            groundedNow = false;
         // [2026-08-21 r88/r89] **A "carried vy" is not the resting slide.** The
         // convention written for the rising-floor catch (flyRide) (the note below:
         // only the vy==0 rest re-accumulates from 0) applies just as well to a
@@ -4677,6 +5156,14 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // -> 56+ (census stayed green = the [[gd-census-green-cold-broken]] pattern).
         const bool ridingCarry =
             (flyRide || (s.onSlope && s.grounded && s.flip)) && s.vy != 0.0f;
+        // --bandcarryvy [2026-09-29]: a ship the recorded band's floor is carrying up is a
+        // carried state too. fly/bandcarry leaves its vy alone and GD goes on integrating
+        // it, held or not. lv22 t=16,481: the ship lands on a band floor that pans up
+        // 1.36 px a tick; GD reads vy 0.108, 0.216 ... held and 1.227, 1.158 released, with
+        // y on the floor every tick, where the model restarted from 0 each tick.
+        const bool bandCarry = c.mode == 1 && btFlyOn && s.grounded
+                               && !s.flip && s.vy != 0.0f
+                               && (double)s.y <= floorY + pHalf + 1e-3;
         c.held = (uint8_t)input;
         // The UFO acts on the EDGE, the ship on the level. One press is one
         // flap and holding does not repeat it -- measured on lv12: pressed at
@@ -4733,7 +5220,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             && forceBoxAcc(modX, modY, pHalf,
                               forceUnitFor(s.mode, useDx)) * gdSign > kSwingG;
         if (groundedNow && !act && !(isSwing && s.rHover) && !swingLift
-            && !ridingCarry) {
+            && !ridingCarry && !bandCarry) {
             VYSET(c.vy) = 0;
             c.grounded = 1;
             // the ride: seat on the moved face (cube family's rule, same
@@ -4835,6 +5322,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             if (ceilTakeoff) {
                 vpS = -1.0;                    // no gravity step on this tick
                 VYSET(c.vy) = (float)(qVy(vpS) * gsS);
+                a1cVyUpd = (double)c.vy;       // --a1clatch (the fall test, 0x38cb26)
+                a1cUpUpd = (c.flip != 0);
                 YSET(c.y) = s.y;
                 yFree = c.y;
             } else {
@@ -4890,6 +5379,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     if (fb != 0.0) { vyW = qVy(vyW + fb); vpS = vyW * gsS; }
                 }
                 VYSET(c.vy) = (float)vyW;
+                a1cVyUpd = vyW;   // --a1clatch (the fall test, 0x38cb26)
+                a1cUpUpd = (c.flip != 0);
                 YSET(c.y) = (float)((double)s.y + kYScale * (double)c.vy * tScale);
                 yFree = c.y;
             }
@@ -4901,7 +5392,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // step). Only the resting slide (vy == 0) restarts from 0.
             // [2026-08-21 r88] The ladder during a ride is also a "carried vy"
             // (measurements at the declaration of ridingCarry).
-            const double vp = (groundedNow && !ridingCarry)
+            // --bandcarryvy: ...and so is a ship the band's floor carries (bandCarry).
+            const double vp = (groundedNow && !ridingCarry && !bandCarry)
                                   ? 0.0 : (double)s.vy * gsign;
             // GD's velocity-limit exemption (State::boost) clears at the HEAD
             // of updateJump's flying branch, on the INCOMING gravity-frame vy,
@@ -4960,10 +5452,35 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             const double fbAcc = g_forceBoxes.empty()
                 ? 0.0 : forceBoxAcc(modX, modY, pHalf,
                                      forceUnitFor(s.mode, useDx)) * gdSign;
+            // --ufolawflap: the flap off a --slopelaw seat carries the ramp's velocity
+            // (State::lawSv). updateJump's UFO flap (0x38c701-) raises vy to its target and
+            // then, with m_isOnSlope or m_wasOnSlope set and m_slopeVelocity > 0, makes it
+            // min(target + m_slopeVelocity / 2, 1.4 x target) before the acceleration and the
+            // terminal clamp. The seat is a contact GD counts as on-slope while the ride block
+            // refuses it. Official level 19 t=15,177: a UFO clips the low corner of ramp
+            // uid 10059 (m +1), the seat lifts it 7.19 px, GD reads isOnSlope 1 and
+            // m_slopeVelocity 6.906 (the ramp's exit 9.207 x 0.75); the flap on 15,178 reads
+            // 8.000 in GD (the clamp) and 6.871 in the model, 0.47 px off the next tick, and
+            // the run is 73 px apart by x=27,550. Not beside a force box (as the ride's rule).
+            double lawSvIn = (isUfo && !s.onSlope && fbAcc == 0.0)
+                                 ? (double)s.lawSv : 0.0;
+            // --uforideflap: a UFO that rode a ramp rising in the travel direction last tick
+            // flaps by the same updateJump term, with the ride's m_slopeVelocity (the ramp's
+            // exit, as the law seat's lawSv) -- not the constant kUfoRampFlap, which was the
+            // normal UFO's terminal clamp and left the mini UFO out. Custom level A
+            // t=12,671 (two episodes): a mini UFO seated on ramp uid5448 (m +1) flaps the next
+            // tick; GD vy 8.887, the model's plain mini flap 6.648.
+            const bool rideFlap = isUfo && act && s.onSlope && fbAcc == 0.0
+                                  && !c.flip
+                                  && (double)s.slopeM
+                                         * (((double)K.dxF < 0.0 || s.rev != 0) ? -1.0 : 1.0)
+                                     > 0.0;
+            if (rideFlap)
+                lawSvIn = slopeExitVy(std::fabs((double)s.slopeM), 3, useDx, c.mini != 0);
             double vpNew = qVy(
                 (isUfo ? gdapprox::UfoModel::stepVy(
                             vp, act, ufoParamsFor(useDx, c.mini, K), thrFlip,
-                            boostNow)
+                            boostNow, lawSvIn)
                        : gdapprox::ShipModel::stepVy(
                             vp, act, shipParamsFor(useDx, c.mini, K), thrFlip,
                             boostNow))
@@ -4987,10 +5504,11 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             //
             // Force boxes are excluded rather than guessed: the rig had none,
             // so what GD does when a push and this assignment meet is unmeasured.
-            if (isUfo && act && s.onSlope && !c.mini
+            if (!rideFlap && isUfo && act && s.onSlope && !c.mini
                 && fbAcc == 0.0)
                 vpNew = kUfoRampFlap;
             VYSET(c.vy) = (float)(vpNew * gsign);
+            a1cVyUpd = (double)c.vy;   // --a1clatch (the fall test, 0x38cb26)
             YSET(c.y) = (float)((double)s.y + kYScale * (double)c.vy);
             yFree = c.y;
             // [2026-08-21 r86] **The flight modes also carry over "the half gravity
@@ -5112,6 +5630,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // left alone.
             YSET(c.y) = (float)(floorY + pHalf);
             c.grounded = 1; CLAMP0("fly/bandcarry");
+            bandFloorHeld = true;
         }
         // GD clamps the CENTRE to ceil - 15*vsize (checkCollisions, 0x213c38).
         // The WAVE never reaches this line -- it has its own branch and its own
@@ -5221,13 +5740,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             if (dead) break;
             noteSolidVisit(K, o, x, (double)c.y, pHalf);   // --solidorddbg
             if (o->type != 0) {
-                // --flyhazaftersolid leaves it to the second walk below, after the solids
-                // have placed the body. GD's checkCollisions runs its hazard stage after the
-                // solid loop for EVERY mode, not only the cube (0x2137f0; the rect is re-read
-                // at 0x214752) -- the cube side of that is --hazaftersolid, default since
-                // ab0bdf7, and this is the same change on the flying branch.
-                if (!g_flyHazAfterSolid)
-                    sweepFlyHazard(o);
+                // Left to the second walk below, after the solids have placed the body. GD's
+                // checkCollisions runs its hazard stage after the solid loop for EVERY mode,
+                // not only the cube (0x2137f0; the rect is re-read at 0x214752).
                 continue;
             }
             // face = the surface the ship rests ON, head = the one it bumps
@@ -5489,10 +6004,10 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // reads the veto of its own face.
             const bool vetoFootL = vetoOf(K, o, x, (double)c.y,
                                           pHalf, pHalf, gsL > 0, xPrev,
-                                          (double)s.y, c.slopeUidNow);
+                                          (double)s.y, c.slopeUidNow, lawWasOn);
             const bool vetoHeadL =
                 vetoOf(K, o, x, (double)c.y, pHalf, pHalf,
-                       gsL < 0, xPrev, (double)s.y, c.slopeUidNow);
+                       gsL < 0, xPrev, (double)s.y, c.slopeUidNow, lawWasOn);
             if (vetoFootL && vetoHeadL)
                 continue;
             const double prevFootL = ((double)s.y - gsL * pHalf - face) * gsL;
@@ -5615,7 +6130,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                             && !(g_pinMinNoSwing && c.mode == 7)))
                        && xOver
                        && prevHeadP <= kShipLandTol && newHeadP >= 0
-                       && !(g_ceilRideSlope && s.ceilT > 0)
+                       && !(s.ceilT > 0)
                        && !vetoHeadL) {
                 // Ceiling ride. The ship stops dead against a block's underside
                 // and slides along it -- it does NOT die and it does NOT pass
@@ -5766,13 +6281,17 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             //                 (x penetration 10.5, killer obj=NULL)
             // Without the bound the model lifted the player 21 px onto the top
             // and planned on, and a cold paid six iterations at x=11,366.
+            // --swingpushflight [2026-09-29]: the reach GD allows a flying body is 6.0, not the
+            // ground 10.0 (collidedWithObjectInternal 0x391c48 / 0x391bc1), on both faces and
+            // whatever the gravity. lv22 t=8,195: a swing clips the side of two stacked blocks
+            // with its foot 6.36 below the lower one's top; GD leaves it there (it dies on the
+            // side 7 ticks later), and at 10.0 the model lifted it onto that top.
             } else if (c.mode == 7 && !deepIn && xOver
                        && std::fabs(xPrev - o->cx) > o->hw + pHalf
                        && std::fabs((double)c.y - o->cy) < o->hh + pHalf
-                       && (!g_swingPushTol
-                           || std::min(std::fabs(o->cy + o->hh + pHalf - (double)c.y),
-                                       std::fabs(o->cy - o->hh - pHalf - (double)c.y))
-                                  < kLandTol)) {
+                       && std::min(std::fabs(o->cy + o->hh + pHalf - (double)c.y),
+                                   std::fabs(o->cy - o->hh - pHalf - (double)c.y))
+                              < 6.0) {
                 const double above = o->cy + o->hh + pHalf;
                 const double below = o->cy - o->hh - pHalf;
                 const double yNow  = (double)c.y;
@@ -5845,12 +6364,46 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // the body. A second walk of the same K.near, in the same order, with the same gate --
         // the cube's form (--hazaftersolid), which has no x window here because the loop above
         // has none either.
-        if (g_flyHazAfterSolid) {
+        {
             for (const Obj* o : *K.near) {
                 if (dead) break;
                 if (o->type == 0) continue;
                 sweepFlyHazard(o);
             }
+        }
+    }
+    // --a1clatch: updateJump's half of +0xa1c, before the collision pass reaches a ramp's exit.
+    // Unless its jump block ran, a byte that is up meets playerIsFallingBugged on the vy updateJump
+    // leaves and goes down if that says "falling" (0x38c115 -> 0x38c154; the flying branch asks on
+    // every tick, 0x38cb26 -> 0x38cb2f, which comes to the same). Then the collision pass's raises.
+    {
+        if (!a1cNoFall && a1cNow) {
+            const bool fixedArm = g_fixGravityBug != 0 || s.frame != 0 || s.mode == 7;
+            if (a1cFallingBugged(a1cVyUpd, a1cUpUpd, s.dual != 0, fixedArm,
+                                 gdapprox::accelSwitchVyForSpeed(speedMulForDx(useDx))))
+                a1cNow = false;
+        }
+        if (a1cEarlySet) a1cNow = true;
+    }
+    // --portalslopeorder, the nested step (the end of stepOne says when it runs): the gravity
+    // portal comes ahead of the ramp here, tested where the update left the body, since the
+    // game's collision loop reaches it first and judges it from the rect it took at entry.
+    // A portal that does not overlap from there does not fire on this tick, and the portal
+    // pass below skips it either way.
+    if (g_prePortalUid >= 0 && K.ports) {
+        for (const Obj* p : *K.ports) {
+            if (p->uid != g_prePortalUid) continue;
+            const double pHalfPre = (c.mode == 4 && c.mini) ? kWaveContactHalfMini : pHalf;
+            const uint8_t wantUp = (p->type == 3) ? 1 : 0;
+            const bool overlaps = std::fabs(x - p->cx) <= p->hw + pHalfPre
+                                  && std::fabs((double)yFree - p->cy) <= p->hh + pHalfPre;
+            if (overlaps && gdUpOf(c) != wantUp && p->gpBit >= 0
+                && !s.portalLatch.test(p->gpBit)) {
+                c.portalLatch.set(p->gpBit);
+                VYSET(c.vy) = (float)((double)c.vy * kGravPortalScale);
+                c.flip = (c.frame == 3) ? (uint8_t)!wantUp : wantUp;
+            }
+            break;
         }
     }
     // Slopes (see slopeXOffset / slopeExitVy), for EVERY mode: measured on
@@ -5958,6 +6511,18 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                     (double)c.y, tC, tolC);
                     YSET(c.y) = (float)tC;
                     if ((double)c.vy > 0.0) VYSET(c.vy) = 0;
+                    // ...and the release nudge V4 (0x3909d5: -2.0 along gravity on the
+                    // underside, gated on !m_jumpBuffered && a flight mode && bVar22), which
+                    // the in-span upceil branch already applies through slopeNudge: it is the
+                    // same continuing contact in GD, split in two only here. The model-only check of
+                    // custom level A (iterations 53 / 55): an upright ship riding the underside of
+                    // uid 4016 (sdir 5) past its x0 lets go at t=9,420 and GD writes -2.000;
+                    // the model kept -0.069 and was 3,000 ticks off GD's death. --ceilcontv4.
+                    if (slopeNudgeMode(c.mode)) {
+                        const float vN = slopeNudge(c.vy, c.flip != 0, sp->slopeDir, c.mode,
+                                                    input);
+                        if (vN != c.vy) VYSET(c.vy) = vN;
+                    }
                     c.grounded = 0;
                     CLAMP0O("slope/ceilcont", sp);
                     ceilContNow = true;
@@ -5967,7 +6532,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     const bool revC2 = ((double)K.dxF < 0.0 || s.rev != 0);
                     if ((revC2 ? -mC : mC) < 0.0) {
                         ceilPressedNow = true;
-                        ceilPressM = mC; ceilPressMode = c.mode;
+                        ceilPressM = mC; ceilPressMode = c.mode; ceilPressUid = sp->uid;
                     }
                     break;
                 }
@@ -6055,8 +6620,32 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             double lawTop = 0.0;
             int lawUid = -1;
             bool lawUnder = false;
+            double lawM = 0.0;   // --ufolawflap: the seat's ramp slope (world frame)
             const float yBeforeSlopes = c.y;
             const uint8_t gBeforeSlopes = c.grounded;
+            // --slopetopveto [2026-09-28]: GD's first m_wasOnSlope veto, read at
+            // 0x38fa0d-0x38fa42 (frozen exe, canaries 2/2). While the body was on a
+            // ramp last tick and is climbing it in its own frame (sign * the stored
+            // slope velocity > 0), a ramp whose bVar22 holds, whose top-ness equals
+            // the current ramp's, and whose top-ness equals the body's upside-down
+            // byte is skipped before any contact test. top-ness is GD's
+            // m_isCurrentSlopeTop, directions 1/3/5/6; bVar22 is the static form
+            // used at the UFO band above. The ramp being ridden never meets it:
+            // climbing it means its own bVar22 is false.
+            // Measured on a custom level: a flipped mini UFO hangs under a rotated
+            // ramp and climbs it (its own frame) past the seam where a second
+            // ceiling ramp of the same diamond starts below; the box dips 0.453 px
+            // into the second one's rect and the model moved the body 42.55 px down
+            // to its underside, while GD's slope trace shows it evaluated and left.
+            const Obj* topVetoCur = nullptr;
+            bool topVetoClimb = false;
+            if (s.onSlope && c.frame == 0) {
+                for (const Obj* q : *K.slopes)
+                    if (q->uid == s.slopeUidNow) { topVetoCur = q; break; }
+                const double mTravV = (double)s.slopeM
+                    * (((double)K.dxF < 0.0 || s.rev != 0) ? -1.0 : 1.0);
+                topVetoClimb = c.flip ? (mTravV < 0.0) : (mTravV > 0.0);
+            }
             for (const Obj* sp : *K.slopes) {
                 // the wave does not ride anything -- it only ever dies
                 if (c.mode == 4) break;
@@ -6068,7 +6657,19 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // and the search flew a UFO down the tunnel that GD kills at
                 // x=5,119. 154 of lv18's 759 ramps are spiked, 192 of lv17's,
                 // 139 of lv19's, 88 of lv16's; lv20-22 have none.
-                if (sp->slopeHazard) continue;
+                // --spikebottom (needs --preslopesolid): ...but its flat edge is. The skip moves
+                // below the preslopegate block, so a spiked ramp's wall / strip is resolved as the
+                // same 1-px solid a plain ramp's is, and the ramp itself still never seats or
+                // carries the body. The hazard byte is not in that path: neither
+                // preSlopeCollision (0x38f2e0-0x38f800, which reads the ramp at +0x39c, +0x440,
+                // +0x444) nor collidedWithObjectInternal (0x391a70, which takes the strip) reads
+                // m_slopeIsHazard (+0x448) directly; collidedWithSlopeInternal's first read of it
+                // is at 0x3902af, after its return on preSlopeCollision's answer (0x38f88e). The
+                // ship rigs' flat-side crush (--shipslopecap below) is this strip on spiked ramps.
+                // Measured on a custom level (two recorded attempts, GD's rows): a mini ship
+                // rising under a spiked floor ramp (dir 0, box y 284..314) stops at
+                // y = 275.000 = 284 - 9 with vy 0 on the tick its rect reaches the box; the model
+                // skipped the ramp and flew on at 275.060, vy 1.249.
                 // Riding: an upright player rides the line from above, a
                 // FLIPPED one hangs under it. The flipped case used to be
                 // skipped outright, and that was lv16's wall: at t=4111 an
@@ -6079,6 +6680,206 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 const double x0 = sp->cx - sp->hw, x1 = sp->cx + sp->hw;
                 const double m = (sp->sy1 - sp->sy0) / (x1 - x0);
                 if (m == 0.0) continue;
+                // --preslopegate [2026-09-29]: PlayerObject::preSlopeCollision (0x14038f2e0), which
+                // collidedWithSlopeInternal calls first (0x14038f887) and returns on when it is
+                // true (0x14038f88e), before anything is written. It is skipped for the ramp the
+                // body is on (m_collidingWithSlopeId, the last seat's uid -- which is why a
+                // continuing ride runs past the ramp's own box), and otherwise returns
+                //   hit || !slopeRect.intersects(playerRect)
+                // with `hit` set by the flat face's wall (dir {2,3,4,6}: the left face, reached
+                // while the centre is left of it; {0,1,5,7}: the right face, only when travelling
+                // left, on static geometry) or by the 1-px strip along the ramp's flat edge
+                // (top-type dir {1,3,5,6}: centre at or above maxY; the others: centre at or
+                // below minY + 1). Neither reads the gravity. The strip / wall is also handed to
+                // collidedWithObjectInternal as a thin solid when the boxes meet -- not modelled.
+                // Witness: Custom level B t=664..668, an upside-down body on ramp uid 215
+                // followed in uid order by uid 227 whose box it has left upward (centre 304.727,
+                // maxY 300): the game's slope line shows 227 not moving the body, the model
+                // clamped it to 227's corner 300.000.
+                if (c.frame == 0 && sp->uid != c.slopeUidNow) {
+                    const uint8_t dP = sp->slopeDir;
+                    const bool wallLeftP = dP == 2 || dP == 3 || dP == 4 || dP == 6;
+                    const bool topP = dP == 1 || dP == 3 || dP == 5 || dP == 6;
+                    const bool goingLeftP = (double)K.dxF < 0.0 || s.rev != 0;
+                    const double sMinY = sp->cy - sp->hh, sMaxY = sp->cy + sp->hh;
+                    const double pyP = (double)c.y;
+                    bool hitP = wallLeftP ? (x0 > x) : (goingLeftP && x > x1);
+                    if (topP ? (pyP >= sMaxY) : (pyP <= sMinY + 1.0)) hitP = true;
+                    const bool meetP = !(x0 > x + pH || x - pH > x1
+                                         || sMinY > pyP + pH || pyP - pH > sMaxY);
+                    // --preslopesolid [2026-09-29]: ...and the wall / strip that set `hit` is
+                    // handed to collidedWithObjectInternal (0x391a70; the wall at 0x38f5a6, the
+                    // strip at 0x38f7fb) as an ordinary solid 1.0 px thick, the ramp itself as the
+                    // object and no partner, whenever the player's rect meets it (closed test,
+                    // libcocos2d intersectsRect). Static geometry, classic mode:
+                    //   wall  {2,3,4,6}, centre left of minX : [minX, minX+1] x [minY+i, maxY-i],
+                    //         i = reversed ? 1 : 0;  {0,1,5,7} only when travelling left:
+                    //         [maxX-1, maxX] x [minY+i, maxY-i], i = reversed ? 0 : 1
+                    //   strip top dirs, centre >= maxY: [minX+i, maxX-i] x [maxY-1, maxY];
+                    //         the others, centre <= minY+1: [minX+i, maxX-i] x [minY, minY+1]
+                    //         (i = the wall branch's inset, 0 when no wall branch ran)
+                    // and the callee's classic block rules resolve it: from above (every upright
+                    // body; flipped ship / ball / UFO / swing) when bot+tol >= maxY now or last
+                    // tick, snapped to maxY+h/2 if vy <= 0 or it was on a ramp; from below
+                    // (flipped bodies; upright ship / ball / UFO / swing) when minY >= top-tol,
+                    // snapped to minY-h/2 if vy >= 0 or it was on a ramp; neither -> the 0.3
+                    // inner box meeting the rect kills (0x393667 / 0x3937f8). tol 10, 6 for the
+                    // flight modes. The slope itself is then skipped this tick (preSlopeCollision
+                    // returns true, 0x38f88e -> 0x390b60).
+                    // Measured on gv18 custom levels (the recorded episodes, GD's own rows): a
+                    // flipped ball at y 435 meets a ceiling ramp's box (dir 5, x 8850..8880,
+                    // y 368.5..428.5) at its left edge and GD moves it to 443.5 = 428.5 + 15 and
+                    // grounds it; the model stayed at 435. 71 recorded episodes at three sites
+                    // part the same way (ball / mini ship on a top strip, a ship under a bottom
+                    // strip).
+                    if (hitP) {
+                        double wx0 = 0, wx1 = 0, wy0 = 0, wy1 = 0;
+                        bool wall = false;
+                        double inset = 0.0;
+                        if (wallLeftP && x0 > x) {
+                            inset = s.rev ? 1.0 : 0.0;
+                            wall = true; wx0 = x0; wx1 = x0 + 1.0;
+                            wy0 = sMinY + inset; wy1 = sMaxY - inset;
+                        } else if (!wallLeftP && goingLeftP && x > x1) {
+                            inset = s.rev ? 0.0 : 1.0;
+                            wall = true; wx0 = x1 - 1.0; wx1 = x1;
+                            wy0 = sMinY + inset; wy1 = sMaxY - inset;
+                        }
+                        const double prX = x;    // the player's rect as preSlopeCollision took it
+                        const double prY = (double)c.y;
+                        // `ownWall`: this is the wall (preSlopeCollision's probes at 0x38f45e..
+                        // 0x38f4d0 and 0x38f4d5..0x38f558, both handing the rect to
+                        // collidedWithObjectInternal at 0x38f5a6), and the ramp that
+                        // built it is not in the slope map this tick, so it cannot veto the snap.
+                        // A probe branch sets r14b (0x38f499 / 0x38f518), and the map insert at
+                        // 0x38f655..0x38f675 is skipped when it is set (0x38f638 test r14b /
+                        // jne 0x38f72e). checkCollisions seeds the map only from +0x670 / +0x678
+                        // (0x2138fd / 0x21392e): +0x678 is the ramp last ridden, which this block
+                        // does not run for (slopeUidNow, above), and +0x670's writer (0x38f727)
+                        // sits behind the same test -- a ramp approached from its wall side has
+                        // had the wall probe fire on every tick it was dispatched (the probe has
+                        // no y condition), so +0x670 does not name it either. Measured on lv16
+                        // t=6,231..6,239 (ramp uid 2549, dir 2, minX 9,210): GD holds the cube at
+                        // 225.000 = the wall's top + 15 while the centre is left of minX and
+                        // drops it back to its plate (224.952) on t=6,240, the tick it passes;
+                        // the ramp's own line at the wall's right edge (209.5) vetoed the snap and
+                        // the model stayed at 224.950. The same at t=7,048..7,058 (uid 3026). The
+                        // strip (0x38f7c5 / 0x38f7fb) takes the same r14b path and is left as it
+                        // was: no witness.
+                        auto thinSolid = [&](double rx0, double rx1, double ry0, double ry1,
+                                             bool ownWall) {
+                            if (rx0 > prX + pH || prX - pH > rx1
+                                || ry0 > prY + pH || prY - pH > ry1) return;
+                            const bool flyM = c.mode == 1 || c.mode == 3 || c.mode == 7;
+                            const bool fbM = flyM || c.mode == 2;
+                            const double tol = flyM ? 6.0 : 10.0;
+                            const double yy = (double)c.y;
+                            const double bot = yy - pH, top = yy + pH;
+                            const double pbot = (double)s.y - pH, ptop = (double)s.y + pH;
+                            const bool flipped = c.flip != 0;
+                            const bool wasOn = s.onSlope != 0;
+                            // the slope map can still veto the snap (the callee's flags
+                            // [rsp+0x34] / 0x33 top / 0x30 bottom), with no x filter: the
+                            // partner is null. A vetoed snap moves nothing and kills nothing.
+                            auto vetoed = [&](bool faceIsTop) {
+                                Obj tr{};
+                                tr.type = 0;
+                                tr.cx = (rx0 + rx1) / 2.0; tr.cy = (ry0 + ry1) / 2.0;
+                                tr.hw = (rx1 - rx0) / 2.0; tr.hh = (ry1 - ry0) / 2.0;
+                                // --stripvetoorder: THE MAP, NOT THE LEVEL. GD's veto reads the
+                                // slope map, which at this point holds the ramp last ridden and
+                                // the ramps the ascending-uid pass has already been through --
+                                // not a ramp with a larger uid than this strip's, which the pass
+                                // has not reached. The strip only (the witness); the wall keeps
+                                // the whole list.
+                                // Measured on custom level B (iteration 33) t=4,222: a ship at
+                                // x 5,925.26 meets the top strip of ceiling ramp uid 2555 (box
+                                // y 206..236) from the side, its bottom 5.357 under the top, with
+                                // floor ramp uid 2556 (box 236..266) stacked on it. GD puts it on
+                                // the top (y 251.000); the model's veto came from 2556 and left it
+                                // on 2556's line (245.403). A GD sweep of the depth (worker probe,
+                                // y injected at t=4,221): 0.5-6.0 -> 251.000, 7-13 -> 245.403
+                                // (the strip's tolerance missed, 2556 seats it), 14+ -> falls.
+                                if (g_stripVetoOrder && !ownWall && K.slopes) {
+                                    // --stripownacq: ...and the strip's OWN ramp is in the map when
+                                    // it takes the body on this tick (the reach, the inset rect and
+                                    // the free side of its line, as --slopelaw decides). Custom level A
+                                    // (model-only check, iterations 55-81 of two runs): a mini
+                                    // ball falling past the low corner of ceiling ramp uid 5474 is
+                                    // seated by it at 175.768 on t=12,785 (GD the same); with the
+                                    // larger-uid veto gone the ramp's top strip landed it at 190.000.
+                                    // An upright body that was in the air last tick only, which is the
+                                    // witness. A ball GD stands on ceiling ramp uid 3640's top strip
+                                    // (custom level F, t=6,513-6,575 at 443.500, grounded from the first tick)
+                                    // keeps the strip, though the ramp's line runs above it there.
+                                    if (!flipped && !s.grounded) {
+                                        const bool ceilO = slopeIsCeiling(sp->slopeDir);
+                                        const double sx0 = sp->cx - sp->hw, sx1 = sp->cx + sp->hw;
+                                        const double lineO = (sx1 > sx0)
+                                            ? sp->sy0 + (sp->sy1 - sp->sy0) * (x - sx0) / (sx1 - sx0)
+                                            : 0.0;
+                                        if (sx1 > sx0 && slopeWouldAcquire(sp, x, yy, pH, false)
+                                            && (ceilO ? yy < lineO : yy > lineO))
+                                            return true;
+                                    }
+                                    std::vector<const Obj*> mapped;
+                                    for (const Obj* q : *K.slopes)
+                                        if (q->uid < sp->uid || q->uid == c.slopeUidNow)
+                                            mapped.push_back(q);
+                                    return slopeVetoesSolidIn(&tr, mapped.data(),
+                                                              mapped.data() + mapped.size(), x, yy,
+                                                              pH, pH, faceIsTop, xPrev, (double)s.y,
+                                                              c.slopeUidNow, true, nullptr);
+                                }
+                                return slopeVetoesSolid(&tr, K.slopes, x, yy, pH, pH, faceIsTop,
+                                                        xPrev, (double)s.y, c.slopeUidNow, true,
+                                                        ownWall ? sp : nullptr);
+                            };
+                            if ((!flipped || fbM) && (bot + tol >= ry1 || pbot + tol >= ry1)) {
+                                if (((double)c.vy <= 0.0 || wasOn) && !vetoed(true)) {
+                                    YSET(c.y) = (float)(ry1 + pH);
+                                    VYSET(c.vy) = 0.f;
+                                    c.grounded = 1;
+                                    CLAMP0O("slope/thin-top", sp);
+                                }
+                                return;
+                            }
+                            if ((flipped || fbM) && (ry0 >= top - tol || ry0 >= ptop - tol)) {
+                                if (((double)c.vy >= 0.0 || wasOn) && !vetoed(false)) {
+                                    YSET(c.y) = (float)(ry0 - pH);
+                                    VYSET(c.vy) = 0.f;
+                                    if (flipped) c.grounded = 1;
+                                    CLAMP0O("slope/thin-bottom", sp);
+                                }
+                                return;
+                            }
+                            const double ih = 0.3 * pH;
+                            if (!(rx0 > x + ih || x - ih > rx1
+                                  || ry0 > yy + ih || yy - ih > ry1))
+                                DIE("slope/thin-crush", sp);
+                        };
+                        if (wall) thinSolid(wx0, wx1, wy0, wy1, true);
+                        if (!dead && (topP ? ((double)c.y >= sMaxY) : ((double)c.y <= sMinY + 1.0))) {
+                            if (topP) thinSolid(x0 + inset, x1 - inset, sMaxY - 1.0, sMaxY, false);
+                            else thinSolid(x0 + inset, x1 - inset, sMinY, sMinY + 1.0, false);
+                        }
+                        continue;
+                    }
+                    if (!meetP) continue;
+                }
+                // --spikebottom: the spiked ramp's strip / wall has had its turn; the rest is the
+                // ride, which a spiked ramp never gives (see the note at the top of the loop).
+                if (sp->slopeHazard) continue;
+                if (topVetoCur && topVetoClimb) {   // --slopetopveto, see above the loop
+                    const auto topDir = [](uint8_t d) { return d == 1 || d == 3 || d == 5 || d == 6; };
+                    const bool upV = sp->slopeDir == 0 || sp->slopeDir == 3
+                                  || sp->slopeDir == 6 || sp->slopeDir == 7;
+                    const bool leftV = (double)K.dxF < 0.0 || s.rev != 0;
+                    const bool bandV = ((!upV) != leftV) != (c.flip != 0);
+                    const bool curTop = topDir(topVetoCur->slopeDir);
+                    if (bandV && curTop == topDir(sp->slopeDir) && curTop == (c.flip != 0))
+                        continue;
+                }
                 // ...but "flipped" does NOT mean "ceiling". A FLOOR ramp blocks
                 // an inverted player from below exactly as the ground plane does
                 // ("GD's ground plane blocks the player from BELOW whatever its
@@ -6184,11 +6985,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // where it shifts the target by m_vehicleSize * 20.0f. See
                 // slopeSeatOff in slopes.hpp for bVar9 and for why this arm has
                 // no corpus witness.
-                const double seatOff = g_noSlopeSeat
-                    ? 0.0
-                    : slopeSeatOff(sp, K.slopes,
-                                   s.onSlope ? (int)s.slopeUidNow : -1,
-                                   s.onSlope != 0, c.mini != 0);
+                const double seatOff = slopeSeatOff(sp, K.slopes,
+                                                    s.onSlope ? (int)s.slopeUidNow : -1,
+                                                    s.onSlope != 0, c.mini != 0);
                 // Downhill ramps hold the player up exactly the same way; the
                 // contact point is just on the other side of the box, because
                 // GD tilts the player the other way. lv18 x=3,615 is a 210->180
@@ -6208,6 +7007,19 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // `inside` is the strict version, for telling "still on it"
                 // apart from "just ran off the top" (see rampWindowHere).
                 struct Smp { double xr; bool ok; bool inside; };
+                // GD's own end of a continuing floor-side ride (the --rideseatrepeat note in the
+                // r window below): the ride the body was on last tick still holds while its seat
+                // (slopeSeatTarget, clamped to the ramp's box) differs from the one written last
+                // tick, and is dropped on the tick it repeats bit-exactly. Only the tick's own
+                // sample. Shared by --rideseatrepeat and --extseatrepeat.
+                auto rideSeatMoves = [&](double cx) {
+                    if (!(s.onSlope && c.frame == 0 && (int)s.slopeUidNow == sp->uid
+                          && cx == x))
+                        return false;
+                    const float seatR =
+                        (float)slopeSeatTarget(sp, cx, pH, false, seatOff);
+                    return seatR != s.y;
+                };
                 auto sampleAt = [&](double cx) {
                     // ridesTop, not !c.flip: an inverted player standing on a
                     // FLOOR ramp contacts it with the same rotated corner an
@@ -6249,7 +7061,23 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                 // cx crosses x1+11.459 (=pH-xoff). Keeping extC
                                 // (33.54) is 1 tick late (census nearceil edvy
                                 // -3.229).
-                                if (K.near) {
+                                bool flushFlat = false;
+                                // --groundflushflat: the level's ground is a flat as
+                                // much as a block is. Custom level J t=15,867: a
+                                // cube rides uid8869 (m -1, low end 90 = the ground)
+                                // past x1 on the extrapolated line, 3.554 px below the
+                                // ground's seat on 15,866 and 4.853 on 15,867; GD
+                                // releases on 15,867 (vy -5.193, the release stamp)
+                                // and stands at 105.000, where the model, finding no
+                                // block, kept the air window and rode on underground.
+                                if (std::fabs((revE ? (double)sp->sy0
+                                                    : (double)sp->sy1)
+                                              - kGroundY) <= 0.5) {
+                                    extC = slopeXOffset(m, pH)
+                                         + kStickGap / std::fabs(m);
+                                    flushFlat = true;
+                                }
+                                if (K.near && !flushFlat) {
                                     const double xEndF = revE ? x0 : x1;
                                     const double yEndF = revE
                                         ? (double)sp->sy0 : (double)sp->sy1;
@@ -6270,13 +7098,38 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                             // at 3 speeds)
                                             extC = slopeXOffset(m, pH)
                                                  + kStickGap / std::fabs(m);
+                                            flushFlat = true;
                                             break;
                                         }
                                     }
                                 }
-                                const bool okE = revE
+                                bool okE = revE
                                     ? (r <= x1 && cx >= x0 - extC)
                                     : (r >= x0 && cx <= x1 + extC);
+                                // --extseatrepeat [2026-09-30]: the air extC is
+                                // exactly where the seat, line(cx) + pH*sqrt(1+m^2),
+                                // reaches the low end's line value, objMinY, so this
+                                // window ends the ride on the FIRST tick whose seat
+                                // slopeSeatTarget clamps to the box bottom. GD
+                                // has no x window for a continuing ride
+                                // (rideSeatMoves): it seats the body at the clamp
+                                // once, onGround still set, and drops the contact
+                                // on the next tick, whose clamped seat repeats the
+                                // one written, with the release from there.
+                                // Measured on a custom level (an upright cube past
+                                // the low end of a m -0.5 ramp, twice): 150.273 on
+                                // the line, then 150.000 = objMinY at x1 + 34.29
+                                // (unclamped 149.624), 150.000 again -> dropped,
+                                // 149.951 with vy -2.597. The window released on
+                                // the first of those ticks, from 150.273, and fell
+                                // one tick ahead for the rest of the drop (dead one
+                                // tick early).
+                                // Air past the end only: a flush flat's shorter
+                                // window above was measured on its own.
+                                if (!okE && !flushFlat
+                                    && (revE ? r <= x1 : r >= x0)
+                                    && rideSeatMoves(cx))
+                                    okE = true;
                                 return Smp{r, okE, r >= x0 && r <= x1};
                             }
                         }
@@ -6351,6 +7204,19 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         bool ok = rev
                             ? (r >= x0 - rideGrace && r <= x1)
                             : (r >= x0 && r <= x1 + rideGrace);
+                        // --rideseatrepeat [2026-09-29]: a CONTINUING ride has no x window in
+                        // the game. Its seat is the extrapolated line clamped to the ramp's
+                        // box (slopeSeatTarget), and the acquisition is dropped only when that
+                        // seat is bit-identical to the one written last (m_wasOnSlope and
+                        // targetY == [+0x940], 0x390415-0x390488): a ride that reaches the
+                        // clamp seats there once more and leaves on the tick after. Measured
+                        // on lv20 t=19,244 (coins): a ship riding up uid 15507 changes size
+                        // and speed on the tick before (pH 9 -> 15, dx 1.047 -> 1.614), so
+                        // the contact point jumps 2.5 px past the window; the game seats it
+                        // at the clamp 195.000 and launches on t=19,245 (+2.762, one tick
+                        // of factor 0.4). Only the ramp the body rode last tick, and only
+                        // the tick's own sample.
+                        if (!ok && rideSeatMoves(cx)) ok = true;
                         // [2026-08-20] **On the landing tick only, grab if at the
                         // height of the high end's flat clamp.** Puts in, in that
                         // narrow form, the note from when "widen the entry side by
@@ -6740,6 +7606,20 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         if (revH && m < 0 && cx + xoffH > x1)
                             return Smp{x1, false, false};
                     }
+                    // --hangseatrepeat: a flipped cube's (or robot's) hang ends on the tick its seat
+                    // repeats. The game drops a continuing acquisition when the target is the seat it
+                    // wrote last (m_wasOnSlope and targetY == [+0x940], 0x390415-0x390488), the rule
+                    // --rideseatrepeat carries for a floor ride. This branch clamps the sample to the
+                    // ramp's end, so a hang that has run off it was seated at the end corner on every
+                    // tick. Measured on a custom level's dual: the flipped half under a ceiling ramp
+                    // (m -1) is seated at the end corner 465.000 once and leaves on the next tick with
+                    // the ramp's launch, the tick its upright partner leaves the mirrored floor ramp;
+                    // the model re-seated it there for five more ticks.
+                    if ((c.mode == 0 || c.mode == 5) && c.frame == 0
+                        && s.onSlope && (int)s.slopeUidNow == sp->uid && cx == x) {
+                        const float seatH = (float)slopeSeatTarget(sp, cx, pH, true, seatOff);
+                        if (seatH == s.y) return Smp{(m < 0) ? x1 : x0, false, false};
+                    }
                     return Smp{(sa <= sb) ? a : b, ok, ok};
                 };
                 const auto smp = sampleAt(x);
@@ -6820,6 +7700,17 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     const double flat =
                         gdSeat ? slopeSeatTarget(sp, cx, pH, true, seatOff)
                                : sp->sy0 + m * (rc - x0) - pH;
+                    // --ceilwallnopush: on this ramp's wall side (dirs {2,3,4,6} with the centre
+                    // left of the box, the others travelling left and right of it) GD never reaches
+                    // the ramp's own seat -- preSlopeCollision (0x38f2e0) reports the 1-px wall and
+                    // collidedWithSlopeInternal returns at 0x38f88e -- so the valley's flat corner
+                    // below is not this ramp's to impose. The neighbour whose span holds the centre
+                    // seats the body through its own pass (its line, or its own cap past its end).
+                    const bool wallSideL = c.mode == 1
+                        && ((sp->slopeDir == 2 || sp->slopeDir == 3 || sp->slopeDir == 4
+                             || sp->slopeDir == 6)
+                                ? cx < x0
+                                : (((double)K.dxF < 0.0 || s.rev != 0) && cx > x1));
                     // SHIP ONLY, like everything else measured here: letting
                     // the extension serve every mode moved lv19's UFO at
                     // t=14,799 onto a ceiling it never touches in GD (58 px,
@@ -6858,8 +7749,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                 const double rr = std::min(r, nx1);
                                 const double ext = nb->sy0
                                     + nm * (rr - nx0) - pH;
-                                return (nm * m > 0.0) ? ext
-                                                      : std::min(ext, flat);
+                                return (nm * m > 0.0 || wallSideL) ? ext
+                                                                   : std::min(ext, flat);
                             }
                             if (r < x0 && std::abs(nx1 - x0) <= 0.5
                                 && std::abs((double)nb->sy1
@@ -6867,15 +7758,15 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                 const double rr = std::max(r, nx0);
                                 const double ext = nb->sy0
                                     + nm * (rr - nx0) - pH;
-                                return (nm * m > 0.0) ? ext
-                                                      : std::min(ext, flat);
+                                return (nm * m > 0.0 || wallSideL) ? ext
+                                                                   : std::min(ext, flat);
                             }
                         }
                     }
                     return flat;
                 };
                 auto ceilLimAt = [&](double cx) {
-                    return ceilLimSeat(cx, !g_noSlopeSeat);
+                    return ceilLimSeat(cx, true);
                 };
                 // ...and a FLIPPED player meets that same ceiling from the other
                 // side. GD does not hang it under the line -- it pushes it OUT of
@@ -6964,6 +7855,35 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                     "lim=%.3f rc=%.2f x0=%.1f x1=%.1f inY=%d\n",
                                     (long long)K.t, x, sp->uid, (double)c.y,
                                     limU, rcU, x0, x1, inYU ? 1 : 0);
+                    // --undercrush: a fresh underside contact is GD's by its own three stages --
+                    // preSlopeCollision's 1-px end strip, the object rect inset 1 px top and
+                    // bottom, and y > targetY at the centre x, extrapolated -- not by the contact
+                    // point entering the span, which is what gates the push below. On a custom
+                    // level a cube rising under a rising ceiling ramp's left end died in GD's
+                    // rows 5 ticks before that contact point reached the box.
+                    if ((c.mode == 0 || c.mode == 5 || c.mode == 6)
+                        && !s.onSlope && s.ceilT == 0) {
+                        const bool graceC =
+                            (((c.mode != s.mode) ? 0 : (int)s.modeT + 1) < kFlipGraceTicks)
+                            || (((gdUpOf(c) != gdUpOf(s)) ? 0 : (int)s.flipT + 1)
+                                < kFlipGraceTicks);
+                        const uint8_t dC = sp->slopeDir;
+                        const bool leftFaceC = (dC == 2 || dC == 3 || dC == 4 || dC == 6);
+                        const bool probeC = leftFaceC
+                            ? (x < sp->cx - sp->hw)
+                            : (((double)K.dxF < 0.0 || s.rev != 0) && sp->cx + sp->hw < x);
+                        if (!graceC && !probeC
+                            && slopeWouldAcquire(sp, x, (double)c.y, pH, false)) {
+                            const double tgtC = slopeSeatTarget(sp, x, pH, true, seatOff);
+                            if (g_slopeDbg)
+                                std::printf("undercrush: t=%lld p%d uid=%d y=%.4f seat=%.4f\n",
+                                            (long long)K.t, g_halfNow + 1, sp->uid,
+                                            (double)c.y, tgtC);
+                            if ((double)c.y - 2.0 > tgtC) DIE("slope/crush", sp);
+                            else c.grounded = 0;
+                            continue;
+                        }
+                    }
                     // [2026-08-21 r40] **No grace on the exit side.** The push-out
                     // is a geometric constraint, not a "ride", so it no longer
                     // applies on the tick the contact point exits the span. The
@@ -7011,9 +7931,12 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // plain gravity, -0.387). Off the whitelist the push ends 1
                     // tick early and that tick alone free-falls (census
                     // `m6/.../sp1.1/air` edy -0.686, re-converges next tick).
+                    // --ballunderv3: ...and the ball. Custom level G t=2,930: a ball pressed down
+                    // the underside of uid1479 (m 1) takes its corner flat 346.000 on the
+                    // tick rc leaves the span and is released on 2,931 at 6.906 x 22/24.
                     const bool contU =
                         (c.mode == 1 || c.mode == 3 || c.mode == 6
-                         || c.mode == 7)
+                         || c.mode == 7 || (c.mode == 2))
                         && s.ceilT > 0 && (revU ? -m : m) < 0.0
                         && (!revU ? (rcU > x1 && x <= x1 + pH)
                                   : (rcU < x0 && x >= x0 - pH));
@@ -7064,8 +7987,16 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                 < kFlipGraceTicks
                             || ((gdUpOf(c) != gdUpOf(s)) ? 0 : (int)s.flipT + 1)
                                 < kFlipGraceTicks);
+                    // The same window past the low end for a FRESH contact (no ride last tick).
+                    // GD's acquisition there is the box overlapping the ramp past the 1-px inset
+                    // (insetRefusedU below), not m_wasOnSlope.
+                    const bool freshEndU =
+                        (c.mode == 1 || c.mode == 3 || c.mode == 6 || c.mode == 7)
+                        && s.ceilT == 0 && (revU ? -m : m) < 0.0
+                        && (!revU ? (rcU > x1 && x <= x1 + pH)
+                                  : (rcU < x0 && x >= x0 - pH));
                     const bool winU = (rcU >= x0 && rcU <= x1) || contU
-                                      || cubeGraceU;
+                                      || cubeGraceU || freshEndU;
                     // [2026-09-05] **GD ACQUIRES FROM BELOW THE LINE, this does
                     // not.** `c.y > limU` only ever acts once the player is
                     // already through the ceiling; GD takes it while still under
@@ -7105,13 +8036,52 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                           || c.mode == 4 || c.mode == 7);
                     const bool seatedPrevU =
                         std::fabs((double)s.y - ceilLimAt(xPrev)) <= 0.001;
+                    // --upceilband [2026-09-28]: bVar22 IS a term of this band after all.
+                    // The underside branch clears al for a ship / UFO / wave / swing
+                    // whose ramp has bVar22 set (r15b; 0x14038ffcb-0x14038fffb, the
+                    // platformer byte +0xb70 being the only way back), and the strict
+                    // `y > targetY` is then all that can seat it. Witnesses, one each
+                    // way: lv19 t=5,465's ramp (uid 3205, sdir 3, rising in the travel,
+                    // bVar22 clear) lifts a held ship 0.79 px from below; lv16 t=19,509
+                    // (a held mini ship of a dual under uid 9974, sdir 1, bVar22 set)
+                    // is left 0.332 px under the line, where the model lifted it, and
+                    // the ramp takes it only on the next tick, from above.
+                    const bool upU = sp->slopeDir == 0 || sp->slopeDir == 3
+                                  || sp->slopeDir == 6 || sp->slopeDir == 7;
+                    const bool band22U = ((!upU) != revU) != (c.flip != 0);
                     const double tolU =
                         (flightU && input && !c.onSlope
-                         && !ceilContNow)
+                         && !ceilContNow && !band22U)
                             ? (seatedPrevU ? 2.0 : 1.0)
                             : 0.0;
-                    if (inYU && winU
+                    // --slopeinset: the fresh-contact inset (see the ceiling press above).
+                    const bool insetRefusedU = !wasOnSlopeG && overlapG <= 1.0;
+                    // --upceilrepeat [2026-09-29]: a continuing contact whose seat is bit-equal
+                    // to the one the last tick took is dropped before anything is written
+                    // (0x390415-0x390488: m_wasOnSlope and targetY == +0x940), so a body held
+                    // at a ramp's clamped end leaves it on the second tick there. lv16's coin
+                    // route (an upright ship pressed up under the ceiling V of uids 7515 / 7547,
+                    // whose tip is at (23190,600)): GD seats it at the clamped 585.000 on
+                    // t=15,171 and on t=15,172 drops the contact and launches it at -4.316;
+                    // the model clamped it to 585 for four more ticks.
+                    const bool repeatDroppedU = wasOnSlopeG && (float)limU == s.y;
+                    if (inYU && winU && !insetRefusedU && !repeatDroppedU
                         && (double)c.y > limU - tolU) {
+                        // --undercrush [2026-09-30]: the cube family is not seated on an
+                        // underside outside the grace. collidedWithSlopeInternal's underside
+                        // path for a non-flight, non-ball body (0x3900e1-0x39023b) kills it
+                        // when (y - 2) > targetY and otherwise only clears the grounded flags,
+                        // writing neither y nor vy; the grace seat above is the one exception.
+                        // m_stateHitHead (+0xb7c) > 0 would skip this, and the model does not
+                        // carry it. Witnesses: recorded attempts on custom levels where GD's
+                        // rows fly on unmoved while within 2 px of the seat and die on the first
+                        // acquiring tick past it (upright cubes under ceiling ramps).
+                        if ((c.mode == 0 || c.mode == 5 || c.mode == 6)
+                            && !cubeGraceU && (double)c.y > limU) {
+                            if ((double)c.y - 2.0 > limU) DIE("slope/crush", sp);
+                            else c.grounded = 0;
+                            continue;
+                        }
                         // Reached from UNDER the line: the branch below is the
                         // push-out, which assumes the player was through it.
                         const bool seatU = ((double)c.y <= limU);
@@ -7154,7 +8124,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         // a press: the exit launch fires on this very tick.
                         if ((revU ? -m : m) < 0.0 && !cubeGraceU) {
                             ceilPressedNow = true;
-                            ceilPressM = m; ceilPressMode = c.mode;
+                            ceilPressM = m; ceilPressMode = c.mode; ceilPressUid = sp->uid;
                         }
                         // [2026-08-20 r36] **The push-out drops vy to the face's
                         // value too.** The lv20 t=18,826 measurement above says so
@@ -7256,7 +8226,12 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                             }
                         } else {
                             const double vClampU = (c.mode == 6) ? 0.0 : -2.0;
-                            if (dirU < 0.0 && (freshU || holdRelU)
+                            // --ballunderv3: not the BALL. Custom level G t=2,909:
+                            // a ball rising at +2.649 meets uid1467's underside (m 1,
+                            // falling in the travel); GD reads vy 0.000 (V3 alone), then
+                            // the ball's gravity steps, where the model wrote -2.000.
+                            if (!(c.mode == 2)
+                                && dirU < 0.0 && (freshU || holdRelU)
                                 && (double)c.vy > vClampU) {
                                 VYSET(c.vy) = (float)vClampU;
                                 CLAMP0O("slope/upceil", sp);
@@ -7293,8 +8268,127 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // keeping the y pin and vy=0, so the launch (-7.880) was 1
                     // tick late (the swing never reaches this branch, mode!=7, so
                     // the sampleAt-side fix closed it first).
-                    if (inY && rc >= x0
-                        && rc <= x1 + std::fabs((double)useDx)) {
+                    // --flipceilend: a CONTINUING cube ride has no x window. GD's
+                    // continuation test is a y comparison with the ramp's far edge
+                    // (0x38fc08-0x38fc2f) and its seat is the extrapolated line,
+                    // clamped (slopeSeatTarget); the ride ends on the tick whose seat
+                    // is bit-identical to the one it wrote last (0x390415-0x390488:
+                    // m_wasOnSlope and targetY == [+0x940] -> the acquisition is
+                    // dropped), i.e. on the second tick of a clamped seat. On a
+                    // custom level a flipped mini cube rode 17 px past the ramp's
+                    // end, seated at objMaxY on one tick, and left on the next with
+                    // the release stamp; the model let go where the contact point
+                    // left the span. A continuing candidate is GD's: the broad phase
+                    // (the player's box against the ramp's rect doubled about its
+                    // centre, collisionCheckObjects 0x214ac8) and the y test alone --
+                    // flipped, it ends when objMinY is past the head, py + the seat's
+                    // secant half + the continuing tolerance 4. Its gate takes that
+                    // tolerance too (targetY < py + 4, strict): with a solid pushing
+                    // the body back each tick the seat keeps moving, and the ride
+                    // ends on the tick the line has run 4 px away (GD's own trace,
+                    // the same level: a flat block holds y at 825 while the ramp's
+                    // seat climbs 826.055, 826.704, ...; the call stops acquiring when
+                    // it is 4.25 ahead). The seat written last is read off s.y, which
+                    // is that seat unless something moved the body after it.
+                    const double headC = (double)c.y + pH * std::sqrt(1.0 + m * m)
+                                       + 4.0;
+                    // ...and a SHIP's continuing ride the same way, while its band is open
+                    // (extraTol for a ship is !m_jumpBuffered, 0x38fe6b-0x38fe74; bVar22 is
+                    // the mirrored-downhill test hangSnap already makes). The model-only check of
+                    // custom level A (a dual mini ship, iteration 63): p2, flipped, is seated on
+                    // uid 5798's gravity-facing side at t=13,766 and GD keeps it on the line
+                    // into uid 5799 at 13,767 (327.026, 1.586 above the free y, the button
+                    // up); the model's 1.0 let it go and it left at vy 6.457. --shipceiltol4.
+                    const bool shipCont = c.mode == 1
+                                          && !(input != 0 && !c.holdDead);
+                    const bool contRide =
+                        (c.mode == 0 || shipCont) && c.frame == 0
+                        && s.onSlope && s.grounded && !impulsedThisTick
+                        && std::fabs(x - sp->cx) <= 2.0 * sp->hw + pH
+                        && std::fabs((double)c.y - sp->cy) <= 2.0 * sp->hh + pH
+                        && !((double)(sp->cy - sp->hh) > headC);
+                    // --contseatclamp: AT A SAME-SIGN SEAM THE OLD RAMP STILL HOLDS THE RIDE. GD keeps
+                    // a continuing ride on the ramp it started on past that ramp's end, seated on its
+                    // extrapolated line clamped to its extent (slopeSeatTarget, the cube's continuation
+                    // note above), and lets go on the tick the seat repeats. While the two lines are
+                    // one line that is invisible -- except on the one tick the old ramp's line first
+                    // passes its corner, where the clamp seats the body ON the corner. The model has
+                    // handed the ride to the next ramp by then, so it sits that one tick on the corner
+                    // here: this ramp's line has just passed the corner shared with the previous
+                    // same-sign ramp, and the body was still short of it a tick ago.
+                    // custom level A (model-only check, iterations 63-71), p2 a flipped mini ship riding the ceiling
+                    // chain uid 5798 -> 5799 -> 5800 (m +1, corners 330 / 360): GD p2y 330.000 at
+                    // t=13,769 and 360.000 at 13,788, each for one tick, then the line again
+                    // (331.866 / 362.518); the model went straight along the line (330.253 / 360.905).
+                    // Measured shape only: a flipped ship climbing to the right.
+                    double limSeat = lim;
+                    if (contRide && c.mode == 1 && c.flip && m > 0.0
+                        && (double)K.dxF > 0.0 && s.rev == 0) {
+                        const double corner = sp->sy0;
+                        bool prevSame = false;
+                        for (const Obj* nb : *K.slopes) {
+                            if (nb == sp || nb->slopeHazard) continue;
+                            const double nx0 = nb->cx - nb->hw, nx1 = nb->cx + nb->hw;
+                            if (nx1 <= nx0) continue;
+                            const double nm = (nb->sy1 - nb->sy0) / (nx1 - nx0);
+                            if (nm > 0.0 && std::abs(nx1 - x0) <= 0.5
+                                && std::abs((double)nb->sy1 - corner) <= 0.5
+                                && slopeIsCeiling(nb->slopeDir)) { prevSame = true; break; }
+                        }
+                        if (prevSame && lim > corner && (double)s.y < corner - 1e-6)
+                            limSeat = corner;
+                    }
+                    const bool seatRepeats = contRide && (float)limSeat == s.y;
+                    // --ceilgracerider: the exit-side grace above is the RIDER's corner tick. A body
+                    // that was not on the ramp last tick is pushed only while the contact point is in
+                    // the span. Custom level B (model-only check, iterations 42 / 82 / 83), p2 a flipped mini ship
+                    // held at 321.05 under the thin solid uid 4805 (bottom 330.05), level with the end
+                    // of ceiling ramp uid 4804 (330 at x1 = 13,140): at t=8,691 its contact point is
+                    // x1 + 1.11 and the model pushed it to the clamped 321.000, off the solid, and it
+                    // fell (vy -2.762) the next tick; GD holds 321.05 on.
+                    // A SHIP only, as are both witnesses here and of --ceilfreshrect below: a flipped
+                    // mini ball held the same way under a thin solid at a ceiling ramp's end (custom level A,
+                    // model-only check, iteration 73, uid 5474, t=12,810: 0.05 into the rect, contact point
+                    // x1 + 0.88) IS seated by GD (141.000) and released the tick after (vy -2.762).
+                    const bool shipC = c.mode == 1;
+                    const double exitGrace = (shipC && !s.onSlope)
+                                                 ? 0.0 : std::fabs((double)useDx);
+                    // --ceilfreshrect: a FRESH contact is GD's inset-rect test (the ramp window's
+                    // freshRectOk: the player's box against the ramp's rect shrunk by 1 px in y), not
+                    // the plain overlap inY takes. Custom level B (model-only check, iteration 29), p2 a flipped full-
+                    // size ship held at 161.05 under the thin solid uid 2502 (bottom 176.05) as ceiling
+                    // ramp uid 2504 (rect 176..206, m +0.5) starts beside it: at t=4,104 its top
+                    // reaches 176.017, 0.017 into the rect, and the model's hang snap pulled it up the
+                    // line (161.621, then +0.807 a tick); GD stays under the solid (161.050).
+                    const bool freshRectC = !shipC || s.onSlope || contRide
+                        || ((double)yFreeBeforeSlope + pH >= sp->cy - sp->hh + 1.0
+                            && (double)yFreeBeforeSlope - pH <= sp->cy + sp->hh - 1.0);
+                    // --ceilpushreach: ...and its x reach is the box overlap GD's acquisition takes
+                    // (slopeWouldAcquire: px + pH >= rx0), not the rotated contact point. Custom level B
+                    // (model-only check, iteration 30), p2 a flipped full-size ship sinking into ceiling ramp
+                    // uid 2433 (rect 5,520..5,580 x 206..236, m -0.5) from its low end: at t=3,964
+                    // its box is 3.8 px into the span and 11 px into the rect, and GD seats it on
+                    // the line taken at its centre, past the span (224.836, the model's lim to the
+                    // digit), then rides it down 0.807 a tick; the contact point (5,512.3) was
+                    // short of x0 and the model left it inside until it died on 3,969.
+                    // ...and once that contact has made it a ride, the ride goes on the same way: a
+                    // CONTINUING ride has no x window (the --flipceilend note above). Without this the
+                    // next tick's contact point, still short of x0, dropped the body the push had just
+                    // seated -- custom level H (model-only check, iterations 106-109; a flipped mini cube sliding down onto
+                    // ceiling ramp uid 585 from left of its span: GD 473.250 seated at t=1,729, the model
+                    // 473.948 falling) and custom level E, iteration 4 (a flipped ball, t=7,617).
+                    const bool reachC = rc >= x0
+                        // (the fresh reach is the whole of slopeWouldAcquire's fresh test, the inset
+                        // rect included, whatever the mode: without it a ball grazing a ramp's rect
+                        // from beside its span was pushed -- custom level A t=12,847, twenty model-only check episodes)
+                        || (!s.onSlope && x + pH >= x0
+                            && (double)yFreeBeforeSlope + pH >= sp->cy - sp->hh + 1.0
+                            && (double)yFreeBeforeSlope - pH <= sp->cy + sp->hh - 1.0)
+                        || contRide
+                        || (s.onSlope && s.slopeUidNow == sp->uid
+                            && !(c.onSlope && c.slopeUidNow != sp->uid));
+                    if (inY && freshRectC && reachC && !seatRepeats
+                        && (rc <= x1 + exitGrace || contRide)) {
                         // Inside the ramp the flipped player is either pushed out
                         // of the solid half or in free flight -- it never HANGS
                         // from a ceiling ramp. GD's own standtrace says so: over
@@ -7335,18 +8429,62 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         // gate the final +0.405 to 4,142's high-end corner
                         // (line(x1)-pH = 435.000) never appears -- GD stands at
                         // 435.000 until 4,146).
+                        // --flipceilride: the CUBE's ride continuation too. A
+                        // flipped cube riding a ceiling ramp's gravity-facing side
+                        // (its floor) sits the line's own rise per tick short of lim,
+                        // so the `y > lim` pin never fired: the ride dropped, the
+                        // downhill release below stamped +2.597, and the cube fell
+                        // back onto the ramp seven ticks later, over and over. GD
+                        // rides the line: on a custom level (flipped cube, ramp
+                        // id 484 rot 180, m=0.5) GD moves +0.649 a tick with dvy 0
+                        // and its slope byte up on every tick, the model 0.05 with
+                        // the saw-tooth. Only the continuation
+                        // (already riding and standing), not the ship's rising
+                        // acquisition, which is the ship's measurement. Never on
+                        // a jump tick: the snap lands on the line the jumping
+                        // body has just left and the zeroing below erased the
+                        // jump (the same ride, pressed: vy 0 and the cube fell
+                        // back, where without the flag it leaves at -11.18).
+                        const bool cubeRide =
+                            c.mode == 0 && c.frame == 0
+                            && s.onSlope && s.grounded && !impulsedThisTick;
+                        // --flipceilland: ...and the cube's rising acquisition,
+                        // the ship's snap above. On a custom level (flipped mini
+                        // cube rising at 6.048 onto an id 493 rot 180, m=0.5) GD
+                        // lifts it +0.893 onto the line, vy 0 and onGround 1, and
+                        // rides; the model stopped 0.89 short of lim, missed the
+                        // pin and kept the 6.264.
+                        const bool cubeLand =
+                            c.mode == 0 && c.frame == 0
+                            && (double)c.vy > 0.0 && !impulsedThisTick;
+                        // (--flipceilend: a continuing ride takes GD's tolerance 4,
+                        // strict, in place of the 1.0 -- see contRide above)
                         const bool hangSnap =
-                            c.mode == 1
+                            (c.mode == 1 || cubeRide || cubeLand || contRide)
                             && ((double)c.vy > 0.0
                                 || (s.onSlope && s.grounded))
                             && ((((double)K.dxF < 0.0 || s.rev != 0) ? -m : m)
                                 > 0.01)
                             && ((((double)K.dxF < 0.0 || s.rev != 0))
                                     ? (rc <= x1 - 0.8) : (rc >= x0 + 0.8))
-                            && (double)c.y <= lim
-                            && lim - (double)c.y <= 1.0;
-                        if ((double)c.y > lim || hangSnap) {
-                            YSET(c.y) = (float)lim;
+                            && (double)c.y <= limSeat
+                            && (contRide ? limSeat - (double)c.y < 4.0
+                                         : limSeat - (double)c.y <= 1.0);
+                        // --flipcldbg (print only): a state --flipceilland changes -- a
+                        // non-dual cube pinned here while moving into the floor and not
+                        // already riding, i.e. its snap or its zeroing below.
+                        if (g_flipLandDbgLeft.load(std::memory_order_relaxed) > 0
+                            && c.mode == 0 && c.frame == 0
+                            && !s.dual && !cubeRide && (double)c.vy > 0.0
+                            && ((double)c.y > lim || hangSnap)
+                            && g_flipLandDbgLeft.fetch_sub(1) > 0)
+                            std::printf("flipcl t=%lld x=%.3f uid=%d y=%.3f lim=%.3f "
+                                        "vy=%.3f snap=%d sOn=%d sG=%d\n",
+                                        (long long)K.t, x, sp->uid, (double)c.y, lim,
+                                        (double)c.vy, (double)c.y > lim ? 0 : 1,
+                                        (int)s.onSlope, (int)s.grounded);
+                        if ((double)c.y > limSeat || hangSnap) {
+                            YSET(c.y) = (float)limSeat;
                             // vy: TWO cases share this pin. A body moving AWAY
                             // from the surface (falling through from above,
                             // lv21 t=19,837, vy=-9.884) keeps its vy -- the
@@ -7508,12 +8646,27 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                 VYSET(c.vy) = 0.f;
                                 flyHangRide = true;
                             }
+                            // --flipceilland: the single-player cube the same, in a
+                            // non-rotated world, on the ball's reasoning above (lv22's
+                            // counter-example is frame != 0). On a custom level a
+                            // flipped cube rising at 13.544 lands on an id 311 (m=0.5):
+                            // GD vy 0 and onGround 1; the model seated it on the same
+                            // y and kept the 13.76.
                             if (!flyHangRide
                                 && ((c.mode == 0 && s.dual)
+                                    || (c.mode == 0 && c.frame == 0)
                                     || ((c.mode == 2 || c.mode == 1
                                          || c.mode == 3)
                                         && c.frame == 0))
                                 && (double)c.vy > 0.0) VYSET(c.vy) = 0.f;
+                            // ...and the cube's ride (--flipceilride): GD's dvy is 0
+                            // along the line (the custom level above), where the model's
+                            // gravity step had added 0.216 a tick. Only a velocity
+                            // that is not AWAY from the floor: an impulse away from
+                            // it (an orb or a pad on the ride) is kept. `>=`, not
+                            // `>`: the ride arrives here with -0.0 too.
+                            if ((cubeRide || contRide) && (double)c.vy >= 0.0)
+                                VYSET(c.vy) = 0.f;
                             // ...and GD calls that STANDING (onGround=1 at
                             // t=4,636, then a jump at vy=-2.390). The flag only
                             // survives if the ramp is remembered too -- the
@@ -7529,6 +8682,19 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                             // model wrote -7.405 (= slopeExitVy(1,cube)) on the
                             // next tick and fell back onto the ramp (dy 46px).
                             if (!impulsedThisTick) {
+                                // --hanglandgate [2026-09-29]: this side is hitGround's, and
+                                // hitGround lands the body only while its speed in the
+                                // gravity frame is at most 5.0; above it the old velocity
+                                // is put back and m_isOnGround stays clear, though the seat
+                                // and m_isOnSlope are written. lv21 t=19,841: a flipped cube
+                                // moving away from ceiling ramp uid 26823 at -9.668 is
+                                // pushed out onto its line and keeps falling away (-9.452
+                                // the next tick, no ground); grounded, the model stood it
+                                // on the ramp at vy 0, and a cold run repeated the same
+                                // death there five times.
+                                const bool awayFastH =
+                                    (double)c.vy * (c.flip ? -1.0 : 1.0) > kSlopeLandV;
+                                if (!awayFastH) {
                                 c.grounded = 1;
                                 // grounded here IS the landing, so the ride
                                 // carries it (State::rideLanded). Setting the
@@ -7537,6 +8703,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                 // the exit then refused a launch GD makes --
                                 // lv16 t=13,117, mini ball, GD -5.179.
                                 c.rideLanded = 1;
+                                }
                                 c.onSlope = 1;
                                 c.slopeM = (float)m;
                                 // the ramp the ride began on (State::slopeUid0)
@@ -7651,7 +8818,21 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         }
                         return false;
                     };
-                    const bool cornerReg = (c.mode == 1) && !inSpan
+                    // --ceilwallnopush: ...and not from the ramp's wall side (see ceilLimSeat). A
+                    // rising ceiling ramp's corner regime is exactly its left end, i.e. always the
+                    // wall side of a dir 3 / 6 ramp: there GD seats the ship on the descending
+                    // neighbour's line, or not at all, and the spiked twin's cap does the rest.
+                    // Custom-level witnesses: an upright ship rising into a ceiling V of 60x30
+                    // plain+spiked twins, 5.6 px left of the join, is seated by GD at
+                    // line(x) - ph*sqrt(1+m^2) = 226.018 where this regime put it at the join's
+                    // 240 - 15 = 225.000; a mini ship 6.5-7.8 px left of a 30x30 join is not
+                    // pushed at all (free flight, 1.3-1.5 px above the join - 9).
+                    const bool wallSideC =
+                        (sp->slopeDir == 2 || sp->slopeDir == 3 || sp->slopeDir == 4
+                         || sp->slopeDir == 6)
+                            ? (double)x < x0
+                            : (((double)K.dxF < 0.0 || s.rev != 0) && (double)x > x1);
+                    const bool cornerReg = (c.mode == 1) && !inSpan && !wallSideC
                         && (m < 0 ? (rc > x1 && (double)x - pH <= x1 + 0.5)
                                   : (rc < x0
                                      && (double)x + pH >= x0 - 0.5))
@@ -7760,7 +8941,23 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         ? ((double)s.y >= limPrev - 0.05
                            && (double)s.y <= limPrev + 2.0)
                         : ((double)s.y <= limPrev + 0.05);
-                    if (ceilOk && pressGate) {
+                    // --slopeinset [2026-09-29]: a FRESH contact (GD's m_wasOnSlope clear; the
+                    // model's s.onSlope / s.ceilT) is refused unless the player's rect meets the
+                    // ramp's rect inset by 1 px top and bottom, CCRect(x, y + 1, w, h - 2)
+                    // (collidedWithSlopeInternal 0x14038fc39-0x14038fc7b, constants 1.0 / 2.0).
+                    // Seen from under a ceiling ramp that is "more than 1 px into it". It is the
+                    // mechanism under the start-inside gate above: that gate's own witness (lv16
+                    // t=15,366 free at 0.889 px inside, the snap one tick later) and lv16 coin
+                    // t=14,908 (a ship rising past ramp uid 7515's corner: GD leaves it free at
+                    // 0.363 / 0.655 / 0.931 px and pushes at t=14,911, 1.19 px in, where the
+                    // start-inside gate pushed three ticks early).
+                    const bool insetRefusedC =
+                        !(s.onSlope || s.ceilT > 0)
+                        && ((double)c.y + pH <= sp->cy - sp->hh + 1.0);
+                    // --upceilrepeat: the seat-repeat drop (see the upceil clamp below).
+                    const bool repeatDroppedC =
+                        (s.onSlope || s.ceilT > 0) && (float)lim == s.y;
+                    if (ceilOk && pressGate && !insetRefusedC && !repeatDroppedC) {
                         if ((double)c.y > lim
                             && (c.mode == 1 || rcInSpan)) {   // r42: see the rcInSpan note
                             YSET(c.y) = (float)lim;
@@ -7775,7 +8972,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                             // writes -2.762 = 6.906 x 0.4 after the move.
                             if (m * (double)useDx < 0.0) {
                                 ceilPressedNow = true;
-                                ceilPressM = m; ceilPressMode = c.mode;
+                                ceilPressM = m; ceilPressMode = c.mode; ceilPressUid = sp->uid;
                             }
                             // ...and GD does NOT stop the player dead here: it
                             // SETS the velocity to the ride's own +-2.000, the
@@ -7827,6 +9024,20 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                                ? (float)(2.0 * dir) : 0.f;
                                 }
                                 CLAMP0("slope/ceillim");
+                            } else if (slopeNudgeMode(c.mode)) {
+                                // --ceillimv4 [2026-09-29]: V4 is not an acquisition write. The
+                                // underside branch places it on every contact while the button is
+                                // up and vy is above -2.0 (the upceil note's lv16 witnesses fire
+                                // on one contact four times), and this push-out only placed it
+                                // from a rising body. lv20 t=14,458: a ship flipped upright by a
+                                // portal comes to ceiling ramp uid 11803 at vy -1.0775, released;
+                                // GD reads -2.000.
+                                const float vN = slopeNudge(c.vy, c.flip != 0, sp->slopeDir,
+                                                            c.mode, input);
+                                if (vN != c.vy) {
+                                    VYSET(c.vy) = vN;
+                                    CLAMP0("slope/ceillim");
+                                }
                             }
                         // [2026-08-21 r78] **While still being pressed on the same
                         // tick, do not fire the valley's corner release.** lv20
@@ -7961,6 +9172,51 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     ((double)K.dxF < 0.0 || s.rev != 0) ? -1.0 : 1.0;
                 const double xHiPO = (m > 0) ? x1 : x0;
                 bool okHere = smp.ok;
+                bool seamHere = false;   // the concave-seam switch below took this ramp
+                // A CONCAVE SEAM: the body rides a floor ramp and the next ramp of the same
+                // surface (contiguous in x and in y at the seam) seats it higher. GD runs the
+                // slope law on every candidate while m_wasOnSlope -- the cheap y test, then
+                // targetY > y against the y the earlier ramp's seat just wrote (candidates in
+                // ascending uid) -- so the steeper ramp takes over on the first tick its seat
+                // tops the current one, before the contact point reaches its span. The model-only check
+                // custom level A (a ball, iterations 12/13/16/19/22): riding uid 1733 (m=0.5,
+                // ends at x 6,450, y 150) into uid 1734 (m=2, starts there), GD's y is 1734's
+                // seat from t=4,962 on (161.605 against 1733's 161.287; at 4,961 1734's 159.009
+                // is below 160.637 and GD stays); the model waited for the window to 4,964.
+                // Only a contiguous seam of two floor ramps without spikes: a candidate
+                // elsewhere in the broad phase is not what was measured.
+                // (The ramp ridden is last tick's, s.slopeUidNow: this tick's ride writes
+                // c.onSlope / c.slopeUidNow later in the pass, so they are not set yet when
+                // the next ramp is reached. And the two seats are compared directly, so the
+                // order the loop meets the two ramps in does not matter.)
+                if (!okHere && s.onSlope && ridesTop && !ceilRamp
+                    && !sp->slopeHazard && c.frame == 0
+                    && (int)s.slopeUidNow != sp->uid) {
+                    const Obj* cur = nullptr;
+                    for (const Obj* q : *K.slopes)
+                        if (q->uid == (int)s.slopeUidNow) { cur = q; break; }
+                    if (cur && !slopeIsCeiling(cur->slopeDir) && !cur->slopeHazard) {
+                        const bool revS = ((double)K.dxF < 0.0 || s.rev != 0);
+                        const double cx0 = cur->cx - cur->hw, cx1 = cur->cx + cur->hw;
+                        const double xs = revS ? cx0 : cx1;           // the seam's x
+                        const double xb = revS ? x1 : x0;             // the next ramp's near end
+                        const double yCur = cur->sy0 + (cur->sy1 - cur->sy0) * (xs - cx0)
+                                                           / (cx1 - cx0);
+                        const double yNext = sp->sy0 + m * (xb - x0);
+                        if (std::fabs(xs - xb) < 0.5 && std::fabs(yCur - yNext) < 0.5
+                            && slopeSeatTarget(sp, x, pH, false, 0.0)
+                                   > slopeSeatTarget(cur, x, pH, false, 0.0)) {
+                            okHere = true;
+                            seamHere = true;
+                            if (g_slopeDbg)
+                                std::printf("slopeseam t=%lld p%d from uid=%d (seat %.4f) to "
+                                            "uid=%d (seat %.4f) y=%.4f\n", (long long)K.t,
+                                            g_halfNow + 1, cur->uid,
+                                            slopeSeatTarget(cur, x, pH, false, 0.0), sp->uid,
+                                            slopeSeatTarget(sp, x, pH, false, 0.0), (double)c.y);
+                        }
+                    }
+                }
                 // [2026-09-08] `!c.flip` REMOVED. It was the only orientation
                 // test in this gate, and GD has no counterpart to it.
                 //
@@ -8157,11 +9413,72 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     const bool vertProbe =
                         leftFace ? (x < sp->cx - sp->hw)
                                  : (goingLeftSL && sp->cx + sp->hw < x);
+                    // --lawfreeclamp: the side is read against the line as the seat reads it,
+                    // clamped to the ramp's span (slopeSeatTarget clamps x the same way). A
+                    // centre past the end compared with the extrapolated line read a body
+                    // under a ceiling ramp's low end as above it. Custom level D
+                    // t=3,571: a flipped ship rises into the apex of two ceiling ramps
+                    // (uid1058 m -1 ending at 390, uid1059 rising from it), centre 14.9 px
+                    // past uid1058's x1 and 1.255 px into the apex; GD seats it at 375.000
+                    // (og 1, then -2.222 off the ramp), while the line extended to the
+                    // centre said 375.08 and the model flew on into the ceiling.
+                    const double lineSide = sp->sy0 + m * (std::clamp(x, x0, x1) - x0);
                     const bool freeSide =
-                        ceilRamp ? ((double)c.y < lineSL)
-                                 : ((double)c.y > lineSL);
-                    if (!preVeto && !vertProbe && freeSide
-                        && slopeWouldAcquire(sp, x, (double)c.y, pH, false)) {
+                        ceilRamp ? ((double)c.y < lineSide)
+                                 : ((double)c.y > lineSide);
+                    // --lawcontact: the tick after a law seat the contact is a CONTINUING one
+                    // (m_wasOnSlope, State::seatT). GD then reaches the ramp through the cheap
+                    // edge test instead of the inset rect (0x38fc0e-0x38fc2c), widens the
+                    // gate by tol = bVar22 * 4 (0x38fab3-0x38fad0) -- acquire if
+                    // targetY + tol > y (0x38feae-0x38feb9) whenever extraTol holds, which for
+                    // a body that is not flying is !isTop && bVar22 && !m_isOnSlope &&
+                    // +0xa1c == 0 (0x38fe2b-0x38fe7d) -- and drops an acquisition whose
+                    // target equals the last one (0x390415-0x390488: [player+0x940], the
+                    // target that seat wrote, which the law left in y).
+                    const bool contSL = lawWasOn && !ceilRamp;
+                    bool acqSL = slopeWouldAcquire(sp, x, (double)c.y, pH, contSL);
+                    if (contSL && !acqSL && seatOff == 0.0
+                        && slopeBVar22(false, sp->slopeDir) && !(a1cNow)) {
+                        // the helper's reach test for a continuing contact, then the band
+                        const double cosB = std::cos(std::atan(std::fabs(m)));
+                        const bool reachB = x + pH >= x0 && x - pH <= x1
+                            && !((double)c.y - pH / cosB - 4.0 > oMaxSL);
+                        if (reachB && slopeSeatTarget(sp, x, pH, false, 0.0) + 4.0
+                                          > (double)c.y)
+                            acqSL = true;
+                    }
+                    // ...and a FRESH contact has the same band at tol = 1 (0x38fab3: bVar22 ? 1,
+                    // x4 only with m_wasOnSlope): past the inset rect test, acquire if
+                    // targetY + 1 > y whenever extraTol holds -- for a SHIP bVar22 && !bVar9 &&
+                    // !m_isOnSlope && !m_jumpBuffered[+0x985] (0x38fe2b-0x38fe93). So GD pulls a
+                    // ship falling onto a DESCENDING ramp down from up to 1 px above the seat,
+                    // where the strict test waits for it to sink in. Measured in GD (Windows
+                    // worker, custom level B iteration 33, p1 an upright ship on uid 2536, m=-0.5,
+                    // seat 278.094 at t=4,144, y injected after 4,143): it seats from 0.998 px above
+                    // and not from 1.008, the same at vy -1, -4.4, -6 and -8 and at vy 0 and +1, on
+                    // the tick the button was let go; the tick before (0.866 px above, the button
+                    // down) it does not. Custom level A (a mini ship, m=-1) seats from 0.955 and
+                    // not from 1.036. The ramp window's ship gate below carries the same band
+                    // (shipBand). Ship and upright only, the measured case; the other modes' band
+                    // (UFO / wave / swing always, the cube while +0xa1c is clear) is not taken here.
+                    if (!contSL && !acqSL && !ceilRamp && c.flip == 0 && seatOff == 0.0
+                        && !c.onSlope && (slopeBVar22(false, sp->slopeDir) != goingLeftSL)
+                        && c.mode == 1 && !(input != 0 && !c.holdDead)) {
+                        const bool reachF = x + pH >= x0 && x - pH <= x1
+                            && (double)c.y + pH >= oMinSL + 1.0
+                            && (double)c.y - pH <= oMaxSL - 1.0;
+                        if (reachF && slopeSeatTarget(sp, x, pH, false, 0.0) + 1.0
+                                          > (double)c.y)
+                            acqSL = true;
+                    }
+                    const bool dropSL =
+                        contSL && !preVeto && !vertProbe && freeSide && acqSL
+                        && (float)slopeSeatTarget(sp, x, pH, false, seatOff) == s.y;
+                    if (dropSL) {
+                        lawRepeatDrop = true;
+                        lawDropM = m;
+                    }
+                    if (!preVeto && !vertProbe && freeSide && acqSL && !dropSL) {
                         const double tgtSL =
                             slopeSeatTarget(sp, x, pH, ceilRamp, seatOff);
                         if (g_slopeDbg)
@@ -8178,6 +9495,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         lawTop = tgtSL;
                         lawUid = sp->uid;
                         lawUnder = slopeUnderside(c.flip != 0, sp->slopeDir);
+                        lawM = m;
                         // ...and what the acquisition writes BESIDES y. Two
                         // independent witnesses, one per side, both of them the
                         // measurement that produced this rule rather than a
@@ -8274,7 +9592,6 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     }
                 }
                 if (!okHere) continue;
-                const double xr = smp.xr;
                 // `top` is the resting y: the surface plus the player's half in
                 // the PLAYER's frame, so a flipped player hangs under a ceiling
                 // ramp at surface - pH.
@@ -8319,28 +9636,43 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // without it, which cannot happen if these two branches differ
                 // here -- so the question is which one ran, and that is not a
                 // thing to settle by arithmetic on the printed value.
-                const char* topSrc = "?";
-                if (!g_noSlopeSeat) {
-                    top = slopeSeatTarget(sp, x, pH, gs < 0.0, seatOff);
-                    topSrc = "seatTarget";
-                } else {
-                    top = sp->sy0 + m * (xr - x0) + gs * hangOff;
-                    topSrc = "flatOld";
-                    if (c.mode == 2 && gs < 0.0) {
-                        // The hang's low end is bounded by the **flat** at
-                        // line(end) - pH (lv16 t=13,116: 583.000 = sy1 - 9, not
-                        // the rotated amount 581.6).
-                        const double lowLine = (m < 0)
-                            ? (sp->sy0 + m * (x1 - x0)) : sp->sy0;
-                        top = std::max(top, lowLine - pH);
-                    }
-                }
+                const char* topSrc = "seatTarget";
+                top = slopeSeatTarget(sp, x, pH, gs < 0.0, seatOff);
                 // [r33] On a tick pushed out at the ridge, no ramp's seat drops
                 // below the apex height (measurements at pushOutSeat's declaration).
                 if (pushOutSeat && !c.flip) {
                     const double beforePush = top;
                     top = std::max(top, pushOutTop);
                     if (top != beforePush) topSrc = "pushOutSeat";
+                }
+                // --seatkeepfirst [2026-09-28]: a DOWNHILL ramp met after another ramp has
+                // already seated the body on this tick gets no acquisition tolerance. In
+                // collidedWithSlopeInternal the floor-side acquisition is `targetY > y`, or
+                // `targetY + tol > y` when al is set (0x14038fe96-0x14038fefd), and al is
+                // cleared for a ramp that falls away in the body's travel (r15b, the same bVar22
+                // as the band) when m_isOnSlope is ALREADY set (0x14038fe35); the flag is only
+                // set by an earlier call's seat (0x140390750), the tick's first write being the
+                // clear in checkCollisions (0x140213890). A second call that fails the strict
+                // test returns before any write (0x140390523): the body keeps the earlier ramp's
+                // m_slopeVelocity, top-ness and seat.
+                // Measured on lv16 t=14,143: an uphill ramp (uid 7148) seats a ship on its end
+                // corner (578.800) and the downhill ramp that starts there (uid 7149, high corner
+                // 578.800) comes next; the game's line for it reads "y 578.800 -> 578.800", and
+                // the next tick launches the body UPWARD at +2.762, the uphill ramp's exit. An
+                // injection sweep at that tick gets the same launch for every height from 1.1 to
+                // 16 px above the downhill line. The model gave the contact to 7149 and rode it
+                // down, which also kept --slopetopveto from firing on the tick after (the ramp it
+                // thought it was climbing was the downhill one); with both, the recorder call
+                // follows the game to its death 157 ticks later.
+                if (c.onSlope && c.frame == 0) {
+                    const bool upK = sp->slopeDir == 0 || sp->slopeDir == 3
+                                  || sp->slopeDir == 6 || sp->slopeDir == 7;
+                    const bool leftK = (double)K.dxF < 0.0 || s.rev != 0;
+                    const bool fallsAway = ((!upK) != leftK) != (c.flip != 0);
+                    // in float, as the game compares them (targetY is cvtsd2ss'd): the
+                    // double 578.8 is above the float 578.79999 the first ramp wrote
+                    const float topF = (float)top;
+                    if (fallsAway && !(gs > 0.0 ? topF > c.y : topF < c.y)) continue;
                 }
                 // ...and it only counts as "a ramp still has me" if its resting
                 // height is where the player actually is. The window alone is
@@ -8470,12 +9802,28 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                 sp ? sp->id : -1, smp.inside ? 1 : 0,
                                 top, (double)s.y, gap, tol, (double)useDx,
                                 pH, m, gs, seatOff,
-                                g_noSlopeSeat ? "flat" : "secant",
+                                "secant",
                                 topSrc, smp.xr, hangOff, (double)sp->sy0, x0,
                                 (smp.inside && gap <= tol) ? 1 : 0);
                 }
+                // --hangrunoff: ...but not for a ship hanging under the ramp whose contact point has
+                // already run off the end it travels toward. sampleAt keeps such a hang "inside"
+                // for one more dx (the corner grace the hang's exits share), and when that is the
+                // tick the ride ends, the window suppressed the exit launch. Measured on a custom
+                // level (a flipped ship under a ceiling ramp, m -0.5, 19 ticks from the contact):
+                // the contact point at x1 + 1.47 (grace 1.61), the model's ride ends there and
+                // GD leaves with the ramped launch -2.952 = 3.729 x 19/24, where the model kept
+                // the ship's own -2.086 plus one tick of its acceleration.
+                bool hangRanOff = false;
+                if (c.mode == 1 && !ridesTop) {
+                    const bool revW = ((double)K.dxF < 0.0 || s.rev != 0);
+                    const double xoffW = slopeXOffset(m, pH);
+                    hangRanOff = (!revW && m < 0 && x + xoffW > x1)
+                              || (revW && m > 0 && x - xoffW < x0);
+                }
                 if (smp.inside && std::fabs(top - (double)s.y)
-                                      <= 3.0 * std::fabs((double)useDx))
+                                      <= 3.0 * std::fabs((double)useDx)
+                    && !hangRanOff)
                     rampWindowHere = true;
                 // Only ride it if the player came from ON or ABOVE the surface.
                 // Without this a ship flying INTO the slope from below gets
@@ -8483,18 +9831,11 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // a regression: lv18's wall went backwards from x=5,115 to
                 // x=3,716 the moment the ship branch got the unconditional
                 // version, because the search then planned through the ramp.
-                // sampleAt already clamps to [x0,x1] on the normal path. The outer
-                // re-clamp was redundant and killed the prevTop of the
-                // extrapolated ride continuation (the new branch above), so it was
-                // removed (2026-08-19).
-                const double xrPrev = sampleAt(xPrev).xr;
-                // ...and the previous tick's seat is the SAME formula one step
+                // The previous tick's seat is the SAME formula one step
                 // back -- GD re-evaluates slopeYPos at the advanced centre x on
                 // every acquiring tick (0x39072c-0x39074a), which is where the
                 // measured -0.807 px/tick descent (m*dx) comes from.
-                const double prevTop = g_noSlopeSeat
-                    ? (sp->sy0 + m * (xrPrev - x0) + gs * pH)
-                    : slopeSeatTarget(sp, xPrev, pH, gs < 0.0, seatOff);
+                const double prevTop = slopeSeatTarget(sp, xPrev, pH, gs < 0.0, seatOff);
                 // Came from the wrong side? Normally not a ride -- but if the
                 // player is INSIDE the ramp's solid slice, GD lifts it out onto
                 // the surface rather than letting it through, and that is the
@@ -8549,8 +9890,53 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                 (!insideSolid
                                  && ((double)s.y - prevTop) * gs < -kLandTol)
                                     ? 1 : 0);
-                if (!insideSolid && ((double)s.y - prevTop) * gs < -kLandTol)
+                if (!insideSolid && ((double)s.y - prevTop) * gs < -kLandTol) {
+                    // --lawfrombelow: ...but a contact the window accepted and this
+                    // gate throws away still goes to GD's own law, which has no
+                    // "came from below" and no bound on how far below the seat the
+                    // body may be. On a custom level a cube rising at 8.29 enters
+                    // a ramp's low tip; GD's slope call seats it 14.18 px up onto
+                    // the line (vy kept, onGround2 only -- s*v > 5.0) on the first
+                    // tick its centre is past objMinY + 1, and not the tick before
+                    // (preSlopeCollision's probe). The law block above never saw
+                    // it: it only runs when the window did not accept.
+                    // CUBE ONLY, the measured mode: letting a UFO take it on a
+                    // custom level seated one 42.55 px off the game's y (both
+                    // riding the same ramp) and the level's fixups went 8 -> 134.
+                    if (c.mode == 0 && okHere && !s.onSlope) {
+                        const double oMinFB = sp->cy - sp->hh;
+                        const double oMaxFB = sp->cy + sp->hh;
+                        const double lineFB = sp->sy0 + m * (x - x0);
+                        const bool preVetoFB = ceilRamp
+                            ? ((double)c.y >= oMaxFB)
+                            : ((double)c.y <= oMinFB + 1.0);
+                        const uint8_t dFB = sp->slopeDir;
+                        const bool leftFaceFB =
+                            (dFB == 2 || dFB == 3 || dFB == 4 || dFB == 6);
+                        const bool goingLeftFB =
+                            ((double)K.dxF < 0.0 || s.rev != 0);
+                        const bool vertProbeFB =
+                            leftFaceFB ? (x < sp->cx - sp->hw)
+                                       : (goingLeftFB && sp->cx + sp->hw < x);
+                        const bool freeSideFB =
+                            ceilRamp ? ((double)c.y < lineFB)
+                                     : ((double)c.y > lineFB);
+                        if (!preVetoFB && !vertProbeFB && freeSideFB
+                            && slopeWouldAcquire(sp, x, (double)c.y, pH, false)) {
+                            lawSeat = true;
+                            lawTop = slopeSeatTarget(sp, x, pH, ceilRamp, seatOff);
+                            lawUid = sp->uid;
+                            lawUnder = slopeUnderside(c.flip != 0, sp->slopeDir);
+                            lawM = m;
+                            if (g_slopeDbg)
+                                std::printf("slopelaw: t=%lld p%d uid=%d (from "
+                                            "below) y=%.4f->%.4f\n",
+                                            (long long)K.t, g_halfNow + 1,
+                                            sp->uid, (double)c.y, lawTop);
+                        }
+                    }
                     continue;
+                }
                 // A ship lands on a ramp from slightly ABOVE it, exactly as it
                 // does on a flat surface. Measured on lv16
                 // t=3027: the ship is 0.63 px above the ramp's surface and GD
@@ -8638,10 +10024,41 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // distinction the fresh-rect site spells out at 6979-6983.
                 // lv19 t=14,587 is the missing measurement (the flat kShipLandTol
                 // it replaced was the --no-ufolandtol arm, removed in the flag clean-up).
-                const double ufoAllow = s.onSlope ? 2.0 : 1.0;
+                // --ufobanddir [2026-09-28]: ...and GD opens that band only when
+                // bVar22 holds. Its static form (0x38f8c8-0x38f9f8) is
+                // (!uphill) XOR goingLeft XOR (upsideDown != sideways), uphill being
+                // m_slopeUphill (directions 0/3/6/7); without it the tolerance is 0
+                // (0x38fab3) and the extra-tolerance flag stays clear, so the body
+                // is taken only once it is below the seat. A floor ramp climbing in
+                // the travel direction therefore takes no allowance -- measured on
+                // lv19 t=14,589 (UFO falling at -0.224 onto uid9522, m=+1): the body
+                // is 0.886 px above the seat and GD leaves it alone, then takes it
+                // the next tick from 0.798 px below; the 1.0 grabbed it a tick early
+                // and the seat stayed 0.0027 px off for the rest of the ride.
+                // The rotated frame keeps the old width (sideways is not read here).
+                const bool uphillU = sp->slopeDir == 0 || sp->slopeDir == 3
+                                  || sp->slopeDir == 6 || sp->slopeDir == 7;
+                const bool goingLeftU = (double)K.dxF < 0.0 || s.rev != 0;
+                const bool bandU = ((!uphillU) != goingLeftU) != (c.flip != 0);
+                const double ufoAllow = (c.frame == 0 && !bandU)
+                                            ? 0.001
+                                            : (s.onSlope ? 2.0 : 1.0);
+                // ...and the SHIP gets the same fresh band (tol 1, @0x38fea5-0x38feb6) when
+                // extraTol holds, which for a ship is bVar22 && !bVar9 && !m_isOnSlope &&
+                // !m_jumpBuffered[+0x985] (0x38fe6b-0x38fe74: a press the thrust has not let
+                // go of closes it). Measured in GD on a Windows worker (custom level B
+                // iteration 33, an upright ship falling onto uid 2536, m=-0.5): seated from
+                // 0.998 px above the seat, not from 1.008, at vy -1 to -8, 0 and +1, on the
+                // tick the button was let go -- and not on the tick before, 0.866 px above
+                // with the button still down. lv16 t=9,402's 0.989 px above (the note before
+                // this one) is the same rule: the button is down there too. Fresh contacts
+                // only (s.onSlope is the model's m_wasOnSlope); upright only, as measured.
+                const bool shipBand = c.mode == 1 && c.frame == 0 && !s.onSlope
+                    && c.flip == 0 && bandU && seatOff == 0.0
+                    && !(input != 0 && !c.holdDead);
                 const double landAllow =
                     (ridesTop && (c.mode == 1 || c.mode == 3) && !ufoRising)
-                        ? (c.mode == 1 ? 0.001 : ufoAllow)
+                        ? (c.mode == 1 ? (shipBand ? 1.0 : 0.001) : ufoAllow)
                         : 0.001;
                 // The stick must stay CONTINUOUS. It bypasses the acquisition
                 // test entirely, so with several ramps stacked in the same x
@@ -8704,15 +10121,23 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 const bool shipLeaving =
                     c.mode == 1 && (double)c.vy * gs > 0.0
                     && ((double)c.y - top) * gs > landAllow;
+                // --bandfloorunstick: the band's floor ends the ride. Custom level A (model-only check, iterations
+                // 63-71), p1 an upright mini ship riding floor ramps uid 5796 -> 5821 (m -1) down
+                // into a band whose floor is 120: the line takes it under the floor at t=13,801
+                // (128.122, GD the same), the next tick GD puts it on the floor (129.000) and
+                // holds it there to the end of the episode with its rotation easing off the
+                // ramp's 45 degrees; the model's stick pulled it back to the line (126.509).
                 const bool stickHere =
-                    stickToSlope
+                    stickToSlope && !(bandFloorHeld)
                     && std::fabs(top - (double)s.y) <= kStickGap
                     && !(ufoRising && m > 0.0
                          && ((double)c.y - top) * gs > landAllow)
                     && !shipLeaving;
                 // an end-clamped sample never overwrites an in-span acquisition
                 // (note at the loop head)
-                if (slopeTookInside && !smp.inside) continue;
+                // (...unless the concave seam handed this ramp over: its contact point is short
+                // of the span by construction, and it is the ramp GD takes.)
+                if (slopeTookInside && !smp.inside && !seamHere) continue;
                 // ---- [2026-08-19 slopeland calibration rig] A falling cube's
                 // acquisition starts 1.0px above the seat. GD snaps it downward
                 // and seats it 1 tick before "the centre crosses the seat" (the
@@ -8743,9 +10168,14 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 const double rRaw = x + (m > 0 ? slopeXOffset(m, pH)
                                                : -slopeXOffset(m, pH));
                 const bool revT = ((double)K.dxF < 0.0 || s.rev != 0);
+                // --seattoldual: ...and in a dual section too. The rig was single-
+                // player, so `!s.dual` was its scope, not a counter-example. On a
+                // custom level the dual's upright cube falls at 9.556 onto an m=-1
+                // ramp and GD's own slope call pulls it 0.555 down onto the seat on
+                // the tick it is 0.555 above it (and not the tick before, at
+                // 1.408), vy 0 and onSlope 1; the model waited a tick.
                 const bool seatTolOk =
                     ridesTop && !c.flip && (c.mode == 0 || c.mode == 2)
-                    && !s.dual
                     && !s.grounded && (double)c.vy * gs <= 0.0
                     && (revT ? -m : m) < -0.01
                     && (revT ? (rRaw <= x1 - 0.8) : (rRaw >= x0 + 0.8))
@@ -8787,6 +10217,12 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     for (const Obj* fo : *K.near) {
                         if (fo->type != 0) continue;
                         if (std::fabs(x - fo->cx) > fo->hw + pH + kContactEps)
+                            continue;
+                        // --lawcontact: a flat the ramp vetoes holds nothing (the support
+                        // scan's note)
+                        if (lawWasOn
+                            && vetoOf(K, fo, x, (double)c.y, pH, pH, gs > 0.0, xPrev,
+                                      (double)s.y, c.slopeUidNow, true))
                             continue;
                         const double ff = (gs > 0.0) ? (fo->cy + fo->hh)
                                                      : (fo->cy - fo->hh);
@@ -8857,7 +10293,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // placement is written because the disassembly says so, not
                 // because a tick asked for it.
                 bool freshRectOk = true;
-                if (!s.onSlope) {
+                // --lawcontact: after a law seat the contact is a continuing one (lawWasOn),
+                // which takes the edge test instead (see the law's note)
+                if (!s.onSlope && !lawWasOn) {
                     const double ry0 = sp->cy - sp->hh;
                     const double ry1 = sp->cy + sp->hh;
                     const double py = (double)yFreeBeforeSlope;
@@ -8874,8 +10312,39 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                     (seatTolOk || seatFromPreLand || stickHere
                                      || insideSolid) ? 1 : 0);
                 }
-                if (freshRectOk
-                    && (((double)c.y - top) * gs <= landAllow || seatTolOk
+                // --lawcontact: ...and the continuing contact's 4 px band (the law's note), and
+                // its drop of a target equal to the last one, here too: the window can take the
+                // ramp on a tick the law would have.
+                const bool lawBandOk =
+                    lawWasOn && ridesTop && !c.flip && seatOff == 0.0
+                    && slopeBVar22(false, sp->slopeDir) && !(a1cNow)
+                    && ((double)c.y - top) * gs <= 4.0;
+                const bool lawRideDrop = lawWasOn && ridesTop && !c.flip
+                                         && (float)top == s.y;
+                if (lawRideDrop && freshRectOk
+                    && (((double)c.y - top) * gs <= landAllow || lawBandOk || seatTolOk
+                        || seatFromPreLand || stickHere || insideSolid)) {
+                    lawRepeatDrop = true;
+                    lawDropM = m;
+                }
+                // --balltapstep: a ball tapping off a ramp that falls in the travel takes the
+                // seat's step on the tap tick, as the cube's jump does (the impulse tick's seat
+                // below), and only the position: the tap owns vy. The tap ends the ride's stick,
+                // so the step is written here, for the ramp ridden last tick. Custom level
+                // custom level E t=7,586: a ball riding uid2130 (m -1) taps; GD y=194.084 = the seat
+                // one step down, vy 3.354, where the model kept 195.382.
+                if (c.mode == 2 && impulsedThisTick && s.onSlope && !s.flip
+                    && ridesTop && sp->uid == s.slopeUidNow && freshRectOk && c.frame == 0
+                    && m * (((double)K.dxF < 0.0 || s.rev != 0) ? -1.0 : 1.0) < -0.01
+                    && (double)c.y > top && (double)c.y - top <= kStickGap) {
+                    if (g_slopeDbg)
+                        std::printf("balltapstep: t=%lld uid=%d y %.4f -> %.4f\n",
+                                    (long long)K.t, sp->uid, (double)c.y, top);
+                    YSET(c.y) = (float)top;
+                    continue;
+                }
+                if (freshRectOk && !lawRideDrop
+                    && (((double)c.y - top) * gs <= landAllow || lawBandOk || seatTolOk
                         || seatFromPreLand || stickHere || insideSolid)) {
                     // [2026-08-19] On the tick a downhill rider's centre crosses
                     // the slope rect's top edge (cy+hh), GD clamps **to there for
@@ -8996,6 +10465,27 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     c.slopeUidNow = sp->uid;
                             continue;
                         }
+                    }
+                    // --flipcubecrush: a flipped CUBE meeting a floor ramp's top afresh meets it
+                    // with its head, the mirror of an upright cube under a ceiling ramp, and the
+                    // same underside rule holds (--undercrush, the law seat's copy): outside the
+                    // flip grace, more than 2 px past the seat it dies, within 2 px it is left
+                    // where it is. Custom level D t=8,403 (dual p2, flipped cube rising
+                    // against its gravity at vy -8.80 onto uid3420, m 1): 1.476 px past the seat
+                    // GD leaves it (380.325), and dies on 8,404 at 4.7 px; the model seated it on
+                    // the ramp as a landing and rode on.
+                    if (flipForRide && ridesTop && !ceilRampSide
+                        && c.mode == 0 && !s.onSlope && c.frame == 0
+                        && !((((c.mode != s.mode) ? 0 : (int)s.modeT + 1) < kFlipGraceTicks)
+                             || (((gdUpOf(c) != gdUpOf(s)) ? 0 : (int)s.flipT + 1)
+                                 < kFlipGraceTicks))) {
+                        const double penF = top - (double)c.y;
+                        if (g_slopeDbg)
+                            std::printf("flipcubecrush: t=%lld p%d uid=%d y=%.4f seat=%.4f "
+                                        "pen=%.4f\n", (long long)K.t, g_halfNow + 1, sp->uid,
+                                        (double)c.y, top, penF);
+                        if (penF > 2.0) DIE("slope/crush", sp);
+                        continue;
                     }
                     if (smp.inside) slopeTookInside = true;
                     // --slopedbg: WHICH condition acquired the ramp, and with
@@ -9346,6 +10836,18 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // The lv22 spider measurement is only flipForRide **and**
                     // ridesTop=1 (the case pushed out onto a floor ramp's top
                     // face by r60's hatch).
+                    // --undersidev3 [2026-09-29]: ...and on that face GD does not
+                    // leave vy alone either. The underside branch of the seat
+                    // (V3, 0x390942 / 0x390949) has no mode test: it clamps vy
+                    // to min(vy,0) upright / max(vy,0) flipped for every mode, the
+                    // V3 that the flight modes already get above. The spider's
+                    // +2.891..+3.278 pass through max(vy,0) untouched. lv16 t=13,265
+                    // (dual, p2 a flipped mini ball pushed along floor ramp uid
+                    // 6639's top): a yellow pad has just thrown it at -7.680 into
+                    // the ramp, and GD reads vy 0 with y still on the ramp's line;
+                    // the model kept -7.551.
+                    } else if (slopeUnderside(c.flip != 0, sp->slopeDir)) {
+                        if ((c.flip ? -1.0 : 1.0) * (double)c.vy > 0.0) VYSET(c.vy) = 0.f;
                     } else if (!(flipForRide && ridesTop)) {
                         VYSET(c.vy) = 0;
                     }
@@ -9395,9 +10897,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // back would erase them for any contact entered above 5.0
                     // (lv16 t=14,588 arrives at +7.387 and GD still reads
                     // -2.000 on that tick).
-                    const bool undoneBySide =
-                        slopeNudgeMode(c.mode)
-                        && slopeUnderside(c.flip != 0, sp->slopeDir);
+                    // --undersidev3: ...for every mode, as the clamp itself is.
+                    const bool undoneBySide = slopeUnderside(c.flip != 0, sp->slopeDir);
                     if (!rideLands && !undoneBySide)
                         VYSET(c.vy) = vyPreRide;               // 0x3907dd's restore
                     // ...and **it is not grounded either**. GD's onGround stays 0
@@ -9423,7 +10924,18 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // then flies free at 7.422 with no exit launch; carrying the
                     // earlier landing through that contact made the model emit
                     // one (4.316) on the way out.
-                    c.rideLanded = (uint8_t)rideLands;
+                    // ...that is a FRESH contact, though (the census is of acquisitions,
+                    // 0->1 / 0->0). On a ride already landed and still going, the game's
+                    // non-landing path leaves the landing as it was, so a ship holding up a
+                    // ramp whose own vy crosses 5.0 on the way keeps it and gets the exit
+                    // launch -- while its vy is still restored above, as GD's rows show.
+                    // custom level A t=9,678 (ship, m 1): vy 5.010 on the last riding tick, GD
+                    // onGround 1 and 6.906 at the exit on 9,679 (the full ship launch), where
+                    // the model kept 4.907. Also custom level A t=9,511 (m 2, GD 9.798) and
+                    // custom level E t=5,301 (m 1, GD 5.554 on 5,326). (e0e3e07 kept the landing
+                    // through rideLands instead, which skipped the restore and zeroed the
+                    // ship's vy mid-ride: Custom level E went from GD-exact to 8.8 px off.)
+                    c.rideLanded = (uint8_t)(rideLands || (s.onSlope && s.rideLanded));
                     c.onSlope = 1;
                     c.slopeM = (float)m;
                     c.slopeUid0 = s.onSlope ? s.slopeUid0 : sp->uid;
@@ -9438,7 +10950,46 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // any of them. The state writes ride along here for the same reason
             // the seat does: a landing applied mid-loop is read by the rules
             // after it.
-            if (lawSeat && c.y == yBeforeSlopes && c.grounded == gBeforeSlopes) {
+            // --undercrush: the same underside rule as the upright ceiling push above, for
+            // the seat this law records -- an upright body under a ceiling ramp short of its
+            // span, and a flipped one against a floor ramp. Outside the grace a cube, robot
+            // or spider more than 2 px past the seat dies; within 2 px it is left unmoved.
+            const bool crushLaw =
+                lawSeat && lawUnder
+                && (c.mode == 0 || c.mode == 5 || c.mode == 6)
+                && c.y == yBeforeSlopes && c.grounded == gBeforeSlopes
+                && !((((c.mode != s.mode) ? 0 : (int)s.modeT + 1) < kFlipGraceTicks)
+                     || (((gdUpOf(c) != gdUpOf(s)) ? 0 : (int)s.flipT + 1)
+                         < kFlipGraceTicks));
+            if (crushLaw) {
+                const double penL = c.flip ? (lawTop - (double)c.y) : ((double)c.y - lawTop);
+                if (g_slopeDbg)
+                    std::printf("undercrush: t=%lld p%d uid=%d y=%.4f seat=%.4f pen=%.4f\n",
+                                (long long)K.t, g_halfNow + 1, lawUid, (double)c.y, lawTop,
+                                penL);
+                if (penL > 2.0) {
+                    const Obj* lc = nullptr;
+                    for (const Obj* q : *K.slopes)
+                        if (q->uid == lawUid) { lc = q; break; }
+                    DIE("slope/crush", lc);
+                } else {
+                    c.grounded = 0;
+                }
+            }
+            // --lawunderstack: ...or the body was moved, by an underside push (ceilPressedNow)
+            // short of this seat. GD's collision pass resolves the ramps one after another, each on
+            // the y the last left, so a body pushed down by one ceiling ramp and still in the next
+            // ends at the lower seat whichever goes first; the law's acquisition above already ran
+            // on the pushed y. Custom level A t=9,491: a held ship under uid4054 (m -0.5,
+            // limit 347.410) meets the low end of uid4055 (m -1, seat 347.147); GD writes
+            // 347.147, then 345.533 on the next tick, both the law's seat, where the model kept
+            // the push.
+            const bool lawStack = lawSeat && lawUnder && !crushLaw
+                && ceilPressedNow && c.y != yBeforeSlopes && c.grounded == gBeforeSlopes
+                && (c.mode == 1 || c.mode == 3 || c.mode == 4 || c.mode == 7)
+                && (c.flip ? lawTop > (double)c.y : lawTop < (double)c.y);
+            if (lawSeat && !crushLaw
+                && ((c.y == yBeforeSlopes && c.grounded == gBeforeSlopes) || lawStack)) {
                 if (g_slopeDbg)
                     std::printf("slopelawapply: t=%lld p%d uid=%d y=%.4f->%.4f\n",
                                 (long long)K.t, g_halfNow + 1, lawUid,
@@ -9447,11 +10998,151 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 const double gsSL = c.flip ? -1.0 : 1.0;
                 if (lawUnder) {
                     if (gsSL * (double)c.vy > 0.0) VYSET(c.vy) = 0.0f;
+                    // --undernudge [2026-09-28]: the underside's own velocity write for a
+                    // flying body. bVar24 = bVar22 for ship / UFO / wave / swing (0x3900ab-
+                    // 0x3900dd), and on acquisition (0x390990-0x3909d5) an upright body with
+                    // vy > -2.0 gets vy := -2.0 and a flipped one with vy < 2.0 gets vy :=
+                    // 2.0 (constants -2.0f at 0x623730, 2.0 at 0x622e60): in its own frame,
+                    // vy := min(vy, -2). Measured on a custom level: a flipped ship taken
+                    // from below by a floor ramp goes 0.686 -> 2.000 on the acquisition
+                    // tick, and one flipped on a ramp by a gravity portal gets the same 2.000
+                    // the tick after. bVar22 is the static form the UFO band uses.
+                    // NOT WHILE THE BUTTON IS DOWN: GD's slope lines show the write on every
+                    // tick of the contact with m_jumpBuffered clear (0.686 -> 2.000, then
+                    // 1.995 -> 2.000) and none on the ticks it is set (1.892 stays 1.892).
+                    if (c.frame == 0 && !input
+                        && (c.mode == 1 || c.mode == 3 || c.mode == 4 || c.mode == 7)) {
+                        const Obj* lo = nullptr;
+                        for (const Obj* q : *K.slopes)
+                            if (q->uid == lawUid) { lo = q; break; }
+                        if (lo) {
+                            const bool upL = lo->slopeDir == 0 || lo->slopeDir == 3
+                                          || lo->slopeDir == 6 || lo->slopeDir == 7;
+                            const bool leftL = (double)K.dxF < 0.0 || s.rev != 0;
+                            const bool b22 = ((!upL) != leftL) != (c.flip != 0);
+                            if (b22 && gsSL * (double)c.vy > -2.0)
+                                VYSET(c.vy) = (float)(-2.0 * gsSL);
+                        }
+                    }
+                    // --lawunderrelease [2026-09-29]: this seat is a contact like the push-down
+                    // one (m_isOnSlope set, m_slopeVelocity written, negative for a ramp that
+                    // falls in the travel), so leaving it launches the same way: arm the
+                    // release the push-down arms (ceilPressedNow, the end of the step).
+                    // Measured on lv16 t=19,525: a held ship, full size again after a size
+                    // portal, is seated by uid 9974 (m -1) at its end corner 855.000 for one
+                    // tick, and the next tick GD reads vy -1.791 = slopeExitVy(1, ship, dx
+                    // 1.0465) 4.477 x the one-tick factor 0.4; the model kept -0.884 because
+                    // only the push-down branch armed the release.
+                    // --ballunderv3: ...and the ball, whose release ceil/release already
+                    // carries (--ceilreleaseball). Custom level G t=2,911: the ball passes from
+                    // uid1467's underside onto uid1479's at their seam, seated by this law;
+                    // GD keeps the contact (no release, gravity alone, and the ride's clock
+                    // runs on to the 6.330 = 6.906 x 22/24 at its real exit on 2,931), where
+                    // the model released at -2.762.
+                    if (c.frame == 0 && !c.flip
+                        && (c.mode == 1 || c.mode == 3 || c.mode == 6 || c.mode == 7
+                            || (c.mode == 2))) {
+                        const Obj* lr = nullptr;
+                        for (const Obj* q : *K.slopes)
+                            if (q->uid == lawUid) { lr = q; break; }
+                        if (lr) {
+                            const double mR = (lr->sy1 - lr->sy0) / (2.0 * lr->hw);
+                            const bool revR = (double)K.dxF < 0.0 || s.rev != 0;
+                            if ((revR ? -mR : mR) < 0.0) {
+                                ceilPressedNow = true;
+                                ceilPressM = mR;
+                                ceilPressMode = c.mode;
+                                ceilPressUid = lr->uid;
+                            }
+                        }
+                    }
                 } else if (gsSL * (double)c.vy <= kSlopeLandV) {
                     VYSET(c.vy) = 0.0f;
                     c.grounded = 1;
                 }
                 if (!lawUnder) lawSeatedNow = true;
+                // --ufolawflap: the seat is GD's collidedWithSlopeInternal, which writes
+                // m_isOnSlope = 1 whatever it then decides about landing (the contact note in
+                // the ride block); m_slopeVelocity takes the ramp's sign in the travel frame.
+                // Upright only: updateJump adds the velocity to the flipped flap's -target as
+                // it stands, and which sign m_slopeVelocity takes for a hanging UFO is unread.
+                if (!lawUnder && !s.dual && c.mode == 3 && !c.flip) {
+                    const double mTravL =
+                        lawM * (((double)K.dxF < 0.0 || s.rev != 0) ? -1.0 : 1.0);
+                    if (mTravL > 0.0)
+                        c.lawSv = (float)slopeExitVy(std::fabs(lawM), c.mode, useDx,
+                                                     c.mini != 0);
+                }
+                // --lawseatlaunch: ...and a SHIP seated so on a ramp that climbs in the travel
+                // on its gravity side keeps that velocity for the exit (the launch at the end of
+                // the step, signed away from the surface), as the ride's uphill launch does.
+                if (!lawUnder && !s.dual && c.mode == 1 && c.frame == 0) {
+                    const double mTravL =
+                        lawM * (((double)K.dxF < 0.0 || s.rev != 0) ? -1.0 : 1.0);
+                    if (c.flip ? mTravL < 0.0 : mTravL > 0.0)
+                        c.lawSv = (float)((c.flip ? -1.0 : 1.0)
+                                          * slopeExitVy(std::fabs(lawM), 1, useDx,
+                                                        c.mini != 0));
+                }
+            }
+            // --speedafterseat: where the ramp pass left the body, and which ramp did it
+            // (read by the speed portals, whose note says why).
+            if (c.onSlope && c.y != yBeforeSlopes) {
+                ySeatSp = (double)c.y;
+                seatUidSp = c.slopeUidNow;
+            }
+            // --flyhazafterslope [2026-09-28]: the flying branch tested its hazards
+            // before any ramp had placed the body, and the ramp pass runs after the
+            // solid walk too, so --flyhazaftersolid does not reach it either. GD's
+            // hazard stage comes after the whole object pass, ramps included
+            // (0x214752 re-reads the rect). Measured on lv19 t=14,863: a UFO riding
+            // down uid9716 (m -1) is tested at y 272.827, the ride then seats it at
+            // 271.233, 0.767 px into the floor hazard uid9736 (id 919, 25x6), and GD
+            // kills it there on that object. So a tick whose ramp pass moved a
+            // ship or UFO is tested again where the ramps left it (the end point,
+            // the sample GD takes).
+            if (!dead && (c.mode == 1 || c.mode == 3) && c.y != yBeforeSlopes) {
+                for (const Obj* o : *K.near) {
+                    if (dead) break;
+                    if (o->type == 0) continue;
+                    if (hazardHit(o, x, (double)c.y, pHalf, kHazMargin,
+                                  sawMarginFor(s.mode), s.mode, c.mini)
+                        && (!g_obbAll || !o->obbOk
+                            || obbOverlap(*o, x, (double)c.y, pHalf, (double)s.rot)))
+                        DIE("fly/hazard-afterslope", o);
+                }
+            }
+            // --thinsupport: ...and the cube family's hazard walk, held back on a tick a ramp's
+            // strip holds the body. GD resolves ramps in place inside the object pass and the
+            // hazards after it (0x2147c0..), so they see the body where the strip put it; the
+            // model's band clamp runs first and would have them test the clamped y. Measured
+            // on a custom level: a flipped ball on a ceiling ramp's top strip at 443.5, above
+            // the band's ceiling, was tested at the clamp's 435 -- 16.7 px from a saw of
+            // radius 17.44 -- and died two ticks before GD, which kills it from 443.5 when the
+            // saw comes in range. The walk's own samples (xPrev, s.y) -> (x, c.y).
+            if (thinSupHaz && !dead && K.t > 14) {
+                for (const Obj* o : *K.near) {
+                    if (dead) break;
+                    if (o->type == 0) continue;
+                    // --radreach: the circle's own reach (the cube walk's note)
+                    if (std::fabs(x - o->cx)
+                        > ((o->radius > o->hw) ? o->radius : o->hw) + pHalf
+                              + kContactEps)
+                        continue;
+                    const bool warpedT = spiderWarpedThisTick;   // as the walk treats a warp
+                    for (int si = warpedT ? kSubSteps : 0; si <= kSubSteps && !dead; ++si) {
+                        if (g_hazEndpoint && si < kSubSteps) continue;
+                        const double f = si / (double)kSubSteps;
+                        const double sx = xPrev + (x - xPrev) * f;
+                        const double sy = warpedT
+                            ? (double)s.y : (double)s.y + ((double)c.y - (double)s.y) * f;
+                        if (hazardHit(o, sx, sy, pHalf, kHazMargin, sawMarginFor(s.mode),
+                                      s.mode, c.mini)
+                            && (!g_obbAll || !o->obbOk
+                                || obbOverlap(*o, sx, sy, pHalf, (double)s.rot)))
+                            DIE("cube/hazard", o);
+                    }
+                }
             }
             // Pass 2: only a SPIKED ramp kills. A plain one does not -- it lifts
             // the player out.
@@ -9609,6 +11300,40 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // without `m_stateDartSlide > 0` GD would kill every slide. onSlope
             // is the model's name for that state.
             const bool plainKillsHere = (c.mode == 4) && !c.onSlope;
+            // --shipslopecap [2026-09-29]: the ship's outline around a spiked ramp, measured on
+            // calib_slopespike_ship and _ship_mini (upright; 366, box 30x30 at y 225..255, its
+            // line 4 px outside the box, 0.25-px columns bisected to 0.03 px):
+            //   sloped side  perpendicular ph from the line (mini 8.99 / full 15.0), the line
+            //                extrapolated past the low end out to sx0 - ph (dead at sx0 - 9 /
+            //                sx0 - 15, alive 3 px further)
+            //   high end     flat at objMaxY + ph - 1 on a floor ramp (263 mini, 269 full) and
+            //                objMinY - ph + 1 on a ceiling one (217 / 211), out to sx1 + ph --
+            //                the source's cap (hP/2 past the box) less the pixel the wave's rig
+            //                also lacked. The old caps were the line's own ends (259 / 221),
+            //                4 and 10 px short.
+            //   flat side    objMinY - inner / objMaxY + inner while the inner kill box
+            //                (half 4.5) still meets the box in x (dead at 4.5 px outside, the
+            //                other side at 4.7), inner 4.5 full / 3.0 mini; past that the
+            //                box's own edge, objMinY + 1 / objMaxY.
+            // All of that is preSlopeCollision's: the strip gate (centre within 1 px of the flat
+            // edge) stops the ramp's own kill at objMinY + 1 / objMaxY, and the 1-px strip it
+            // hands on as a solid crushes where the inner box (4.5) meets it and neither the
+            // from-above nor the from-below reach (h/2 - 6 for a flight mode) holds -- hence
+            // min(4.5, ph - 6). On the wall's side the wall does the same, and the ramp's own
+            // kill never runs (see the wall test below). A descending floor ramp's sloped side
+            // sits 1 px higher for an upright ship, as it does for the wave.
+            // The window was the ride box's 15 for every size, 6 px too wide for a mini ship.
+            // A flipped ship has the same outline: the gravity-portal twins of both rigs gave the
+            // same boundaries to 0.03 px (the injection's own one-tick drift), where a flipped
+            // wave's sloped edge sits 0.8 px further out (--waveflipkill).
+            // --ufoslopekill: the UFO takes the ship's whole outline (see the kill below).
+            // --ballslopekill: and the ball. GD's ball leaves the cube family's underside branch
+            // at 0x39011d (the +0x9bb test) for 0x3902a3, the branch the flight modes take, so a
+            // spiked ramp kills it on the same threshold (0x38fd6f-0x38fdf0, the centre against
+            // slopeYPos +- rectH/2/cos) and not by the box overlap. A custom level's recorded
+            // attempts: a ball falling onto a spiked floor ramp (m 0.5) died at the perpendicular
+            // 14.335 from the line, lived at 16.575 the tick before; the overlap took one more.
+            const bool shipCapK = c.mode == 1 || c.mode == 3 || c.mode == 2;
             for (const Obj* sp : *K.slopes) {
                 if (!sp->slopeHazard && !plainKillsHere) continue;
                 const double sx0 = sp->cx - sp->hw, sx1 = sp->cx + sp->hw;
@@ -9623,7 +11348,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // every other mode, exactly the open test it had -- so that the
                 // modes whose outline is NOT measured keep their old behaviour
                 // down to the boundary case.
-                const bool inWin = (c.mode == 4)
+                // --shipslopecap: the ship's window is the wave's form on its own half (see the
+                // caps below for what was measured).
+                const bool inWin = (c.mode == 4 || shipCapK)
                     ? (x >= sx0 - ph && x <= sx1 + ph)
                     : (x + pH > sx0 && x - pH < sx1);
                 if (inWin) {
@@ -9702,7 +11429,15 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // perpendicular -- GD destroys it with no object, the
                     // interval test sees the ship's top at 405.83 below the line
                     // and does not. Same trajectory with --slopelaw on and off.
-                    if (c.mode == 4 || c.mode == 1) {
+                    // --ufoslopekill: the UFO too, with the ship's outline. A mini UFO over a
+                    // spiked floor ramp (line 4 px above the box) died in GD's rows on the first
+                    // tick within 9 of the line: last alive at 9.12-9.49, dead at 8.58-9.00, over
+                    // four attempts on one custom level -- ph, not the turned box (8.2 degrees
+                    // would reach 10.19). And the ship's cap, not the line's: on another custom
+                    // level a mini UFO died at y 247.36 beside the high end of a descending spiked
+                    // ramp whose line tops out at 244, inside objMaxY + ph - 1 = 248 (the sloped
+                    // side alone, capped at the line's top, let it live). No rig has a UFO column.
+                    if (c.mode == 4 || c.mode == 1 || c.mode == 3 || c.mode == 2) {
                         // --waveflipkill: a FLIPPED wave's sloped edge sits
                         // further out. Measured on calib_slopespike_wave and its
                         // flipped-gravity twin (the same units at the same x, one
@@ -9723,13 +11458,107 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                              && ceilSlope)
                             ? kWaveFlipSlopeKillD * std::sqrt(1.0 + sm * sm)
                             : off;
+                        // --shipslopecap (see above the loop): the ship's caps sit ph - 1 past
+                        // the box, and its flat side follows the inner box in x.
+                        const double objMinY = sp->cy - sp->hh, objMaxY = sp->cy + sp->hh;
+                        const double innerS = std::min(kCubeInner, ph - kFlyThinTol);
+                        const bool flatInX = x >= sx0 - kCubeInner && x <= sx1 + kCubeInner;
+                        // ...and on the wall's side the ramp's own test never runs: preSlopeCollision
+                        // reports the wall (dirs {2,3,4,6} while the centre is left of the box,
+                        // the others only travelling left and right of it) and the ramp returns
+                        // before its kill. What is left there is the wall's 1-px solid, whose
+                        // crush reaches the inner box's 4.5 px and the same innerS in y. Measured
+                        // on the descending floor unit (dir 4, box 1020..1050): 3 px left of the
+                        // box a mini ship dies in (222, 258), 6 px and further left nowhere, in
+                        // either gravity.
+                        const uint8_t dirK = sp->slopeDir;
+                        const bool wallLeftK = dirK == 2 || dirK == 3 || dirK == 4 || dirK == 6;
+                        const bool leftK = (double)K.dxF < 0.0 || s.rev != 0;
+                        if (shipCapK && (wallLeftK ? x < sx0 : (leftK && x > sx1))) {
+                            const double wallX = wallLeftK ? sx0 : sx1;
+                            if (std::fabs(x - wallX) <= kCubeInner
+                                && y0 > objMinY - innerS && y0 < objMaxY + innerS)
+                                DIE("slope/spiked", sp);
+                            continue;
+                        }
+                        // --waveslopecap: an upright wave's caps are the box's too, ph - 1 past its
+                        // edge -- the line's ends coincide with that only where the line runs
+                        // along the box. Measured on calib_slopespike_wave: under plain 309's
+                        // ceiling unit (line on the box, low end 225) the wave dies down to 221,
+                        // where lineLo capped it at 225; over spiked 366's floor unit (line 4 px
+                        // outside the box, top 259) it dies up to 259 = objMaxY + 4, where
+                        // lineHi + ph - 1 put the cap at 263. A flipped wave keeps the line's ends
+                        // (the plain ceiling is not measured flipped).
+                        const bool waveCapK = c.mode == 4 && !c.flip;
+                        // GD's m_wasOnSlope (+0x9b1) is the model's seat or ceiling press of the
+                        // previous tick; its m_isOnSlope (+0x9b0) at this point of the object pass
+                        // is this tick's (the ride pass has run). An --start anchor seeds both
+                        // through the hist payload (onSlope / ceilT) when it carries them, else 0.
+                        const bool wasSlopeK = s.onSlope || s.ceilT > 0;
+                        const bool isSlopeK = c.onSlope || ceilPressedNow || ceilContNow;
+                        // --capinsetgate: the caps are the source's objMaxY + ph / objMinY - ph
+                        // (0x38fd73: rectH/2 past the box), strict (0x38fea5 / 0x39001b take `ja`).
+                        // What the rigs measured one pixel short of that is not the cap: a FRESH
+                        // contact (m_wasOnSlope clear) must meet the ramp's rect inset 1 px top and
+                        // bottom (0x38fc39-0x38fc7b, CCRect(x, y + 1, w, h - 2)), and the rig's
+                        // injected body always is fresh. Continuing (0x38fc12-0x38fc2f) it only
+                        // has to meet the box. Custom-level witnesses: a ship seated on a plain
+                        // ridge top at objMaxY + 15 = 195.000 lives (fresh: its bottom 180 does not
+                        // pass 180 - 1), and on the next tick, launched to 194.984, dies (3/3
+                        // attempts) where objMaxY + ph - 1 = 194 let it live.
+                        const bool capK = shipCapK || waveCapK;
+                        const double insetK = (capK && wasSlopeK) ? 0.0 : 1.0;
+                        // --heldtolhead: the head side's band (the underside, slopeUnderside).
+                        // collidedWithSlopeInternal compares the centre with the threshold T at
+                        // 0x39000c-0x39004b: `y > T`, or `al && y > T - xmm10` (mirrored when
+                        // upside down); xmm10 is 1 + m_wasOnSlope for a ship / UFO / wave / swing
+                        // with m_jumpBuffered (+0x985, the button held) set (0x38ffa5-0x38ffc2) and
+                        // 0 when bVar22 (r15b) is set (0x38ff76), and al = !m_isOnSlope && !(flight
+                        // && bVar22) (0x38ffc6-0x39000a). The ride pass already carries the same
+                        // band for a plain ramp's seat (upceil's tolU, --upceilband); for a spiked
+                        // one the same crossing is the kill. Custom-level witnesses, three sites:
+                        // a held ship dies 0.23-0.87 px short of the line (perpendicular 15.21 /
+                        // 15.32 full, 9.53 / 9.60 mini), while at the same tick a released attempt
+                        // lives nearer than that (15.244; 9.564 between two held deaths at
+                        // 9.600 and 9.528). m_jumpBuffered is the tick's input: the flight modes
+                        // never consume it (no jump), so it is the button's level.
+                        const bool revK = (double)K.dxF < 0.0 || s.rev != 0;
+                        const double headTol =
+                            (slopeUnderside(c.flip != 0, sp->slopeDir)
+                             && slopeNudgeMode(c.mode) && input
+                             && slopeBVar22(c.flip != 0, sp->slopeDir) == revK && !isSlopeK)
+                                ? (wasSlopeK ? 2.0 : 1.0)
+                                : 0.0;
+                        // The caps the outline carries are two different things in the source, and
+                        // the bands above only move one of them. The THRESHOLD is the sloped side
+                        // clamped at the box's edge +- ph (0x38fd6f-0x38fdf0), and a band moves it
+                        // (y > T - xmm10). The GATE is the rect test that decides whether the ramp
+                        // is met at all (0x38fc39-0x38fc7b: inset 1 px when fresh, the box itself
+                        // when continuing); no band reaches past it. With neither band nor
+                        // --capinsetgate the two collapse into the old max(sloped, edge - ph + 1).
+                        // Witness for keeping them apart: a held ship whose head is 0.38 px short
+                        // of a ceiling ramp's inset rect (300.622 against 301) is not killed at a
+                        // band's reach of the line in GD's rows, and dies on the tick it crosses.
+                        const double gateLo = objMinY - ph + insetK;
+                        const double thrLo = std::max(surf - offW, objMinY - ph) - headTol;
                         const double lo = ceilSlope
-                            ? std::max(surf - offW, lineLo)   // sloped, capped
-                            : sp->cy - sp->hh - inner;        // flat
+                            ? (capK ? std::max(thrLo, gateLo)          // sloped, capped, gated
+                                    : std::max(surf - offW, lineLo) - headTol)
+                            : shipCapK ? (flatInX ? objMinY - innerS : objMinY + 1.0)
+                                       : sp->cy - sp->hh - inner;        // flat
                         // --waveslopeside: a descending floor ramp's boundary is 1.0 px
                         // higher than an ascending one's (frames.hpp); upright waves only
-                        const double downDy = (c.mode == 4 && !c.flip
-                                               && !ceilSlope && sm < 0.0)
+                        // ...and the ship's the same (--shipslopecap; dir 4 unit, mini: 257.72
+                        // over the line's 244 against 256.72 ascending; flipped, no +1)
+                        // --heldnodown: that +1 is the feet side's band (xmm10 = bVar22 = 1 on a
+                        // descending ramp, 0x38fab3; `al && y < T + xmm10`, 0x38feaa-0x38feb9), and
+                        // its al is clear for a ship holding the button (0x38fe6b-0x38fe7d: the ship
+                        // test, then m_jumpBuffered). A custom level's recorded attempts: at the
+                        // same (x, y) over a descending spiked ramp a released mini ship dies and a
+                        // held one lives; the held one dies on the next, released, tick.
+                        const bool heldNoDownK = c.mode == 1 && input;
+                        const double downDy = ((c.mode == 4 || shipCapK) && !c.flip
+                                               && !ceilSlope && sm < 0.0 && !heldNoDownK)
                             ? kWaveSlopeDescendDy : 0.0;
                         // ...and the cap past the ramp's high end is not the line's top:
                         // measured flat at lineHi + 4.0 for a normal wave on 309 (m=1,
@@ -9737,12 +11566,22 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         // rotated 90 (m=2). The source's cap is hP/2 + objMaxY (0x38fd73),
                         // one pixel above what the rig kills at, so the extra pixel is
                         // taken from the measurement, not the formula.
-                        const double capHi = (c.mode == 4 && !c.flip)
-                            ? lineHi + ph - kWaveSlopeCapInset : lineHi;
+                        // (A wave that is not capped is a flipped one, whose cap is the line's top.)
+                        const double capHi = capK ? objMaxY + ph - insetK : lineHi;
+                        // (capHi is the floor ramp's gate for the two capped outlines.)
+                        const double thrHi = std::min(surf + off, objMaxY + ph) + downDy + headTol;
                         const double hi = ceilSlope
-                            ? sp->cy + sp->hh + inner         // flat
-                            : std::min(surf + off + downDy, capHi);   // sloped, capped
-                        hit = (y0 >= lo && y0 <= hi);
+                            ? (shipCapK ? (flatInX ? objMaxY + innerS : objMaxY)
+                                        : sp->cy + sp->hh + inner)         // flat
+                            : capK ? std::min(thrHi, capHi)            // sloped, capped, gated
+                                   : std::min(surf + off + downDy, capHi) + headTol;
+                        // --capinsetgate: GD's crossing of the threshold is strict (`ja` at
+                        // 0x38fea5 / 0x39001b), so a body sitting exactly on the cap (a seat at
+                        // objMaxY + ph) is not inside it; the rect gate is CCRect::intersectsRect,
+                        // which counts touching.
+                        const bool strictLo = capK && ceilSlope && thrLo >= gateLo;
+                        const bool strictHi = capK && !ceilSlope && thrHi <= capHi;
+                        hit = (strictLo ? y0 > lo : y0 >= lo) && (strictHi ? y0 < hi : y0 <= hi);
                     } else {
                         const double sxc = std::min(std::max(x, sx0), sx1);
                         const double sf = sp->sy0 + sm * (sxc - sx0);
@@ -9855,7 +11694,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // `faceIsTop`: pushed UP means the contact is with the
                     // block's underside, pushed DOWN means with its top.
                     if (vetoOf(K, o, x, seatY, pHalf, pHalf,
-                               !up, xPrev, (double)s.y, c.slopeUidNow))
+                               !up, xPrev, (double)s.y, c.slopeUidNow, lawWasOn))
                         continue;
                     if (up ? (f < lim) : (f > lim)) lim = f;
                 }
@@ -9961,19 +11800,62 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // ([[gd-census-green-cold-broken]]).
         // The rig's cells are all flip=1, so the evidence covers the c.flip side
         // only.
-        if (!c.onSlope && s.onSlope && uphillExit && !rampWindowHere
+        // --a1clatch: postCollision's boost gate (0x38d7f5-0x38d82f) takes the launch only when
+        // +0xa1c is down or the body is a ship, UFO, wave, swing or ball; a cube, robot or spider
+        // whose byte is up goes to the no-boost path, whose release wants the byte down as well
+        // (0x38da69, the release branch below) -- so it leaves the ramp with neither. A custom
+        // level (fixGravityBug=0), an upside-down mini cube: a pink ring (vy -6.44) raises the
+        // byte, the cube rises and turns at +0.904 -- under 2g, so the classic arm's flipped side
+        // never says falling -- lands on a ceiling ramp and rides it to its end, and GD's rows go
+        // straight on along the flat ceiling past it where the model launched it at -3.999.
+        const bool a1cHoldsLaunch = a1cNow
+                                    && (c.mode == 0 || c.mode == 5 || c.mode == 6);
+        const bool uphillLaunch = !c.onSlope && s.onSlope && uphillExit && !rampWindowHere
             && s.rideLanded
-            && !(impulsedThisTick && (c.mode == 3 || c.flip))) {
-            // ...and the SIGN follows the same ride side as uphillExit above: a
-            // launch throws the player off the surface it climbed, so a flipped
-            // rider on a floor ramp's TOP leaves upward exactly as an upright one
-            // does. lv22 t=3,806 measures it: GD emits **+6.906**, and keyed on
-            // the flip alone the model emitted -6.906 (dvy -13.812).
-            VYSET(c.vy) = (float)rawQ(((c.flip && rodeCeil) ? -1.0 : 1.0)   // speed.hpp
-                           * slopeExitVy(std::fabs((double)s.slopeM), c.mode,
-                                         useDx, c.mini != 0)
-                           * slopeRampFactor((int)s.slopeT + 1));
+            && !(impulsedThisTick && (c.mode == 3 || c.flip))
+            && !a1cHoldsLaunch;
+        // ...and the SIGN follows the same ride side as uphillExit above: a
+        // launch throws the player off the surface it climbed, so a flipped
+        // rider on a floor ramp's TOP leaves upward exactly as an upright one
+        // does. lv22 t=3,806 measures it: GD emits **+6.906**, and keyed on
+        // the flip alone the model emitted -6.906 (dvy -13.812).
+        const float exitVy = uphillLaunch
+            ? (float)rawQ(((c.flip && rodeCeil) ? -1.0 : 1.0)   // speed.hpp
+                          * slopeExitVy(std::fabs((double)s.slopeM), c.mode,
+                                        useDx, c.mini != 0)
+                          * slopeRampFactor((int)s.slopeT + 1))
+            : 0.0f;
+        // --exitbeatsvy [2026-09-29]: postCollision calls boostPlayer only when
+        // the ramped exit velocity beats the velocity the body already has, on
+        // the launch's own side (0x14038d8e0-0x14038d92c compares it against
+        // m_yVelocity after this tick's updateJump). A ride that holds the body
+        // at vy 0 always loses to the launch, which is every cube, ball and
+        // robot exit; a ship keeps its own vy on the ramp and can outrun it.
+        // lv20 t=15,283: a flipped ship pushed along a floor ramp's top leaves
+        // it at vy 2.129, the launch is 3.73 x 0.4 = 1.492, and GD writes
+        // nothing -- the next ticks are plain ship gravity. When the launch
+        // loses, nothing else of the exit block runs either (the no-boost path
+        // at 0x14038da3d is for an unramped velocity that already loses, which
+        // this does not model).
+        // A jump from a press made on THIS tick is not in that comparison: the game
+        // handles the buttons after the collision pass, and boostPlayer has cleared
+        // m_isOnGround by then, so the launch stands and the press finds no ground.
+        // A jump released from an earlier press (the buffer) is made in updateJump,
+        // before the collisions, and does take part. lv16 t=6,516: a cube seated on
+        // a ramp's clamped top presses on that tick; the game's y moves on the old
+        // velocity and vy is the launch 9.208. lv18 t=20,462: the press came before
+        // the landing, the jump (12.726) goes first and the launch (5.226) loses.
+        const bool freshPress = input && !s.action;
+        const bool exitLoses = uphillLaunch
+            && !(impulsedThisTick && freshPress)
+            && !(exitVy > 0.0f ? exitVy > c.vy : exitVy < c.vy);
+        if (uphillLaunch && !exitLoses) {
+            // --balltapexit: the re-run at the top of stepOne keeps this step when the launch
+            // fires with no tap in it
+            if (freshTapHeld && c.mode == 2 && !ballFlippedThisTick) g_ballTapLaunch = 1;
+            VYSET(c.vy) = exitVy;
             c.grounded = 0;
+            a1cLate = true;   // --a1clatch: boostPlayer raises +0xa1c (0x39feee)
             // The slope machinery sets GD's velocity-limit exemption
             // (postCollision +0x18ca, next to the launch record update). A
             // slow exit clears it at the next tick's band check; a fast one
@@ -9986,7 +11868,10 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // lv16 t=8,913, both halves: the flipped ship leaves at 6.906 and
             // GD lets it decay 6.820 / 6.734 / 6.648 / 6.562 / 6.476 / 6.390
             // before the clamp touches it at all.
-            if (boostLatchMode(c.mode)) c.boost = 1;
+            c.boost = 1;
+            // --sloperot: boostPlayer also stakes a cube's spin (State::rotBoost). The robot,
+            // spider and the flying modes are excluded there; the ball is not a cube here.
+            if (c.mode == 0) rotBoostNow = true;
             // ...and "like a pad" includes the y: the ramp is a block, so the
             // tick's gravity step is in y and nothing re-seats the player.
             // Measured on lv19 t=254 (ramp uid=33 at (300,105), exit 3.999):
@@ -10031,10 +11916,12 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // lv16 t=9,879: a ship leaves riding uid4293 into its underside (V4
         // -2.000), a cube portal halves that to GD's -1.000; the model stamped
         // the release's -3.2285 over the V4 first.
-        else if (!c.onSlope && s.onSlope && !rampWindowHere
+        // --a1clatch: ...and the release wants +0xa1c down in every mode (0x38da69).
+        else if (!uphillLaunch && !c.onSlope && s.onSlope && !rampWindowHere
                  && s.rideLanded
                  && !impulsedThisTick
-                 && !ceilPressedNow) {
+                 && !ceilPressedNow
+                 && !(a1cNow)) {
             // **NO slopeRampFactor HERE, and this is measured, not an
             // oversight.** The uphill launch above scales by the ride's length
             // and the structure of GD invites the same conclusion for this
@@ -10079,11 +11966,23 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                             (double)c.slopeM, mTravel, (double)K.dxF,
                             (double)c.vy);
             c.grounded = 0;
+            // --sloperot: this is postCollision's no-boost exit (0x38da3d), which stakes the
+            // cube's spin through runNormalRotation at the full size -- turned on this tick.
+            if (c.mode == 0) rotReleaseNow = true;
             // same as the uphill launch above: the slope machinery sets the
             // velocity-limit exemption (State::boost), in every mode that
             // reads it (boostLatchMode)
-            if (boostLatchMode(c.mode)) c.boost = 1;
-            releasePin(false);
+            c.boost = 1;
+            // --relkeepblock: ...but not a SOLID's pin from this same tick. The
+            // release is written in postCollision, after the collision pass has
+            // already put the body back on the block it stands on, and GD keeps
+            // that y under the stamped velocity: on a custom level an upright cube
+            // rides a downhill ramp while a flat block holds it at 705; on the tick
+            // the line is 4.22 px away the ramp lets go (-2.597) and GD's y is
+            // still 705.000, where undoing the pin left the free 704.951. The same
+            // on the flipped side (825.000 against 825.049). The pad and orb undo
+            // stays: their impulse is written before the solid pass.
+            if (!pinnedOnBlock) releasePin(false);
             // --stickrelease [2026-09-19]: ...and later in the same
             // postCollision (0x38e76f-0x38ea48) GD re-lands the player on a
             // solid that moved AWAY from it this tick, when the gap is under
@@ -10115,6 +12014,56 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 }
             }
         }
+        // --lawcontact: ...and a continuing LAW contact dropped as a repeat (lawRepeatDrop) is
+        // the same exit -- m_isOnSlope 0 against m_wasOnSlope 1 at postCollision -- so a ramp
+        // that falls in the travel stamps its face velocity (the release above, 0x38da69).
+        // lv19, the ramp uid 10385 (m -1): the law seats a falling cube on its clamped corner
+        // (375.000, t=15,512 in GD's rows is the next tick), the same target is dropped, and GD
+        // reads 374.951 with vy -5.193 = -1.29825 / 0.25; the corner seats it again the tick
+        // after and the line the tick after that (373.881).
+        // --lawseatlaunch: a ship the law seat held last tick on a ramp climbing in the travel
+        // (State::lawSv, signed away from the surface) and that no ramp holds now leaves with the
+        // ride's uphill launch, scaled by the seat's age (seatT counts the contact tick as 1, the
+        // ride's slopeT + 1) and only where it beats the velocity the ship has. Custom level
+        // custom level D t=3,572: a flipped ship seated at the apex of two ceiling ramps (uid1058,
+        // m -1, its clamped end 375.000) for one tick; GD reads -2.222 = slopeExitVy(1, ship,
+        // dx 1.298) 5.555 x 0.4 the next tick, where the model went on at +0.103.
+        if (s.mode == 1 && c.mode == 1 && s.lawSv != 0.0f && !s.onSlope
+            && !c.onSlope && !lawSeatedNow && !rampWindowHere && !impulsedThisTick
+            && c.frame == 0) {
+            const float evL = (float)rawQ((double)s.lawSv * slopeRampFactor((int)s.seatT));
+            if (evL > 0.0f ? evL > c.vy : evL < c.vy) {
+                VYSET(c.vy) = evL;
+                c.grounded = 0;
+                a1cLate = true;   // --a1clatch: boostPlayer raises +0xa1c
+                c.boost = 1;
+            }
+        }
+        if (lawRepeatDrop && !c.onSlope && !lawSeatedNow && s.grounded && !rampWindowHere
+            && !ceilPressedNow && !impulsedThisTick && !(a1cNow)) {
+            const double mTravL =
+                lawDropM * (((double)K.dxF < 0.0 || s.rev != 0) ? -1.0 : 1.0);
+            if (mTravL < 0.0) {
+                VYSET(c.vy) = (float)(mTravL * std::fabs((double)K.dxF) / 0.25);
+                c.grounded = 0;
+            } else if (mTravL > 0.0 && !c.flip) {
+                // --lawuplaunch: ...and a ramp that RISES in the travel launches, as a ride's
+                // exit does (the uphill launch below, its ride count the law's seatT). Custom level B
+                // (model-only check, iterations 53 / 54), p2 an upright mini cube falling onto ramp
+                // uid 7445 (m +1) at its top corner, block uid 7468 flush beyond it: the law
+                // seats it at 159.000 on t=13,219, the same target is dropped on 13,220 and
+                // GD launches it at vy 4.449 = slopeExitVy(1, cube, dx 1.9495) 11.12 x 0.4;
+                // the model left it standing on the block.
+                const float exitL = (float)rawQ(
+                    slopeExitVy(std::fabs(lawDropM), c.mode, useDx, c.mini != 0)
+                    * slopeRampFactor(std::max<int>(1, (int)s.seatT)));
+                if (exitL > c.vy) {
+                    VYSET(c.vy) = exitL;
+                    c.grounded = 0;
+                    a1cLate = true;   // --a1clatch: boostPlayer raises +0xa1c (0x39feee)
+                }
+            }
+        }
         // --mpushlaunch [2026-09-19]: postCollision launches the player from
         // LAST tick's c6 (+0x638) at 0x38eb5c when prev != 0, |prev - c6| >
         // 0.5, prev > 5.0 and prev > c6 -- i.e. on the tick contact with a
@@ -10132,6 +12081,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             if (p >= (double)c.vy) {
                 VYSET(c.vy) = (float)p;
                 c.grounded = 0;
+                a1cLate = true;   // --a1clatch: boostPlayer (0x38ec5c)
             }
         }
         c.prevC6q = (int16_t)std::lround(
@@ -10180,23 +12130,32 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // The same ramp ridden WITHOUT the tap (the solution's own replay) exits at 5.755 off a
         // 20-tick ride, and 5.755 x 19/20 = 5.4673 = GD's value to four decimals. Carrying the
         // count gives 5.466925, so this PREDICTS GD's number rather than being fitted to it.
-        const bool sameRide = (s.slopeT > 0 && c.slopeUid0 >= 0
-                               && c.slopeUid0 == s.slopeUid0);
+        //
+        // "The one already being ridden" is the ramp under the body when the tap broke the ride
+        // (slopeUidNow), not the one the ride began on (slopeUid0): after a seam the two differ,
+        // and the re-acquired ramp then never matched the start. Custom level A: a
+        // ball rides uid1733 (m 0.5) across the seam onto uid1734 (m 2), taps at t=4,984 and is
+        // pushed up 1734 flipped until its top at 4,987; GD launches it at 7.880 on 4,988, the
+        // ball's full-factor exit off m 2, where the model restarted the count at 4,985 and
+        // left vy at 4.461. The same level's t=4,549 site is the same shape (9.798, the full
+        // value at speed 1.24).
+        const bool sameRide = (s.slopeT > 0
+                               && ((c.slopeUid0 >= 0 && c.slopeUid0 == s.slopeUid0)
+                                   || (c.slopeUidNow >= 0 && c.slopeUidNow == s.slopeUidNow)));
         c.slopeT = c.onSlope
             ? (uint8_t)((s.onSlope || rampSeam || sameRide)
                             ? std::min<int>(24, (int)s.slopeT + 1) : 0)
             : (uint8_t)(rampSeam ? s.slopeT : 0);
         // --lawseatonslope: a ride that begins on a tick the --slopelaw seat has
         // already been holding the body on the ramp started THEN (State::seatT).
-        if (g_lawSeatOnSlope) {
-            if (c.onSlope) {
-                if (!(s.onSlope || rampSeam || sameRide) && s.seatT > 0)
-                    c.slopeT = (uint8_t)std::min<int>(24, (int)s.seatT);
-                c.seatT = 0;
-            } else {
-                c.seatT = lawSeatedNow
-                    ? (uint8_t)std::min<int>(24, (int)s.seatT + 1) : 0;
-            }
+        // --lawcontact keeps the same record: it is the next tick's m_wasOnSlope for a law seat.
+        if (c.onSlope) {
+            if (!(s.onSlope || rampSeam || sameRide) && s.seatT > 0)
+                c.slopeT = (uint8_t)std::min<int>(24, (int)s.seatT);
+            c.seatT = 0;
+        } else {
+            c.seatT = lawSeatedNow
+                ? (uint8_t)std::min<int>(24, (int)s.seatT + 1) : 0;
         }
         (void)0;
     }
@@ -10237,8 +12196,14 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // (the old exe reached x=2,441 at iter 11; the disabled build 2,343 in 26
     // iterations). `flip` still means "flipped against that frame's vertical" in
     // a rotated frame, so it can be used as is.
-    if (!dead && c.mode != 1 && c.mode != 4 && c.flip && !c.grounded
-        && (double)c.y - pHalf > topAheadAtF((int)c.frame, x)) {
+    // --escufo: ...and the UFO, for the same reason once more: its jump works in the air and
+    // goes against gravity, so an upside-down UFO above everything taps its way back DOWN.
+    // Measured on a custom level (the cold run's attempts 98 and 110): GD's UFO, upsideDown=1
+    // and airborne, flies on at y=300.9 (t=15,804, x=27,001) and y=236.8 (t=15,866, x=27,102)
+    // where the model pruned both, and the loop's resims died there on this prune and nothing
+    // else.
+    if (!dead && c.mode != 1 && c.mode != 4 && !(c.mode == 3) && c.flip
+        && !c.grounded && (double)c.y - pHalf > topAheadAtF((int)c.frame, x)) {
         // --escrotahead: the test above reads THIS frame's table and
         // cannot know the frame will change. lv22 t=5,096 (plan 598, frame 3):
         // topAhead is a real surface 444 px below (i=25 of 91), and GD rotates back
@@ -10422,10 +12387,27 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     for (const Obj* p : *K.ports) {
         if (spiderWarpedThisTick) break;
         if ((p->type == 28) != (pport == 0)) continue;
+        // --portalslopeorder: the nested step dealt with this one ahead of the ramps.
+        if (g_prePortalUid >= 0 && p->uid == g_prePortalUid) continue;
         // uid-order gate (measurements at teleUid's declaration). Objects
         // processed before the teleport were judged at the old position = do not
         // fire at the landing site.
-        if (pport == 1 && teleportedThisTick && p->uid < teleUid) continue;
+        // --teleoldpos: ...but "judged at the old position" is a judgement, not a skip. GD's one
+        // ascending-uid loop reaches a smaller-uid portal BEFORE the teleport moves the player, so it
+        // can fire there, at the old position. Under the flag such a portal is tested (and applied)
+        // with the pass's position put back to where the teleport found the player, and the landing
+        // restored after it. Custom level I t=4,869: dual portal uid 24019 and teleport 747
+        // uid 24310 (both rot -45, one section) overlap the cube at y=228.616; GD enters dual on
+        // that tick with p2 at 228.616 -- the pre-teleport y -- while p1 lands on 242.000. The
+        // model teleported, skipped 24019, and entered dual a tick late with p2 at 244.424.
+        // lv21 t=4,710 (teleport uid5090, gravity portal uid5050 at the landing site, 160 px from
+        // the old position) is the same rule: tested at the old position, it does not fire.
+        const bool oldPosHere = pport == 1 && teleportedThisTick && p->uid < teleUid;
+        struct OldPosGuard {
+            State& st; float& yf; bool on; float y, f;
+            ~OldPosGuard() { if (on) { st.y = y; yf = f; } }
+        } oldPosGuard{c, yFree, oldPosHere, c.y, yFree};
+        if (oldPosHere) { c.y = teleFromY; yFree = teleFromYFree; }
         // only the size portal has the smaller contact half (pHalfSize note)
         // ...only rotated objects use "the current box" (pHalfLive note).
         // Axis-aligned ones keep the entry snapshot.
@@ -10506,6 +12488,39 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // does not fire again (the measurements are at the function, which the
         // ground arm's pre-evaluation calls too).
         if (portalOnFrameRotTrigger(*p, (int)c.frame)) continue;
+        // --tponce (default off): a teleport fires on the tick its contact
+        // BEGINS, not on every tick of it. GD asks canBeActivatedByPlayer
+        // (0x2178c0) first; for an object that cannot multi-activate the answer
+        // is !hasBeenActivatedByPlayer (vtable +0x560), and teleportPlayer
+        // marks the portal with activatedByPlayer (+0x558, reached for every
+        // teleport but the 3022 trigger) -- one firing per player per attempt.
+        // The model had no such mark, and a 747 whose exit lies inside its own
+        // box (16 of the 25 on a custom level) left the player in the box, so
+        // `changes` below read "not at the target" on the next tick and the
+        // model put y back to tpy on every tick of the contact while GD flew on
+        // (x=2,975-3,003 in a UFO and 3,702-3,712 in a ship, edy growing by
+        // 0.04-0.3 px a tick). Said without a State field: x only grows here, so
+        // "was inside at the previous tick's position" stands for "has fired".
+        // Where the two part: a body that leaves the box vertically and comes
+        // back while x is still over it (GD: no second firing; this: a second
+        // one), and an entry the collision pass pushed the body into after the
+        // previous tick's test (GD fires it this tick; this does not).
+        // --teleoldpos: ...except on the first step of a body born on the previous tick. GD's
+        // activatedByPlayer mark is the player's own, so a second body spawned inside a teleport's
+        // box has fired nothing; "inside at the previous tick" reads as "has fired" only for a body
+        // that existed then. Custom level I t=4,870: p2, born at 4,869 at the spot p1 teleported from,
+        // takes the teleport on its first step (p2y 228.616 -> 242.000); the gate held it back.
+        const bool bornLastTick = s.portSeen[0] == -2;
+        if (p->type == 28 && !bornLastTick
+            && portalWasInsideAtPrev(*p, xPrev, (double)s.y, pHalfP, pRotHere))
+            continue;
+        // --tplatch: ...and the part it leaves open, a body that leaves the box and comes back.
+        // Measured on a custom level (the cold run's attempt 96, a mini wave at x=26,822): GD
+        // teleports at t=15,696 (y 215.70 -> 231.00), is back inside the 747's box (26,841.2,
+        // 216.7, rot 45) from t=15,698 on its way down, and flies on to 199.8 without a second
+        // firing; the model teleported back to 231 at 15,699, 15,702, 15,704.. and split there.
+        if (p->type == 28 && p->gpBit >= 0 && s.portalLatch.test(p->gpBit))
+            continue;
         // Would this portal change anything at all? An inert one is a no-op and
         // dodging it means nothing (see the halving note below).
         // A teleport's REAL target: the linked exit half (tpEy) for the 2902
@@ -10580,7 +12595,17 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // objrects says" reading of 2026-08-27 really was: swept from the
         // player's post-clamp y it needs a shortened box, from the free y it
         // fires at the dump's own h=91.
-        const double yPort = (double)yFree;
+        // --gravportalseat [2026-09-28]: ...but a GRAVITY portal fires from where the
+        // collision pass left the body. On a custom level a ship rides up a ramp into
+        // an inverse gravity portal (uid1264); GD's trace for that tick prints the
+        // ramp's seat (y 590.419 -> 593.663) BEFORE the flip, and the flip line
+        // carries the seated y: the seat lifts the box 1.16 px into the portal and it
+        // fires, where the free y is still 1.84 px short and the model fired a tick
+        // later. The two measurements above are a spider portal and a dual portal,
+        // both mode portals, so this is kept to the gravity pair.
+        const double yPort = ((p->type == 3 || p->type == 4))
+                                 ? (double)c.y
+                                 : (double)yFree;
         const double gapY = std::fabs(yPort - p->cy) - (p->hh + pHalfP);
         // --slopedbg: `changes` and the y gap, the two things between a portal
         // being a candidate and it firing. `portfire` above only says "in the x
@@ -10600,7 +12625,11 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // fires. The model had the open form and skipped that case.
         // [2026-09-03, from the disassembly of collisionCheckObjects 0x214960]
         if (gapY > 0.0) {
-            if (changes && gapY < g_portalDodgeMin) {
+            // ...and the glitch-avoid mode's wider margin, under the same closing rule
+            // (thread_pool.hpp g_glitchPortal). Named apart, so a run can say which one it was.
+            const bool glitchDodge = g_glitchPortal > g_portalDodgeMin
+                                     && gapY >= g_portalDodgeMin;
+            if (changes && gapY < std::max(g_portalDodgeMin, g_glitchPortal)) {
                 // A portal you are still CLOSING ON is not one you dodged.
                 // [2026-09-03] The guard was asked on every tick of the
                 // approach, so the last tick before a crossing -- where the gap
@@ -10633,8 +12662,10 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     s.frame != c.frame
                     || std::fabs(yPort - p->cy)
                            < std::fabs((double)s.y - p->cy);
-                if (!stillClosing)
-                    DIE("portal/hairline-dodge", p);
+                if (!stillClosing) {
+                    if (glitchDodge) DIE("glitch/portal-dodge", p);
+                    else DIE("portal/hairline-dodge", p);
+                }
             }
             continue;
         }
@@ -10689,7 +12720,21 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // A mode or size portal this body already overlapped on the previous tick was activated
         // then, whether or not it changed anything, and does not fire again (speed.hpp, the note
         // that was --portalonce's). The overlap is this loop's own test, in State::portSeen.
-        if (isModePortalType(p->type) && p->uid >= 0) {
+        // --dyngravseen: ...and so does a gravity portal the latch cannot hold. GD's activation mark
+        // is the object's own, per attempt, whatever carries it, but the latch's bits go to the
+        // static gravity portals only (level_loader.hpp: StepCtx::ports also draws on
+        // Dynamics::PORT, which the numbering never walks), so a grouped one re-fires on every
+        // tick its test passes. Kept in the same three slots as the mode portals, it cannot fire
+        // twice in one continuous stay -- the latch's whole effect while the body stays inside;
+        // a body that leaves the box and comes back still re-fires it where GD would not. A custom
+        // level (the 09-30 diagnostic cold's attempt 15): the grouped 45-degree gravity portal
+        // uid 1699 at (6205, 276.8) turns the cube at t=4,942, the blue ring uid 1692 in the same
+        // box turns it back at 4,947, and the model re-fired 1699 at 4,948 (vy -4.783 halved to
+        // -2.391); GD's cube stays upright and falls on. The copy has 139 gravity portals, 71 of
+        // them grouped, and 128 bits taken by 68 static ones and 25 teleports.
+        if ((isModePortalType(p->type)
+             || ((p->type == 3 || p->type == 4) && p->gpBit < 0))
+            && p->uid >= 0) {
             bool seen = false;
             for (int i = 0; i < 3; ++i) seen = seen || s.portSeen[i] == p->uid;
             bool placed = false;
@@ -10779,6 +12824,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // reasoning rather than measurement -- if a grounded one ever shows up,
         // check it.
         if (p->type == 28) {
+            // --tplatch: teleportPlayer marks the portal whether or not it moves anything.
+            if (p->gpBit >= 0) c.portalLatch.set(p->gpBit);
             if (!changes) continue;   // already at the target
             // The destination's PADS and ORBS do not fire on the arrival tick.
             // GD's checkCollisions has already run for this tick at the old
@@ -10795,7 +12842,10 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             c.tpSkip = 1;   // State::tpSkip
             if (g_touchCensus) g_tcBranch |= 4;
             teleUid = p->uid;      // uid-order gate (measured, see teleUid's decl.)
+            teleFromY = c.y;       // --teleoldpos
+            teleFromYFree = yFree;
             YSET(c.y) = (float)tpTarg;   // exit half for 2902, closed tpY for 747
+            teleLandY = (double)c.y;
             // A teleport is the one thing in the pass that MOVES the player for
             // the objects behind it: the uid-order gate above exists because
             // lv20 t=7,295's pad and gravity portal (both larger uids) fire at
@@ -10966,6 +13016,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // press behind it -- it has not been anywhere yet.
                     c.mode2 = c.mode;
                     c.mini2 = c.mini;
+                    if (g_dualSlide) c.slideT2 = c.slideT;   // --dualslide: born with p1's arm
                     c.ceilT2 = 0;
                     c.ceilM42 = 0;
                     c.flip2 = c.flip ? 0 : 1;
@@ -10982,11 +13033,28 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     c.usedOrb2 = nullptr;
                     c.usedOrbOld2 = -1;
                     for (int i = 0; i < 3; ++i) c.usedOrbHist2[i] = -1;
+                    c.spdFired2[0] = c.spdFired2[1] = -1;
+                    c.hitG2 = 0;   // --repela0c: a new body has not touched the ground
+                    c.a1cLatch = (uint8_t)(c.a1cLatch & ~2u);   // --a1clatch: nor jumped
+                    {  // --rot2: born with the first body's angle and spin
+                        c.rot2 = c.rot;
+                        c.rotStep2 = c.rotStep;
+                        c.rotNeg2 = c.rotNeg;
+                    }
                     c.holdDead2 = 0;
+                    // --dualflipclock: born upside down relative to the first body, in its own
+                    // mode -- both clocks start here. Custom level D t=7,023: GD's new p2 rides the floor
+                    // ramp p1 is on, upside down, for the next ticks (the flip grace's seat).
+                    { c.flipT2 = 0; c.modeT2 = 0; }
                     for (int i = 0; i < 3; ++i) c.portSeen2[i] = -1;
+                    // --teleoldpos: -2 marks a body born on this tick, for its first step (the
+                    // --tponce gate in the portal pass). portSeen is rewritten every tick and only
+                    // compared with uids, so the mark lives one step and means nothing else.
+                    c.portSeen2[0] = -2;
                     for (int i = 0; i < 4; ++i) c.touchRing2[i] = -1;
                     c.touchRingT2 = 0;
                     for (int i = 0; i < 4; ++i) c.usedPad2[i] = nullptr;
+                    { c.dashing2 = 0; c.dashSlope2 = 0.f; }   // --dualdash: a new body is not dashing
                 }
                 c.dual = wantDual;
                 // Entering a dual re-derives the band from THIS portal's cy
@@ -11046,7 +13114,13 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     c.bandBranch = (uint8_t)((c.bandBranch & ~kBandFree)
                                              | kBandFreeKnown
                                              | (p->freeMode ? kBandFree : 0));
-                const double H = inDual ? bandHeightDual(wantMode)
+                // --dualband: updateDualGround's height is the larger of the new mode's and the
+                // OTHER body's -- s.mode2 in the first half, p1's finished mode in the second
+                // (frames.hpp g_dualOtherMode; stepBoth swaps the halves for p2).
+                const int otherMode = (g_dualOtherMode >= 0) ? g_dualOtherMode : (int)s.mode2;
+                const double H = inDual ? (g_dualBand ? std::max(bandHeightDual(wantMode),
+                                                                  bandHeightDual(otherMode))
+                                                      : bandHeightDual(wantMode))
                                         : bandHeightFor(p->type);
                 const double refY = inDual ? (double)c.bandRefY : p->cy;
                 // ...unless the portal is a FREE MODE one, which writes no
@@ -11066,8 +13140,10 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // band was the MODE's, so it cannot pull a level out of
                     // branch A
                     if (c.bandBranch & 2) c.bandBranch &= (uint8_t)~1;
+                    g_bandPortalWrote = true;   // --dualband (stepBoth)
                 }
                 if (H > 0.0 && !(g_freeModeCol && p->freeMode)) {
+                    g_bandPortalWrote = true;   // --dualband (stepBoth)
                     if (g_staticCamCol) {
                         // animateInDualGroundNew: it takes staticY for itself
                         // when nobody else holds it, and claims the band
@@ -11223,6 +13299,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 if (pressAction == 2) ballFlippedThisTick = false;
                 c.pressSpent = s.pressSpent;
                 portalPressRedo = true;
+                a1cJumpLate = false;   // --a1clatch: redone below by the new mode, if at all
             }
             const bool halves = !isSize;
             double vAtPortal = (double)c.vy;
@@ -11382,6 +13459,16 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // GD's `upsideDown`, so convert back to the frame's own sign.
                 const uint8_t flipBefore = c.flip;
                 c.flip = (c.frame == 3) ? (uint8_t)!wantFlip : wantFlip;
+                if (c.flip != flipBefore && !p->oriented) gravFiredUid = p->uid;
+                // --ballstake: flipGravity ends, for a ball, in runBallRotation2 -- the AIR rate
+                // against the new gravity, the same stake the tap and the ring make -- and a
+                // portal's flip lands before this tick's spin. The same attempt, t=1,898: the mini
+                // ball rolling at 3.125 (0.9's mini ground rate) takes the gravity portal uid 408
+                // and the rot column steps 2.2135 (its air rate) on that row; the model kept 3.125.
+                if (c.mode == 2 && c.flip != flipBefore) {
+                    c.rotStep = (float)ballRotRate(c.mini != 0, true, useDx);
+                    c.rotNeg = (uint8_t)!((c.flip != 0) ^ (c.rev != 0));
+                }
                 // [2026-09-05] **GD's flipGravity also fires the PARTNER.** A
                 // dual's two bodies are not independent: GJBaseGameLayer's
                 // flipGravity calls the other player with the polarity inverted,
@@ -11486,7 +13573,21 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     sizeFiredUid = p->uid;
                     sizePreMini = c.mini;
                 }
+                const uint8_t miniBeforeThis = c.mini;
                 c.mini = wantMini;
+                // --ballstake: togglePlayerScale re-stakes a ball's GROUND rate at the new size, but
+                // only while the stake in force is a ground one (+0x728, which runBallRotation sets;
+                // runBallRotation2's air stake sets +0x729 instead and the scale leaves it). The
+                // model keeps no such bit, but the stake's own value says which it is: a ground
+                // rate at the current size and speed is never an air rate at any size and speed.
+                // The same attempt, t=1,966: the mini ball turning at -2.519 (0.7's mini ground
+                // rate) takes the regular-size portal and steps -2.0152 on that row.
+                if (c.mode == 2 && miniBeforeThis != c.mini
+                    && std::fabs(c.rotStep
+                                 - (float)ballRotRate(miniBeforeThis != 0, false, useDx)) < 1e-3f) {
+                    c.rotStep = (float)ballRotRate(c.mini != 0, false, useDx);
+                    c.rotNeg = (uint8_t)((c.flip != 0) ^ (c.rev != 0) ^ (c.frame != 0));
+                }
                 pHalfLive = (c.mode == 4 && c.mini)
                                 ? kWaveContactHalfMini
                                 : playerHalf(c.mode, c.mini != 0);
@@ -11567,6 +13668,17 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 } else if (growPress) {
                     const double bTap = ballFlipFor(useDx) * (c.mini ? kMiniImpulse : 1.0);
                     VYSET(c.vy) = (float)(-bTap * (c.flip ? -1.0 : 1.0));
+                } else if (pressAction == 1 && s.grounded
+                           && newHalf < oldHalf && c.mode == 0) {
+                    // --shrinkpress: ...and the same when it SHRINKS. The press is the
+                    // buttons phase's, after the collision pass has made the body mini,
+                    // so it is a mini jump; the model had jumped at the full size before
+                    // the portal fired. Official lv11 with its coins: on the ground at
+                    // y=195 the plan presses on the tick the cube touches the mini
+                    // portal, and GD's row reads vsize 0.6 and vy 8.944 (the mini jump)
+                    // where the model had 11.18. No re-seat (shrinking never lifts).
+                    const double j = cubePhysFor(useDx).jump * (kCubeJumpMini / kCubeJump);
+                    VYSET(c.vy) = (float)(c.flip ? -j : j);
                 } else if (s.grounded && c.grounded && newHalf > oldHalf && !growOnGround
                            && !awayNoLift && !growLag)
                     YSET(c.y) = (float)((double)c.y
@@ -11574,10 +13686,31 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             } else {
                 const uint8_t oldMode = c.mode;
                 c.mode = wantMode;
+                // --ballstake: toggleRollMode (0x39b570) clears m_rotationSpeed (+0x720) and the
+                // spin flag +0x728 when the ball flag changes, so a ball entered in the air does
+                // not turn until something stakes it again -- a pad, a flip, a landing. Before the
+                // portal press below, whose tap stakes the air rate after the toggle.
+                if (wantMode == 2 && oldMode != 2) c.rotStep = 0.f;
+                // --ballungroundramp: ...and a ship / UFO that a ramp seated EARLIER in the same
+                // ascending-uid pass (the ramp's uid below this portal's) is a ball that is no longer
+                // on the ground when the pass reaches the portal: GD reports onGround 0 on the change
+                // tick, and the ramp seats it again on the next tick. A ramp with a larger uid comes
+                // after the portal and seats the ball in the same pass (onGround stays 1).
+                // Measured, GD's rows, three levels: Custom level B t=4,277 ramp 2577 < ball portal 2579,
+                // onGround 1 -> 0, then 290.602 seated with vy 0 at 4,278 (the model kept it grounded
+                // and the ship's leftover press tapped it, flip 0 -> 1, vy 3.706); Custom level D t=4,187
+                // ramps 1461/1462 < portal 1486 -> 0; Custom level L t=3,558 portal 6541 < ramps
+                // 6749/6750 -> stays 1. Ramps only: on flat ground the kit's ship -> ball changes
+                // part both ways and no order explains them yet.
+                if (wantMode == 2 && (oldMode == 1 || oldMode == 3)
+                    && c.onSlope && c.slopeUidNow >= 0 && c.slopeUidNow < p->uid)
+                    c.grounded = 0;
                 // --portalpress: the new mode takes the press (undone above). A cube jumps, a
                 // ball taps; a ship or wave holds, which the next tick reads from s.action.
                 if (portalPressRedo) {
                     portalPressRedo = false;
+                    // --a1clatch: the new mode's jump or tap is the jump block's, from pushButton
+                    if (wantMode == 0 || wantMode == 2) a1cJumpLate = true;
                     if (wantMode == 0) {
                         const double j = cubePhysFor(useDx).jump
                                          * (c.mini ? (kCubeJumpMini / kCubeJump) : 1.0);
@@ -11687,6 +13820,13 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 }
                 // oldMode 0/5/6 falling edge writes nothing: cube has no
                 // toggler, robot and spider deliberately leave the angle alone.
+                // --cubeentryspin: ...and a cube entered from the robot or the spider has NO spin
+                // staked. The cube's rotStep (only the ball reads it) carries the marker: -2 on the
+                // entry tick, -1 while idle (see the cube's spin block). Any other change drops it.
+                {
+                    if (c.mode == 0 && (oldMode == 5 || oldMode == 6)) c.rotStep = -2.f;
+                    else if (c.rotStep < 0.f) c.rotStep = 0.f;
+                }
                 pHalfLive = (c.mode == 4 && c.mini)
                                 ? kWaveContactHalfMini
                                 : playerHalf(c.mode, c.mini != 0);
@@ -11779,7 +13919,16 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // The swing's vy assignment above stays swing-only: what is
                 // measured twice is the POSITION, and the ceiling press has its
                 // own release velocity (ceil/release) already.
-                else if (oldMode != wantMode && s.ceilT > 0 && !s.onSlope)
+                // --portalpressorder: ...but only when the portal comes FIRST. Ramps and portals
+                // are resolved in one object loop, in uid order, so a ramp with the lower uid has
+                // already pressed the body onto its face when the portal changes the mode, and the
+                // press stands. lv20's portal uid13881 is below the chain it ends; on a custom
+                // level's dual a ship pressed along the underside of ramp uid 2578 takes a ball
+                // portal, uid 2588, and GD keeps y on the face (182.205 against the free 182.283);
+                // the model's free step there reads the next tick's contact as fresh and places
+                // the underside's -2.000, which GD does not.
+                else if (oldMode != wantMode && s.ceilT > 0 && !s.onSlope
+                         && !(ceilPressedNow && ceilPressUid >= 0 && p->uid > ceilPressUid))
                     YSET(c.y) = yFreeBeforeSlope;
                 // A MODE portal that changes the resting half re-seats a
                 // grounded player the same tick, exactly like the size portal
@@ -11799,9 +13948,21 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 {
                     const double oh = playerHalf(oldMode, c.mini != 0);
                     const double nh = playerHalf(c.mode, c.mini != 0);
-                    if (c.grounded && nh > oh)
+                    // --wavegrowclamp [2026-09-29]: a grounded wave does not rest
+                    // on its 5.0 hitbox half but kWaveClamp (10) off the floor,
+                    // so the new body grows from there. calib_portalspider, wave
+                    // sliding on the floor at y=100 into a spider portal: GD puts
+                    // the spider at 103.5 (= 100 + 13.5 - 10) and grounded; the
+                    // model added 13.5 - 5 and left it at 108.5, 5 px in the air,
+                    // where it fell for ~15 ticks and every press in them was lost
+                    // (the rig's wave cells, including the +12 control, all failed
+                    // to teleport). Only the lift uses it: the ramp branch below
+                    // keeps its own gate.
+                    const double ohG = (oldMode == 4)
+                        ? (c.mini ? kWaveClampMini : kWaveClamp) : oh;
+                    if (c.grounded && nh > ohG)
                         YSET(c.y) = (float)((double)c.y
-                                      + (c.flip ? -1.0 : 1.0) * (nh - oh));
+                                      + (c.flip ? -1.0 : 1.0) * (nh - ohG));
                     // [2026-08-19] Even in the air, if the grown box penetrates a
                     // floor ramp's face it seats on the same tick -- the rest of
                     // the collision pass resolves the face with the new body.
@@ -11956,8 +14117,19 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         // (This replaced a bound on the CURRENT foot's
                         // penetration. That form was not GD's: it is the overlap
                         // term alone, missing the widened previous edge.)
+                        // --tponce: a teleport earlier in this pass moved the body, and
+                        // the previous edge is taken from where it landed, not from the
+                        // start of the tick. lv22 (uid 6437, 1905 -> 645, into the ship
+                        // portal uid 6440 on the same tick): from s.y the block the body
+                        // had stood on 1,260 px above passed the slack test, and the seat
+                        // put it back at y=1905. The same tick's teleport then fired a
+                        // second time and landed it at 645 again, which is where GD is --
+                        // two errors that cancelled, and --tponce's single firing would
+                        // leave only the first.
+                        const double yPrevSeat =
+                            (teleportedThisTick) ? teleLandY : (double)s.y;
                         const double prevFoot =
-                            ((double)s.y - gs * nh - face) * gs;
+                            (yPrevSeat - gs * nh - face) * gs;
                         const double curFoot =
                             ((double)c.y - gs * nh - face) * gs;
                         if (prevFoot < -seatSlack || curFoot > 0.0) continue;
@@ -12074,6 +14246,48 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // tick), GD comes out UPRIGHT at (5.888-0.152)*0.5 while
                     // the model came out flipped at +2.683 and climbed away
                     // at +0.129/tick.
+                    // --portalspidertap [2026-09-29]: a mode portal hands the
+                    // button to a SPIDER too. calib_portalspider (39 cells, GD):
+                    //   * a fresh press on the portal's tick (plan row pt-1) is
+                    //     the spider's own tap, and it teleports on this tick if
+                    //     the body is grounded -- cube / wave -> spider +0;
+                    //   * the ground flag survives the portal from a cube or a
+                    //     wave and not from a UFO or a ship (those spiders come
+                    //     out 1.5 px above the floor, onGround 0, and the same
+                    //     press does nothing);
+                    //   * a button that is down but cannot be used yet is kept
+                    //     while it stays down, and the spider teleports on the
+                    //     first grounded tick: ship -> spider held from -6 / -1
+                    //     teleports on landing at +15 / +11; lv21 t=16,723 is a
+                    //     wave held since the ramp and grounded at the portal,
+                    //     and GD teleports at +1.
+                    // Old bodies measured: cube, wave, UFO, ship. The ball,
+                    // robot and swing are not, and are left alone.
+                    if (c.mode == 6 && oldMode != 6 && input
+                        && (oldMode == 0 || oldMode == 1 || oldMode == 3 || oldMode == 4)) {
+                        const bool carriesGround = s.grounded && (oldMode == 0 || oldMode == 4);
+                        if (!s.action && carriesGround) {
+                            double tY = 0.0;
+                            bool tHaz = false;
+                            const double sh = playerHalf(6, c.mini != 0);
+                            const bool tFound =
+                                spiderTargetY(K, x, (double)c.y, c.flip != 0, c.mini != 0, sh, tY,
+                                              c.frame == 0, &tHaz, (int)c.frame, c.rev != 0);
+                            if (!tFound) DIE("spider/no-target", nullptr);
+                            if (tHaz) DIE("spider/tp-hazard", nullptr);
+                            // the teleport's own writes (the button branch above):
+                            // 1.0 of velocity the way it went, airborne, flipped
+                            YSET(c.y) = (float)tY;
+                            VYSET(c.vy) = (float)(c.flip ? -1.0 : 1.0);
+                            c.flip = c.flip ? 0 : 1;
+                            c.grounded = 0;
+                            c.snapObj = nullptr;
+                            c.spiderJumpT = 0;
+                            c.pSpiderTap = 0;
+                        } else {
+                            c.pSpiderTap = 1;
+                        }
+                    }
                 }
             }
         }
@@ -12180,6 +14394,12 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                                                                   : sizePreMini;
             padHalf = playerHalf(s.mode, padMini != 0);
         }
+        // --wavepadhalf [2026-09-29]: a pad meets the mini wave's getObjectRect, the 6x6 box
+        // the hazards were bisected on (kWaveHazHalfMini), not the 2.0 bracketed off a
+        // rotated speed portal. lv20 t=2,150: a mini wave under a ceiling gravity pad at
+        // (2805,267), 25 wide, has its centre at 2,789.976 -- 2.524 short of the pad's left
+        // edge -- and GD flips; with 2.0 the model flipped one tick later.
+        if (s.mode == 4 && padMini) padHalf = kWaveHazHalfMini;
         // counted even when merely nearby (diagnosing missed collisions)
         // -- the landing site's contact counts from the next tick (type 28)
         // count the vicinity first (same reason as g_nearOrb -- diagnosing missed impulses)
@@ -12405,12 +14625,29 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // the model fire the evicted ones again (528 re-fires, the opposite divergence from
         // t=1,314). GD's latch is per pad for the whole attempt, so only a per-level bit per pad
         // would match it here.
+        // --padentry (default off): with the memory full, a pad the body did not overlap at the
+        // previous tick's position is a new contact and fires; one it did overlap is taken as
+        // fired then. Nothing is remembered for it, so this is the per-attempt latch only while x
+        // keeps going -- a body that leaves such a pad in y and comes back over the same x fires it
+        // again, where GD does not (the lv14 corridor above, which the slots do get right).
+        // A custom level's staircase of 17 pink pads (50 x 5, 2 px apart, rising 2-6 px each)
+        // has ten of them overlapping the body at once: the first four took the slots, every later
+        // one was skipped, and where GD re-fires a new pad each tick and holds vy (dvy 0 on six
+        // ticks running) the model fell by gravity and took the press as a jump off the pads.
         if (slot < 0) {
-            if (g_histStatOn) ++g_hist.padFull;   // --histstat (speed.hpp)
-            continue;
+            const bool insideAtPrev =
+                std::fabs(xPrev - pd->cx) < pd->hw + padHalf + kPadReach
+                && std::fabs((double)s.y - pd->cy) < pd->hh + padHalf
+                && (!pd->oriented || orientedHit(*pd, xPrev, (double)s.y, padHalf, pRotPad));
+            if (insideAtPrev) {
+                if (g_histStatOn) ++g_hist.padFull;   // --histstat (speed.hpp)
+                continue;
+            }
+        } else {
+            c.usedPad[slot] = pd;
         }
-        c.usedPad[slot] = pd;
         padFiredNow = true;
+        a1cLate = true;   // --a1clatch: propellPlayer raises +0xa1c (0x39f86e)
         if (g_histStatOn) {
             int k = 0;
             for (int i = 0; i < 4; ++i) k += c.usedPad[i] != nullptr;
@@ -12493,6 +14730,16 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // --padtable (speed.hpp): GD's own strengths, per pad and mode.
             if (g_padTable) pv = padTableVy((int)pd->type, c.mode, padMini != 0);
             VYSET(c.vy) = (float)(c.flip ? -pv : pv);
+            // --ballstake: propellPlayer stakes the ball's GROUND rate (runBallRotation, unless
+            // locked or dashing) whether the ball is on the floor or not, and this tick's spin
+            // already turns at it. A custom level, attempt 30 of the 09-30 cold: the ball portal
+            // at t=1,538 leaves GD's ball at 0 deg with no rate, the pink pad at 1,539 sets vy
+            // 6.72 and the rot column steps +3.7551 (1.3's ground rate) from that same row, in
+            // the air all the way; the model's ball stayed at 0 until a flip staked the air rate.
+            if (c.mode == 2) {
+                c.rotStep = (float)ballRotRate(c.mini != 0, false, useDx);
+                c.rotNeg = (uint8_t)((c.flip != 0) ^ (c.rev != 0) ^ (c.frame != 0));
+            }
             // The RED pad is the bumpPlayer type that sets the velocity-limit
             // exemption (type==34 at +0x191) where every other pad clears it.
             // kPadRed is 20, so without it the swing handed back 12 of those
@@ -12501,6 +14748,18 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // UNWITNESSED for ship/UFO: no red pad in the corpus launches
             // either of them out of the band.
             if (pd->type == 34 && boostLatchMode(c.mode)) c.boost = 1;
+            // --boostcarry: PlayerObject::bumpPlayer clears the byte and then sets it for type 0x22
+            // alone, in every mode -- so a yellow or pink pad puts a live exemption down.
+            c.boost = (pd->type == 34) ? 1 : 0;
+            // --padclearsride [2026-09-29]: propellPlayer (0x39f850), which bumpPlayer calls
+            // for every pad but the gravity one, clears m_isOnSlope and m_wasOnSlope in one
+            // 2-byte write. The next seat is therefore a fresh contact and the ride's start
+            // time is taken again, which is what the exit launch's factor reads. lv16 (dual,
+            // p2 a flipped mini ball pushed along a floor ramp's top): a yellow pad fires on
+            // t=13,264, the ride is taken again on 13,265 and left on 13,267 at
+            // 6.906 x 0.4 = 2.762; the model counted the ride from before the pad (5.467).
+            c.onSlope = 0;
+            c.slopeT = 0;
         }
         c.grounded = 0;
         // ...and the ROBOT's hover budget dies with it. The budget belongs to
@@ -12822,8 +15081,16 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     const double relx = (usePre ? xPrev : x) - ob->cx;
                     const double rely = (usePre ? (double)s.y : (double)c.y)
                                         - ob->cy;
-                    const double lx = relx * ob->rc - rely * ob->rs;
-                    const double ly = relx * ob->rs + rely * ob->rc;
+                    // --ringrotsign: the loader stores (rc, rs) = (cos -rot, sin -rot), cocos2d's
+                    // rotation being clockwise-positive, so projecting onto the ring's axes is the
+                    // rotation by +(-rot)... which this pair undid: (rx rc - ry rs, rx rs + ry rc) turns
+                    // the offset by -rot, i.e. it tests the ring at +rot. A ring is square, so at a
+                    // multiple of 45 the two agree (the measured lv22 ring is at -45). They part
+                    // anywhere else. On custom level C, dash ring uid 24826 (id 1704, rot 70,
+                    // 30x30), GD's own positions: at +70 the contact starts at t=2,758 and the model
+                    // dashed at 2,759; at -70 it starts at 2,762, i.e. a dash on 2,763, which is GD's.
+                    const double lx = relx * ob->rc + rely * ob->rs;
+                    const double ly = -relx * ob->rs + rely * ob->rc;
                     const double ph = pHalf * (std::fabs(ob->rc)
                                                + std::fabs(ob->rs));
                     if (std::fabs(lx) >= ob->ohw + ph
@@ -12938,6 +15205,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         ballFlippedThisTick = false;
                     }
                     pressAction = 0;
+                    a1cJumpLate = false;   // --a1clatch: nor did its jump block
                 }
                 if (ob->rev) c.rev = c.rev ? 0 : 1;
                 rotWrite = true;   // rings/orbs too (the rotWrite note)
@@ -13015,10 +15283,33 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // `m0/mini0/g0/gdg0/sp0.9/air` edvy -0.216.
                     // The delay is **only the next 1 tick**; the one after
                     // returns to -15.000.
-                    if ((double)c.vy * (c.flip ? -1.0 : 1.0) >= 2.0)
+                    // --dropfall: ...and the 2.0 is PlayerObject::playerIsFallingBugged's 2g (the
+                    // doubled float, 1.8804 / 1.9164 / 1.9144 / 1.9224 by speed; the rig's
+                    // 1.789 / 2.005 bracket holds it): the skip follows GD's own "not falling" on
+                    // the firing tick. Upright that is vy >= 2g; upside down the classic arm tests
+                    // `vy > 2g` without negating g, so it is vy <= 2g -- nearly any rise or slow
+                    // fall -- unless the fixed arm runs (fixGravityBug, a rotated frame), where it
+                    // is vy <= -2g. A custom level (fixGravityBug=0), the 09-30 diagnostic cold's
+                    // attempt 13: a flipped cube at vy -0.885 (0.885 away from its floor) takes a
+                    // drop ring at t=4,656 and GD's next row reads 15.215, one gravity step past the
+                    // terminal, then 15.000; the model clamped at once and sat 0.048 px short.
+                    const bool dropNotFalling = [&] {
+                        if (!(c.mode == 0 || c.mode == 2 || c.mode == 5
+                                             || c.mode == 6))
+                            return (double)c.vy * (c.flip ? -1.0 : 1.0) >= 2.0;
+                        const double g2 = gdapprox::accelSwitchVyForSpeed(speedMulForDx(useDx));
+                        const bool fixedArm = g_fixGravityBug != 0 || c.frame != 0;
+                        const double v = (double)c.vy;
+                        const bool falling = !c.flip ? (v < g2) : fixedArm ? (v > -g2) : (v > g2);
+                        return !falling;
+                    }();
+                    if (dropNotFalling)
                         c.pNoTerm = 1;
                     VYSET(c.vy) = (float)(c.flip ? dv : -dv);
                     c.grounded = 0;
+                    // --boostcarry: ringJump's type-0x20 branch ends by raising the velocity-limit
+                    // exemption, every mode (see the fly-ring path, applyFlyEarlyRing).
+                    c.boost = 1;
                 } else if (ob->type == 43) {
                     // SPIDER ORB (GameObjectType::SpiderOrb = 43, id 3004).
                     // NOT a teleport portal: it carries no stored target. It
@@ -13113,7 +15404,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // hand back everything over 8 on the next tick.
                     // UNWITNESSED for ship/UFO: no red ring in the corpus
                     // throws either of them outside the band.
-                    if (!green && boostLatchMode(c.mode)) c.boost = 1;
+                    if (!green && true) c.boost = 1;
                 } else {
                     // pink (12) and yellow (11), each with its own measured
                     // ball value -- there is no shared ball ratio.
@@ -13207,6 +15498,11 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // after the collision pass has re-seated the body (speed.hpp, ring press pin).
                 if (ob->type != 13 && !(input && !s.jumpBuf))
                     releasePin(true);
+                // --a1clatch: ringJump raises +0xa1c (0x3991fe) for every ring that reaches its
+                // impulse; the drop ring skips the write (0x3991f5) and the dash rings and the
+                // spider orb leave the function before it (0x399056 / 0x39907f / 0x398fed).
+                if (ob->type != 32 && ob->type != 37 && ob->type != 38 && ob->type != 43)
+                    a1cLate = true;
                 noteRingFired(c, ob);
                 // Fired on the release tick, the press is spent and then released in the buttons
                 // phase, whose releaseButton clears +0x986 again (a custom level t=12,320: the fresh
@@ -13229,6 +15525,11 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // leak needs the attitude law those modes also run, and that is
                 // a separate piece of work.
                 if (c.mode == 2) {
+                    if (!ringStakedNow) {
+                        ringStakedNow = true;
+                        preRingStep = c.rotStep;
+                        preRingNeg = c.rotNeg;
+                    }
                     c.rotStep = (float)ballRotRate(c.mini != 0, true, useDx);
                     c.rotNeg = (uint8_t)!((c.flip != 0) ^ (c.rev != 0));
                 }
@@ -13249,7 +15550,19 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 used = ob;
                 stillTouching = true;
             };
+            const uint8_t flipBeforeOrb = c.flip;
             if (pick) applyOrb(pick);
+            // --dualorbflip: a ring that turns this body's gravity reaches the partner exactly as a
+            // gravity portal does -- both go through flipGravity, whose partner call in dual sets
+            // the other body to the inverse and halves it (fixup.hpp stepBoth, --dualcouple). The
+            // portal pass reported only portals, so a green orb or a gravity ring flipped one body
+            // alone. Measured on a custom level (the cold run's attempts 31 and 56, dual cubes):
+            //   t=4,622  p2 takes the green orb (vy -11.42, up 0 -> 1); GD sets p1 1 -> 0 and
+            //            halves it, -8.41 -> -4.205. The model left p1 flipped at -8.41.
+            //   t=5,127  both bodies touch the orb: p1 fires (up 0 -> 1, -11.42), the partner call
+            //            sets p2; p2 fires and sets p1 back, halving: p1 -5.71, p2 -11.42 -- GD's
+            //            values. The model had p1 at +flip, -11.42.
+            if (linkFlip && pick && c.flip != flipBeforeOrb) *linkFlip = true;
         }
         // Only on a teleported tick are the landing site's portals applied here
         // (the runPortalPass note: GD goes in uid order, so pads/orbs come
@@ -13342,6 +15655,37 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // gravity change does not call it.
         if (rotWrite) c.rotNeg = rotWriteFlip;
         else if (s.grounded && !c.grounded) c.rotNeg = c.flip;
+        // --sloperot: a ramp's launch goes through PlayerObject::boostPlayer (0x39fee0, from
+        // postCollision 0x38d966), which stakes the spin with no mode flag of its own:
+        //     m_rotationSpeed = (upsideDown ? +180 : -180) / (0.8666667 full | 0.6666667 mini)
+        // -- half the take-off's size (0.8653846 / 1.125 per tick) and the other way round, with
+        // no reverse or rotated-gameplay term, and it raises +0x728 so the fall's own stake in
+        // updateJump (0x38c3a5) leaves it alone. updateRotation runs after postCollision, so the
+        // tick that launches already turns by it. It holds until something stakes the spin
+        // again: a jump, a pad, an orb, a landing (the ramp's seat included) or a mode change.
+        // Measured on a custom level's dual (cube leaving a 45-degree ramp's top, upright):
+        // GD -0.865 per tick from the launch on, the model +1.731 -- and a 38-degree spike
+        // 60 ticks later that GD's box overlaps by 0.5 px and the model's misses by 4.
+        // The downhill release (postCollision 0x38da3d) is the other exit: runNormalRotation at the
+        // full size, gravity's usual sign (the take-off's rotNeg above), turned on the same tick.
+        // Measured on a custom level: GD +1.731 on the release tick, the model's take-off easing
+        // -2.059.
+        bool boostSpin = false;
+        if (rotBoostNow) {
+            c.rotNeg = c.flip ? 0 : 1;
+            c.rotBoost = 1;
+            boostSpin = true;
+        } else if (rotWrite || c.grounded || c.onSlope || (s.grounded && !c.grounded)
+                   || s.mode != 0) {
+            c.rotBoost = 0;
+        }
+        const bool relSpin = rotReleaseNow && !boostSpin && !rotPadSpin && !c.grounded;
+        // ...and a PRESS on a ramp is read after the collision pass, so the tick the cube jumps
+        // off a ramp still turns by the ramp's law, not the take-off's easing (the jump's spin
+        // starts on the next tick). Four jumps off ramps in the model-only check corpus, m of 1 and -0.5,
+        // full and mini: GD's step on the press tick is the ramp's double ease each time.
+        const bool rampPress = s.onSlope && !c.onSlope && input && !s.action
+                               && !rotPadSpin && !boostSpin && !relSpin;
         // [2026-08-18] The easing applies "**if either end is grounded**". On
         // both the take-off tick and the landing tick, GD applies the easing,
         // not the rotation step. Measured (lv20, GD's dump, rot column):
@@ -13472,9 +15816,42 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // lv22 t=613 (`clamp=solid/land`, `clampuid=320`, grounded 0 on both
         // sides, vy -15 -> +11.18 = kCubeJump).
         const bool spinNow =
-            rotPadSpin || (!c.grounded && !s.grounded && !cubeLandedThisTick);
+            rotPadSpin || boostSpin || relSpin
+            || (!c.grounded && !s.grounded && !cubeLandedThisTick);
+        // --cubeentryspin: a cube entered in the air from the robot or the spider (rotStep < 0, set
+        // at the mode change) turns NOT AT ALL until a spin is staked. Either something stakes it
+        // the usual way (a take-off, a landing, a pad, a ring or an orb, a ramp), or updateJump's
+        // fall stake (win 0x38c3a5) does. After gravity, upright vy < -0.25 or flipped vy > 0.25,
+        // with +0x728 clear, it calls runNormalRotation with the gravity in force. updateRotation
+        // turns by it on that same tick. The entry tick itself does not turn: updateJump ran while
+        // the player was still a robot.
+        // Measured, GD's own rot / yvel / upsideDown (two witnesses):
+        //   custom level C t=2,436, robot -> cube airborne, flipped, vy -1.819 rising:
+        //     rot 0.000 through 2,445 (vy +0.125), -1.731 at 2,446 (vy +0.341), then -1.731/tick.
+        //     The model turned +1.731/tick from the entry tick on, with the robot's stale sign.
+        //     By t=2,480 the box was 138 deg out, and the blue portal uid 22095 (placed at -68)
+        //     fired 2 ticks early.
+        //   custom level K t=71, airborne entry, upright, vy -13.11, already falling: rot 0.000 on the
+        //     entry tick, +1.731 from t=72.
+        bool entryIdle = false, fallStake = false;
+        if (c.rotStep < 0.f) {
+            if (rotWrite || rotPadSpin || boostSpin || relSpin || c.grounded || s.grounded
+                || cubeLandedThisTick || c.onSlope || rampPress) {
+                c.rotStep = 0.f;
+            } else if (c.rotStep < -1.5f) {
+                c.rotStep = -1.f;
+                entryIdle = true;
+            } else if (c.flip ? c.vy > 0.25f : c.vy < -0.25f) {
+                c.rotStep = 0.f;
+                c.rotNeg = c.flip;
+                fallStake = true;
+            } else {
+                entryIdle = true;
+            }
+        }
         const uint8_t spinSign =
-            rotPadSpin ? rotPadFlip : rotSignNow;
+            rotPadSpin ? rotPadFlip
+                       : (boostSpin || relSpin || fallStake) ? c.rotNeg : rotSignNow;
         // THE BASE IS c.rot, NOT s.rot, and every law below has to agree. A mode
         // portal earlier in this same tick may already have written the angle
         // (the edge table at the `c.mode = wantMode` site), and `State c = s` at
@@ -13490,8 +15867,47 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // rate, so updateRotation spends exactly one step in the same physics
         // step. It is not a separate mechanism to model -- it falls out of
         // applying this law to the base the transition just wrote.
-        if (spinNow && !c.grounded) {
-            const double rate = c.mini ? 2.25 : 1.7307692;
+        if (c.frame == 0 && !rotPadSpin && !boostSpin && !relSpin
+            && (c.onSlope || rampPress)) {
+            // --sloperot: SEATED ON A RAMP the cube turns toward the ramp's angle, not the nearest
+            // 90. updateRotation (0x391020) takes its +0x9b0 branch, and collidedWithSlopeInternal
+            // has already called updateSlopeRotation (0x390bc0) for the seat -- the same step
+            // twice: target convertToClosestRotation(+0x930 in degrees), weight
+            // m_playerSpeed * 0.175 * dt (no x3: that is the flat ground's, gated on !onSlope),
+            // through the half-angle slerp FUN_140071ef0, which also folds the angle into
+            // (-360, 360]. No spin: the seat's hitGround has zeroed it.
+            // The angle, measured rather than read off the sign logic: over the model-only check corpus's
+            // ramp rides (fitting T and the per-tick ratio from three GD rows), T = -atan(m) for
+            // m = +-0.5, +-1 and 2, upright and flipped alike, and the ratio is (1 - w)^2 with
+            // w = 0.04375 x the speed to four places (0.9397 at 0.7x, 0.9228 at 0.9x).
+            // Scope: the cube. GD runs the same branch for the robot and the spider, whose angle
+            // the model does not keep; the ball has its own law on a ramp.
+            const double rampM = c.onSlope ? (double)c.slopeM : (double)s.slopeM;
+            const double ang = -std::atan(rampM) * (180.0 / 3.14159265358979);
+            const double w = 0.04375 * speedMulForDx(useDx);
+            for (int k = 0; k < 2; ++k) {
+                // convertToClosestRotation (0x38d100): steps the angle by 90 to bracket the
+                // current rotation truncated to int mod 360, and takes the nearer (ties low
+                // when stepping up, high when stepping down).
+                const float ref = (float)((int)c.rot % 360);
+                float lo = (float)ang, hi = (float)ang;
+                if (hi <= ref) {
+                    for (; hi < ref; hi += 90.0f) lo = hi;
+                } else {
+                    do { lo = hi; hi = lo - 90.0f; } while (ref < hi);
+                }
+                const double tgt = (std::fabs(ref - lo) <= std::fabs(ref - hi)) ? lo : hi;
+                // the half-angle slerp: the shortest arc, then 2 * atan2 of the half angle
+                const double hd = std::remainder((tgt - (double)c.rot) * 0.5, 180.0);
+                c.rot = (float)(2.0 * std::remainder((double)c.rot * 0.5 + w * hd, 360.0));
+            }
+        } else if (entryIdle) {
+            // --cubeentryspin: no spin staked yet, so the angle holds
+        } else if (spinNow && !c.grounded) {
+            // --sloperot: a spin a ramp's launch staked turns at half the size (boostSpin above)
+            const double rate = (c.rotBoost && !rotPadSpin)
+                                    ? (c.mini ? 1.125 : 0.8653846)
+                                    : (c.mini ? 2.25 : 1.7307692);
             c.rot = (float)((double)c.rot + (spinSign ? -rate : rate));
         } else {
             // ...and the rate is **0.13125 x GD's speed multiplier**.
@@ -13529,12 +15945,64 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // upright/flipped are 99.8-99.9%, so it depends on **neither size nor
         // gravity**. The 125 misses are only ticks whose y is clamp-driven,
         // like the ceiling-ramp ride from lv16 t=4,128 on, off by ~0.05 deg.
+        //
+        // SEATED ON A RAMP the ship follows another law, from the seat's own tick on: two
+        // steps of the half-angle slerp toward the ramp's angle, as the cube's --sloperot
+        // above, at HALF the cube's weight -- w = 0.021875 x the speed, per-tick ratio
+        // (1 - w)^2 -- and toward -atan(m) itself (no 90-degree bracketing; flipped alike).
+        // Measured on the model-only check corpus (604 episodes, the ship's ramp ticks where GD's and
+        // the model's positions agree): 476 of 481 riding ticks and 31 of 31 seat ticks match
+        // GD's rot to 0.01 deg, w / speed = 0.0218750 at the median and quartiles, at 0.9 and
+        // 1.1, full and mini, upright and flipped, m = -1, 0.5, 1 and 2. The displacement law
+        // matched none of them: on the seat tick its target is still the fall, so the model
+        // turned a tick late (custom level F t=3,711: GD 36.709 -> 33.523, the model 36.676, and the
+        // spike uid 2140 killed the model's box a tick after GD's). The other 5 riding ticks
+        // take exactly three steps, near a 30-px block edge; not modelled.
+        if (c.onSlope && c.frame == 0) {
+            const double ang = -std::atan((double)c.slopeM) * (180.0 / 3.14159265358979);
+            const double w = 0.021875 * speedMulForDx(useDx);
+            for (int k = 0; k < 2; ++k) {
+                const double hd = std::remainder((ang - (double)c.rot) * 0.5, 180.0);
+                c.rot = (float)(2.0 * std::remainder((double)c.rot * 0.5 + w * hd, 360.0));
+            }
+        } else {
+            const double ddx = x - xPrev;
+            const double ddy = (double)c.y - (double)s.y;
+            if (ddx != 0.0 || ddy != 0.0) {
+                const double tgt =
+                    -std::atan2(ddy, ddx) * 180.0 / 3.14159265358979;
+                c.rot = (float)((double)c.rot + 0.0375 * (tgt - (double)c.rot));
+            }
+        }
+    } else if (c.mode == 3) {
+        // --uforot: THE UFO's tilt. updateRotation sends the UFO (+0x9ba) through the same
+        // updateShipRotation as the ship, and there the UFO branch scales the displacement
+        // angle and clamps it on one side before the slerp (0x71ef0):
+        //   raw    = atan2(-dy, dx)                        [rad]
+        //   scaled = -0.4 * raw                            (0x6236d0, read at 0x390dd0)
+        //   mirror = reverse (+0x9c2) ? -scaled : scaled    (-1.0 at 0x6236f0)
+        //   clamp  = reverse == gravity (+0x9bf) ? max(-0.1, mirror) : min(0.1, mirror)
+        //            (0x6236c0 / 0x622a10)
+        // and the slerp factor is K_ufo 0.07 (0x622a00) against the ship's 0.15 (0x622a50) on the
+        // same per-tick multiplier, which the ship's measured 0.0375 fixes at 0.25: 0.0175.
+        // Checked on gdref lv1-22: 98.9% of 23,078 UFO ticks within 0.01 deg (mini/flip and
+        // normal/flip 100%); the misses are the same short decays after a flap that the ship's
+        // linear form shows, the slerp being approximated by a lerp in both.
+        // Why it matters: the model's UFO kept whatever angle it came in with, and the SAT
+        // against a turned portal uses it. On a custom level (the cold run's attempt 74) GD's
+        // UFO is at 0.86 deg and the model's at -4.01 when it reaches the gravity portal uid
+        // 11773 (rot -51) at x=9,225 -- the model takes it at t=6,640, GD at 6,641.
         const double ddx = x - xPrev;
         const double ddy = (double)c.y - (double)s.y;
         if (ddx != 0.0 || ddy != 0.0) {
-            const double tgt =
-                -std::atan2(ddy, ddx) * 180.0 / 3.14159265358979;
-            c.rot = (float)((double)c.rot + 0.0375 * (tgt - (double)c.rot));
+            const double raw = std::atan2(-ddy, ddx);
+            double m = -0.4 * raw;
+            if (c.rev) m = -m;
+            const bool gdUp = gdUpOf(c) != 0;
+            m = ((c.rev != 0) == gdUp) ? std::max(-0.1, m) : std::min(0.1, m);
+            const double tgt = m * 57.29578;
+            c.rot = (float)((double)c.rot
+                            + 0.0175 * std::remainder(tgt - (double)c.rot, 360.0));
         }
     } else if (c.mode == 2) {
         // THE BALL. Until now its `rot` never moved at all, which the rate
@@ -13570,9 +16038,18 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // only flipGravity and ringJump write the air value, so a ball that
         // left the ground off a step or a pad is still turning at the ground
         // rate up here.
-        if (c.rotStep != 0.f)
+        // --ballstake: ...except that a RING's stake is next tick's. GD's spin has already turned
+        // at the old one by the time ringJump writes, where a pad's and a gravity portal's land
+        // before it. The same attempt, t=1,814: the blue ring uid 389 flips the ball (vy -6.273
+        // -> 3.130) and the rot column steps +2.5 on that row, the ground rate it was already
+        // turning at, and +1.7708 (0.9's air rate) from 1,815; at t=1,674 the rotated gravity
+        // portal uid 13529 turns the step from +1.4274 to -1.4274 on its own row.
+        const bool ringLag = ringStakedNow && !c.grounded;
+        const float stepNow = ringLag ? preRingStep : c.rotStep;
+        const uint8_t negNow = ringLag ? preRingNeg : c.rotNeg;
+        if (stepNow != 0.f)
             c.rot = (float)((double)c.rot
-                            + (c.rotNeg ? -1.0 : 1.0) * (double)c.rotStep);
+                            + (negNow ? -1.0 : 1.0) * (double)stepNow);
     }
     // RIDE. GD carries a standing player with the surface under it; the support
     // test above only asks "is a face still within 0.6 px of the foot" and
@@ -13794,6 +16271,21 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                             (std::fabs(x - sp->cx) >= sp->hw + pHalfSp) ? "REJ"
                                                                         : "pass");
             if (std::fabs(x - sp->cx) >= sp->hw + pHalfSp) continue;
+            // --spdonce: a speed portal GD has activated is not activated again (the
+            // activatedByPlayer mark, as for the teleport); State::spdFired holds the last two
+            // this body fired. Measured on a custom level (the cold run's attempt 17, a UFO): GD
+            // takes the 0.7x portal uid 130 (615,225) at t=481 and the 0.9x uid 132 at 526; the
+            // body is still inside 130's box, and the model took 130 again at 528 -- three ticks
+            // at 0.7x, 0.76 px of x behind GD from there, and the gravity portal at x=661 a tick
+            // late (t=537 against GD's 536).
+            // It is a memory and not "was inside at the previous tick's position" (the --tponce
+            // form, tried first): the pass judges a portal from the entry snapshot, so a body the
+            // previous tick's own test left OUT can already be inside at that tick's end. lv18
+            // t=14,605 is that case -- ship to cube in the same tick, the 0.7x portal fires in GD
+            // and in the model, and the position form refused it (tracked 3,442 -> 3,058).
+            if (sp->uid >= 0
+                && (s.spdFired[0] == sp->uid || s.spdFired[1] == sp->uid))
+                continue;
             // yColl, not c.y: the entry-snapshot registers (see its
             // declaration by pHalfPortal). c.y here already carries this
             // tick's landing clamp and any mid-pass size re-seat, which GD's
@@ -13807,8 +16299,20 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // 747 pair drops the cube at y=161 and GD's very next x step is
             // already 1.95 -- the snapshot-only form ran it a tick late and
             // shrank the t=7,000 segment 286 -> 283.
+            // --speedafterseat [2026-09-29]: ...and past a RAMP of a smaller uid, for the
+            // same reason inside one call: collisionCheckObjects re-reads the player's rect
+            // right after every collidedWithSlopeInternal (0x140215e7e -> 0x140215e8a, the
+            // slope's setPosition having dirtied it), so a later candidate sees the seated y --
+            // with the size the rect was last computed at (togglePlayerScale does not dirty it).
+            // Measured on lv20 t=19,242 (coins): ramps uid 15507 / 15568 seat a mini ship
+            // 184.123 -> 188.870, and the 1.1x portal uid 15625 (51x56, bottom 197) is touched
+            // with the rect (..., 179.870, 18x18), top 197.87: GD's next x step is 1.6133. The
+            // model judged it at the landing tick's entry y 183.906 and switched a tick late.
             const double ySp = (teleportedThisTick && sp->uid > teleUid)
-                                   ? (double)c.y : yColl;
+                                   ? (double)c.y
+                               : (seatUidSp >= 0 && sp->uid > seatUidSp)
+                                   ? ySeatSp
+                                   : yColl;
             // [2026-08-21 r77] **A rotated speed portal is judged with "the
             // current box".**
             // The entry snapshot (yColl) and the axis-aligned player box are the
@@ -13869,9 +16373,31 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 if (g_speedDodgeMin > 0.0 && gapY < g_speedDodgeMin
                     && std::fabs(c.dx - dxForSpeedId(sp->id)) > 1e-6)
                     DIE("speed/hairline-dodge", sp);
+                // The glitch-avoid mode's margin (g_glitchPortal), with the portal pass's
+                // closing rule: a branch still moving towards the portal is on its way in.
+                if (!dead && g_glitchPortal > 0.0 && gapY < g_glitchPortal
+                    && std::fabs(c.dx - dxForSpeedId(sp->id)) > 1e-6
+                    && s.frame == c.frame
+                    && !(std::fabs(ySp - sp->cy) < std::fabs((double)s.y - sp->cy)))
+                    DIE("glitch/speed-dodge", sp);
                 continue;
             }
             c.dx = dxForSpeedId(sp->id);
+            // --ballstake: a speed portal leaves its speed pending in GJBaseGameLayer+0x4e8, and the
+            // next step of GJBaseGameLayer::update hands it to updateTimeMod, which re-stakes a
+            // ball's ground rate at the new speed (unless locked or dashing), in the air as well.
+            // This tick's spin has already turned at the old rate, so the new one is next tick's:
+            // the same attempt's rot steps 3.7551 on t=1,543, the row the 1.1 portal fires on, and
+            // 3.1085 from 1,544.
+            if (c.mode == 2) {
+                c.rotStep = (float)ballRotRate(c.mini != 0, false, c.dx);
+                c.rotNeg = (uint8_t)((c.flip != 0) ^ (c.rev != 0) ^ (c.frame != 0));
+            }
+            // --spdonce: marked whether or not the speed changed (GD marks on activation).
+            if (sp->uid >= 0 && c.spdFired[0] != sp->uid) {
+                c.spdFired[1] = c.spdFired[0];
+                c.spdFired[0] = sp->uid;
+            }
         }
     }
     // [2026-08-19 D9, REMOVED 2026-09-03] The leave-face mark used to arm here:
@@ -13976,13 +16502,24 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         } else {
             // --ceilreleasemode: gate and value on the mode of the press.
             const uint8_t relMode = s.ceilMode;
-            if (relMode == 1 || relMode == 3 || relMode == 6 || relMode == 7) {
+            // --ceilreleaseball: ...and the BALL. The "unmeasured" above has a witness now: on a
+            // custom level's dual, a ship pressed along the underside of a descending 2:1 ramp
+            // turns ball under it and leaves the press ball, and GD writes -3.729 on the tick the
+            // press ends -- slopeExitVy(0.5, ball) at 1.1x times the full ramp factor, the same
+            // value from three different incoming velocities (-3.556 / -3.508 / -3.460), i.e. the
+            // max-down set this branch already does. The cube stays out (lv18's free fall).
+            // --a1clatch: the same boost gate as the ramp's exit (0x38d7f5): a cube, robot or
+            // spider whose +0xa1c is up is not launched, and the no-boost path behind it wants the
+            // byte down too, so nothing is written.
+            if ((relMode == 1 || relMode == 3 || relMode == 6 || relMode == 7 || relMode == 2)
+                && !(a1cNow && (c.mode == 0 || c.mode == 5 || c.mode == 6))) {
                 const double exU = rawQ(slopeExitVy((double)s.ceilM4 / 4.0, relMode,   // speed.hpp
                                                     useDx, c.mini != 0)
                                         * slopeRampFactor((int)s.ceilT));
                 if ((double)c.vy > -exU) {
                     VYSET(c.vy) = (float)-exU;
                     CLAMP0("ceil/release");
+                    a1cLate = true;   // --a1clatch: boostPlayer (0x39feee)
                     // [2026-09-06] ...and it sets GD's velocity-limit
                     // exemption, for the same reason the two uphill/downhill
                     // sites above do: this IS the slope-exit launch machinery
@@ -13997,7 +16534,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // through this one (ceilT2 38 -> 0). GD decays both at
                     // -0.086/tick for six ticks; without this line only p1
                     // reproduced and p2 stayed pinned at the terminal.
-                    if (boostLatchMode(c.mode)) c.boost = 1;
+                    c.boost = 1;
                 }
             }
             c.ceilT = 0;
@@ -14090,15 +16627,120 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 break;
             }
     }
+    // THE GLITCH-AVOID MODE (g_glitchEmbed, thread_pool.hpp): a ship, ufo or swing that ends the
+    // tick with its OUTER box this many px inside a solid is not riding the floor, it is buried
+    // in it -- the half-sunk ship at a step, which only lives because the crush test above reads
+    // the inner box. Riding a face is 0 px (the seat is face + pHalf). The same solids the crush
+    // test reads, one-ways excluded for the same reason (they hold a player 15 px deep by design).
+    if (!dead && g_glitchEmbed > 0.0 && s.frame == 0
+        && (c.mode == 1 || c.mode == 3 || c.mode == 7)) {
+        const double cyF = (double)c.y;
+        for (const Obj* o : *K.near) {
+            if (o->type != 0 || o->slope || o->oneway || o->oriented) continue;
+            const double ox = o->hw + pHalf - std::fabs(x - o->cx);
+            const double oy = o->hh + pHalf - std::fabs(cyF - o->cy);
+            if (ox > g_glitchEmbed && oy > g_glitchEmbed) {
+                DIE("glitch/embed", o);
+                break;
+            }
+        }
+    }
     // The BALL's tap spends the press too: GD's ball arm of updateJump ends with
     // `flipGravity, vy *= 0.6, m_jumpBuffered = 0`. Cleared once here rather than
     // at each of the four tap sites, which is the same thing -- ballFlippedThisTick
     // is exactly "the ball tapped on this tick".
     if (ballFlippedThisTick) c.jumpBuf = 0;
+    g_ballTapped = ballFlippedThisTick;   // --repelland (fixup.hpp stepBoth)
+    // --repela0c: GD's +0xa0c (State::hitG). propellPlayer clears it; hitGround sets it on every
+    // grounded tick, and a tap needs the ground, so a tapping body held it at the repel; the tap
+    // itself (a jump with the button held) then clears it. Only under the flag, so that a flag-off
+    // run keeps the field at 0 and every State byte as it was.
+    {
+        uint8_t at = s.hitG;
+        if (padFiredNow) at = 0;
+        // ...and leaving a ramp clears it: postCollision's slope-exit branch writes +0xa0c = 0 just
+        // before it computes the launch (the same branch that writes the recorded slope velocity,
+        // 0x38da69). Custom level B, iteration 11: p2 rides a ramp over
+        // t=4,285..4,304 and leaves it at vy -3.107; on 4,328, both bodies upright-flipped 17 px
+        // apart, GD does not repel p1 -- p2's byte is down -- where the model, still holding the
+        // ride's 1, flipped p1 to -2. (collidedWithSlopeInternal's two underside pushes, 0x390297
+        // and 0x39095d, clear it too; the model's pushes are not hooked here.)
+        if (s.onSlope && !c.onSlope && !c.grounded) at = 0;
+        if (c.grounded || ballFlippedThisTick) at = 1;
+        g_hitGRepel = at;
+        c.hitG = ballFlippedThisTick ? 0 : at;
+    }
     // ...and +0x985 stays 0 while the button is held (State::holdDead; speed.hpp, hold latch)
     // (the spider's tap too: spiderTestJumpInternal ends with +0x985 = 0)
     if ((ballFlippedThisTick || spiderWarpedThisTick) && input) c.holdDead = 1;
+    // --portalslopeorder [2026-09-28]: the game handles portals and ramps in ONE loop over the
+    // collision candidates, in the candidates' order (collisionCheckObjects 0x214960: the loop
+    // head 0x214a20 and its continue block 0x215a18 enclose both the portal activation at
+    // 0x214d8e and the ramp's collidedWithSlopeInternal at 0x215e73; only solids and hazards are
+    // collected and resolved after it). The model runs every ramp first and the portals after.
+    // Where the two touch the body on one tick, the game's order shows in its own trace:
+    //   lv20 t=14,451, a flipped ship riding the underside of ramp uid 11803 into normal-gravity
+    //     portal uid 11769: the flip is printed BEFORE the ramp's line, the ramp then sees an
+    //     upright body with vy -0.086 * 0.5 = -0.043 and writes nothing more (a press tick).
+    //     The model rode the ramp flipped, wrote -2.0, flipped and halved it to -1.0.
+    //   a custom level t=3,119, ramps uid 1230 / 1231 then inverse portal uid 1264: the ramp
+    //     lines come FIRST (the case --gravportalseat models).
+    // Both follow ascending uid. So when the portal that flipped this body has a smaller uid
+    // than the ramp it touched, the tick is stepped again with that portal fired ahead of the
+    // ramp pass (above the ramp loop). Kept to a single flying body (ship / UFO / wave / swing,
+    // not dual), which is the measured case; the partner call and the grounded robot/spider
+    // blip of the portal pass are not reproduced ahead of the ramps.
+    if (g_prePortalUid < 0 && gravFiredUid >= 0 && !s.dual && !c.dual
+        && (s.mode == 1 || s.mode == 3 || s.mode == 4 || s.mode == 7)
+        && c.onSlope && c.slopeUidNow > gravFiredUid) {
+        g_prePortalUid = gravFiredUid;
+        bool deadRe = false;
+        State r = stepOne(s, input, K, deadRe, linkFlip);
+        g_prePortalUid = -1;
+        dead = deadRe;
+        return r;
+    }
+    // --waverotactual [2026-09-29]: the wave eases toward the angle it actually moved at this
+    // tick, not the one its input and gravity point it at. updateShipRotation (0x390c40), which
+    // updateRotation hands the wave off a ramp (0x391060), takes atan2f(-(y - lastY), x - lastX)
+    // (0x390da6) and never reads the velocity; the easing weight is 0.25 full / 0.40 mini times
+    // dt, the kWaveRotK / kWaveRotKMini above. A wave held against a surface therefore turns
+    // toward 0. lv20: an upside-down wave sliding along a surface with y constant decays
+    // -10.13, -9.50, -8.91 (x 0.9375 a tick), where the intended direction took the model to
+    // -40; that swung its box into rotated gravity portal uid 4087 a tick early. On a ramp
+    // the game uses another law, so ramps are left to the code above.
+    if (s.mode == 4 && c.mode == 4 && s.frame == 0 && c.frame == 0
+        && !s.rev && !s.onSlope && !c.onSlope && x - xPrev > 0.0) {
+        const double target = kRadToDeg * std::atan2(-((double)c.y - (double)s.y), x - xPrev);
+        const double k = c.mini ? kWaveRotKMini : kWaveRotK;
+        c.rot = (float)((double)s.rot + k * (target - (double)s.rot));
+    }
     c.frameChg = (gravHoldOver || c.frame != s.frame) ? 1 : 0;
+    // --spawnringjump: the spawn ring that took this tick's press gives its jump -- the yellow
+    // orb's, kOrbYellow at this speed and size -- on the NEXT tick's move, with no gravity step:
+    // GD's row for the tick after the press moves y by exactly that impulse x 0.225 and ends
+    // with the vy the pads the ring switched on set. Measured on a custom level, the staircase
+    // of pink pads behind a spawn ring (the cold run of 09-30, every attempt through it):
+    //   full size  y 194.800 -> 197.370  dy 2.5695 = 11.42 x 0.225   vy 0 -> 10.4 (pad)
+    //   mini       y 188.800 -> 190.856  dy 2.0556 =  9.136 x 0.225  vy 0 -> 8.32
+    // (11.42 is the 1.1 band's jump, 9.136 its mini). An ordinary orb or pad sets vy after the
+    // move (lv2 t=3,875: the row moves with the old vy, the next with the new one less g), so
+    // this is the spawn ring's own timing, not a pad rule. Put in the model's terms: the press
+    // tick leaves vy = impulse + one gravity step, the next tick's gravity takes that step back
+    // off, and the move carries the full impulse.
+    if (spawnRingJumpNow && !dead && c.mode == 0) {
+        const double vRing = kOrbYellow * ringScaleFor(useDx) * (c.mini ? kMiniImpulse : 1.0);
+        const double gMag = std::fabs(cubePhysFor(useDx).g);
+        VYSET(c.vy) = (float)((c.flip ? -1.0 : 1.0) * (vRing + gMag));
+        c.grounded = 0;
+    }
+    // --a1clatch: +0xa1c as the tick leaves it -- updateJump's and the collision pass's value,
+    // then what raised it after the ramp's exit (a jump from this tick's press, a ring, a pad, a
+    // launch) and a gameplay rotation (rotateGameplay raises it, 0x399fe0, where the frame turned).
+    {
+        const bool up = a1cNow || a1cJumpLate || a1cLate || c.frame != s.frame;
+        c.a1cLatch = (uint8_t)((c.a1cLatch & ~1u) | (up ? 1u : 0u));
+    }
     return c;
 }
 
@@ -14115,6 +16757,15 @@ inline void swapHalves(State& s) {
     std::swap(s.flip, s.flip2);
     std::swap(s.ringHold, s.ringHold2);
     std::swap(s.pressSpent, s.pressSpent2);
+    if (g_dualSlide) std::swap(s.slideT, s.slideT2);   // --dualslide: per-body dart slide arm
+    // --dualdash: per-body dash. GD's m_isDashing is the player's own; with one shared field the
+    // second body ran the first body's dash. Custom level C t=2,763: p1 (robot) takes the
+    // dash ring uid 24826 and dashes, while GD's p2 (ball) keeps falling (p2vy -3.741); the model
+    // dashed both.
+    {
+        std::swap(s.dashing, s.dashing2);
+        std::swap(s.dashSlope, s.dashSlope2);
+    }
     // ...and the velocity-limit exemption, which became per-half on 2026-09-06
     // (State::boost2). lv16 t=8,913 is a DUAL ship whose two halves both carry
     // it; left shared, p2's step would read p1's byte and its own answer would
@@ -14123,6 +16774,9 @@ inline void swapHalves(State& s) {
     std::swap(s.onSlope, s.onSlope2);
     std::swap(s.slopeT, s.slopeT2);
     std::swap(s.rideLanded, s.rideLanded2);
+    // --dualseatt: ...and the law seat's count (State::seatT), the next tick's m_wasOnSlope for a
+    // law seat. Shared, the first body's step wrote it over the second's every tick.
+    std::swap(s.seatT, s.seatT2);
     std::swap(s.mode, s.mode2);
     std::swap(s.mini, s.mini2);
     // ...and WHICH RAMP each half is riding. slopeUid0/slopeUidNow were left behind, so the
@@ -14138,12 +16792,25 @@ inline void swapHalves(State& s) {
     std::swap(s.usedOrb, s.usedOrb2);
     std::swap(s.usedOrbOld, s.usedOrbOld2);
     for (int i = 0; i < 3; ++i) std::swap(s.usedOrbHist[i], s.usedOrbHist2[i]);
+    for (int i = 0; i < 2; ++i) std::swap(s.spdFired[i], s.spdFired2[i]);
     std::swap(s.holdDead, s.holdDead2);
     for (int i = 0; i < 3; ++i) std::swap(s.portSeen[i], s.portSeen2[i]);
     for (int i = 0; i < 4; ++i) std::swap(s.touchRing[i], s.touchRing2[i]);
     std::swap(s.touchRingT, s.touchRingT2);
     std::swap(s.portalLatch, s.portalLatch2);
     for (int i = 0; i < 4; ++i) std::swap(s.usedPad[i], s.usedPad2[i]);
+    std::swap(s.hitG, s.hitG2);   // --repela0c
+    // --a1clatch: the two bodies' +0xa1c are bits 0 and 1 of one byte
+    s.a1cLatch = (uint8_t)(((s.a1cLatch & 1u) << 1) | ((s.a1cLatch >> 1) & 1u));
+    {                 // --rot2
+        std::swap(s.rot, s.rot2);
+        std::swap(s.rotStep, s.rotStep2);
+        std::swap(s.rotNeg, s.rotNeg2);
+    }
+    {        // --dualflipclock
+        std::swap(s.flipT, s.flipT2);
+        std::swap(s.modeT, s.modeT2);
+    }
 }
 
 // Touch-trigger boxes (see TouchTrig): plain rect overlap of the player's box

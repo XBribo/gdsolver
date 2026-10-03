@@ -130,6 +130,9 @@ def parse(path: Path) -> Run:
                     "tick": int(m.group(1)),
                     "x": float(m.group(2)),
                     "kill": int(m.group(3)),
+                    # a kill the model dies too, a tick later (itermap.hpp Fixup::sameDeath);
+                    # logs from before the marker existed read as 0
+                    "same": 1 if " same-death" in line else 0,
                 })
                 continue
 
@@ -208,7 +211,7 @@ def write_map(run: Run, out: Path) -> None:
         lines.append("death={iter},{tick},{x:g},{y:g},{kind},{anchorT},{anchorX:g},"
                      "{backoff},{killerId},{killerUid}".format(**d))
     for f in run.fixups:
-        lines.append("fixup={iter},{tick},{x:g},{y:g},{kill}".format(**f))
+        lines.append("fixup={iter},{tick},{x:g},{y:g},{kill},{same}".format(**f))
     for it, x0, x1 in run.vetoes:
         lines.append(f"veto={it},{x0:g},{x1:g}")
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")

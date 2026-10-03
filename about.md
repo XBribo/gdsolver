@@ -50,14 +50,21 @@ and SubZero and The Challenge, the six of them that have coins with every coin a
 well. That is also the supported set. (Those 17 are not in the main game's level
 list: the solver reads them from level files, which are not distributed with it.)
 
-Custom levels are **not supported yet**. Nothing in the design is specific to
-the official levels and many custom ones already solve as they are, but the
-physics model is measured against what those levels, and the calibration levels
-that come with the source, use, so a level leaning on something it has never met
-is a level it is wrong about. Where
-the model has no answer, the section solver searches the game itself, and a plan
-the game clears is a solution however it was found. Platformer levels are
-refused: the search has no steering input to choose.
+Custom levels can be solved too, without a guarantee. Nothing in the design is
+specific to the official levels, and most custom levels built from parts that
+existed before 2.0 solve as they are; the newest gimmicks often do not yet. The
+physics model is measured against what the official levels, and the calibration
+levels that come with the source, use, so a level leaning on something it has
+never met is a level it is wrong about. The play menu says so before a solve: a
+yellow line when a custom level uses objects from 2.0 on, a red one when a level
+holds something the model cannot express at all. Where the model has no answer,
+the section solver searches the game itself, and a plan the game clears is a
+solution however it was found. Platformer levels are refused: the search has no
+steering input to choose.
+
+On Android the mod is an experiment and not supported. The physics model is
+Windows GD's, and whether Android GD behaves the same has not been measured, so a
+result reached there is Android's alone.
 
 ## Nothing is recorded while it drives
 

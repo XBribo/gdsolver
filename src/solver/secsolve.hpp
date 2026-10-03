@@ -51,6 +51,44 @@ inline long long g_startTick = -1;   // create the checkpoint at this tick and s
 inline double g_targetX = 0.0;       // success when crossed alive (<=0 disables)
 inline int g_horizon = 300;          // section length (ticks)
 inline size_t g_cap = 100;           // states kept per layer
+// ---- how the cap chooses (both off = the even spacing in y order) ----------
+// cfg `seccover`: inside a family, keep the nodes that cover the (y, vy) plane -- one per
+// cell of the finest grid with no more occupied cells than the family's share, both y edges
+// always in -- rather than the evenly spaced ones of the list sorted by y, then vy. The
+// sorted list samples vy at random within a y: at a custom level's UFO section (a 48 px gap
+// between two spikes, a normal-size UFO's centre free over 18 px for about 34 ticks) every
+// branch that reached the gap had flapped within the last few ticks, the coasting ones the
+// gap needs were all cut, and the search died there at cap 2,000 and passed at cap 6,000.
+// Chosen by cover (with the normal-size route forced) it passed at cap 400 and at cap 100.
+// On by default since 2026-09-28, with secsizefam, secp2key and dpseccaptiers=2: the three fix
+// what a cap keeps; without them the custom level's normal-size route never got through the
+// UFO window even at cap 2,000.
+inline bool g_cover = true;
+// cfg `secsizefam`: player 1's size is a family of its own. When both sizes are in a layer
+// each gets half the cap (what one cannot fill goes to the other), so a route that skipped
+// an optional size portal is not crowded out by the one that took it. At the same level the
+// normal-size route was about a twentieth of the frontier under seccover alone, and it died
+// out at a column it has to climb over, at cap 100 and at cap 400. On by default (see seccover).
+inline bool g_sizeFam = true;
+// cfg `secp2key`: in a dual section player 2's state is part of the dedupe key, and its y an
+// axis of seccover's grid. Both players take the same input, so two branches can put player 1
+// in the same place with player 2 in different ones -- riding under a block or in the air --
+// and past a spike hung under that block only the one in the air lives. With player 1 alone in
+// the key the first of the two in won and the other was dropped as a duplicate: at the custom
+// level's dual section the ten normal-size branches that reached that spike all died on it,
+// and with player 2 in the key eight normal-size branches got past it. On by default (see
+// seccover).
+inline bool g_p2Key = true;
+// cfg `secforcesize` (a probe, off = -1): player 1 starts the search at this size, 0 normal or 1
+// mini, whatever the plan left it at -- set again every time the search goes back to its head.
+// The state is one no route may reach, so what the search finds is not a plan: it only says
+// whether the stretch can be crossed at that size. What a wall a plan cannot get past would
+// need, asked of the game rather than of the model.
+inline int g_forceP1Size = -1;
+// cfg `seckeepsize` (off = -1): every branch whose player 1 is not this size (0 normal, 1 mini)
+// is dropped, the spine included -- a search for the route that keeps the size.
+inline int g_keepP1Size = -1;
+inline long long g_keepDropped = 0;   // branches dropped for it, this search
 // ---- exit conditions (other than x) -----------------------------------------
 // The axis of travel is NOT necessarily x. lv22's x≈2,266 is a 90-degree
 // rotated section: travel is -y and pressing moves x. "Crossing x" is not a valid goal there, so the exit can also be written
@@ -104,6 +142,21 @@ inline bool g_warnedNoCkpt = false;
 inline bool g_spineOn = true;        // cfg `secspine=0` turns it off for A/B
 inline int g_spine = -1;             // node index of the spine at this layer
 inline int g_spineNext = -1;         // ...and the child that continues it
+// THE SPINE AS A CHECK ON THE SNAPSHOT. The spine flies a plan the game has flown, so it lives as
+// long as that plan did -- g_spineUntil, the plan's verified death, when the caller knows it. On
+// the player snapshot a spine that dies earlier is the search disagreeing with the game, and every
+// other branch's death is suspect with it: in official level 22's switch band (the 1x lane) a
+// plan that lived to t=2,938 lost its own branch within 9 ticks of a window's head at t=2,740, and
+// from t=2,212 the snapshot search came back EXHAUSTED at depth 294 while the same window on
+// checkpoints (secsnap=0) crossed past t=2,938 -- the snapshot keeps only the player, and the
+// switches' doors and groups are not the player's. Caught that way (g_psnapLied), the search goes
+// on -- what it finds is replayed from the head before it counts. A rung whose search then finds
+// nothing goes back to the loop; only with cfg seccpfallback=1 (a diagnostic) is the same window
+// asked again on checkpoints (hooks_gamelayer).
+inline long long g_spineUntil = -1;  // the tick the spine should live to, -1 = not known
+constexpr long long kSpineSlack = 3; // ...less this many ticks before it counts
+inline bool g_psnapLied = false;     // this search's spine died early on the snapshot
+inline long long g_spineLostT = -1;  // ...at this tick
 // cfg `secspineoff`: which tick's plan input a layer applies. SWEPT, not
 // derived -- see the note at the lookup.
 inline int g_spineOff = -1;   // MEASURED: -1 tracks all 60 layers to 0.0499 px;
@@ -306,6 +359,15 @@ inline int g_grace = 600;
 // were fired by a death 2-9 ticks past the previous splice, a ship the model and the game both
 // killed on the same tick from the spliced state.
 inline int g_graceFly = 0;
+// cfg `secgracedash` (on by default since 2026-10; 0 = off): a body riding a dash ring's dash
+// counts as controllable in the test above -- releasing is an input that changes the path, and none
+// of the test's lines (never press, hold, press every N ticks) holds a dash for a while and then
+// lets go. A custom level's dual section: both bodies take pink dash rings at x~1,695 (t~1,300);
+// holding to t=1,420 lives to t=1,439, and every earlier release dies about 9 ticks after it. A
+// window whose target (t=1,326) fell inside that dash came back DOOMED at caps 100 to 400 and from
+// two heads: the hold line dashes on into the wall at ~1,439 and every releasing line dies soon
+// after its release.
+inline bool g_graceDash = true;
 // Which leaf a depth goal takes first (cfg `secleafmid`, on: the middle of the band; 0 = the
 // old order). The frontier comes out of the cap sorted by y, and the layer that reaches the goal
 // depth took the first child alive there -- the band's lowest edge. Coin-off SubZero lv4001: in
@@ -334,6 +396,21 @@ inline bool g_secCoins = true;
 // cfg dpseccoinrung: the coin this rung was fired for (-1 = none). Leaving it behind is final and
 // a leaf without it is no answer. Set by the handoff, cleared when the rung ends.
 inline int g_rungCoin = -1;
+// cfg `secrungcoinoff` (on by default since 2026-10; 0 = off), under seccoins: the coin a rung was
+// fired for (g_rungCoin) is not counted taken for being passed while its group is off -- neither
+// per step nor at the head. A coin whose group is off is skipped as "not there, so passing it is no
+// miss", and the bit that records that is the one the rung's leaf test reads as "has the coin":
+// SubZero 4003's third coin (group 152 off until a Count sees four presses) was "taken"
+// (bits 3 -> 7) by every leaf of six spliced rungs, one of them at a head it was already passed at
+// (7 -> 7), and GD credited none.
+inline bool g_rungCoinOff = true;
+// cfg `secbookfirst` (on by default since 2026-10; 0 = off): a section search that hands back to
+// the loop puts the loop's coin books (pickup ticks, GD's credits, coinlive latches, item
+// counters, the miss latch, the last
+// x) back BEFORE its resetLevel starts the next attempt, instead of when the search's coroutine
+// ends -- which is after that reset, so the next attempt began with the searched attempt's books
+// (hooks_gamelayer.cpp, runSectionSolve's hand-back).
+inline bool g_bookFirst = true;
 // cfg `secbound` (on; 0 = off): inside a search, an object outside the level's box (every
 // object's position at the section head, plus kBoundMargin px) is not re-bucketed into GD's
 // sections. A player snapshot puts the in-progress moves back but not the objects they move, so
@@ -349,6 +426,20 @@ inline bool g_boundOn = true;
 constexpr double kBoundMargin = 3000.0;
 inline double g_boxX0 = 0.0, g_boxX1 = 0.0, g_boxY0 = 0.0, g_boxY1 = 0.0;
 inline long long g_boundSkips = 0;
+// ...and, bound or not, an object at a position that is not a finite number is never handed to the
+// game's re-bucketing inside a search. GJBaseGameLayer::addToSection (0x226500) turns the position
+// into a cell index and grows the grid to it: a NaN made the index negative and the grow threw
+// "vector too long" (updateObjectSection 0x227f50 -> addToSection -> 0x252df7 -> the vector's
+// grow; MOAI's ladder window at t=9,628, depth 66, every run). Counted, and the first one kept
+// (uid, id, position) for the search to report and give up on: its world is no longer the game's.
+// A position this far out counts too: the cell index is an int (x or y times 0.01), and no level's
+// object comes near it.
+constexpr double kPosLimit = 1e8;
+inline long long g_nonFinite = 0;
+inline int g_nonFiniteUid = -1, g_nonFiniteId = -1;
+inline double g_nonFiniteX = 0.0, g_nonFiniteY = 0.0;
+// cfg secthrow: the exceptions thrown on purpose so far in this process (Config::secThrowKind).
+inline int g_secThrowsDone = 0;
 // cfg `secshaderskip` (on; 0 = off): inside a search, leave the shader layer as it is. resetLevel
 // calls GJBaseGameLayer::updateShaderLayer twice per restore (once through resetLevelVariables),
 // and it moves the layers that hold every object's sprite in and out of the shader's container;
@@ -360,6 +451,54 @@ inline long long g_boundSkips = 0;
 // search layers (every layer's fingerprint), in 328 s against 470 s -- the restore 74 -> 12 us.
 inline bool g_shaderSkip = true;
 inline long long g_shaderSkips = 0;
+
+// cfg `secshadersig=1` (print only): where the shader layer's hierarchy stands -- which parent
+// each sprite batch and object layer hangs from, the part updateShaderLayer moves -- at a
+// search's start and end, at the first real reset after it, and at each level's first reset
+// (`shadersig:` lines). Run with and without secshaderskip, the lines after the search say whether
+// the reset the search did not do is made good by the first one the game does.
+inline bool g_shaderSig = false;
+inline bool g_shaderSigPending = false;   // a search ended; the next real reset prints
+inline std::string shaderSig(GJBaseGameLayer* l) {
+    if (!l) return "no layer";
+    auto kind = [l](cocos2d::CCNode* p) -> char {
+        if (!p) return '0';
+        if (p == l->m_inShaderParent) return 'I';
+        if (p == l->m_aboveShaderParent) return 'A';
+        if (p == l->m_objectLayer) return 'O';
+        if (p == l->m_inShaderObjectLayer) return 'i';
+        if (p == l->m_aboveShaderObjectLayer) return 'a';
+        if (p == l) return 'L';
+        return '?';
+    };
+    std::string seq;
+    size_t in = 0, above = 0, other = 0;
+    if (l->m_batchNodes) {
+        for (auto* n : geode::cocos::CCArrayExt<cocos2d::CCNode*>(l->m_batchNodes)) {
+            const char k = kind(n ? n->getParent() : nullptr);
+            seq += k;
+            seq += std::to_string(n ? n->getZOrder() : 0);
+            seq += ',';
+            if (k == 'I' || k == 'i') ++in;
+            else if (k == 'A' || k == 'a') ++above;
+            else ++other;
+        }
+    }
+    std::string layers;
+    for (cocos2d::CCNode* n : {static_cast<cocos2d::CCNode*>(l->m_objectLayer),
+                               static_cast<cocos2d::CCNode*>(l->m_inShaderObjectLayer),
+                               static_cast<cocos2d::CCNode*>(l->m_aboveShaderObjectLayer),
+                               l->m_inShaderParent, l->m_aboveShaderParent})
+        layers += kind(n ? n->getParent() : nullptr);
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char ch : seq + "|" + layers) { h ^= ch; h *= 1099511628211ULL; }
+    char b[160];
+    snprintf(b, sizeof(b), "batches=%zu in=%zu above=%zu other=%zu layers=%s shader=%s sig=%08x",
+             l->m_batchNodes ? (size_t)l->m_batchNodes->count() : (size_t)0, in, above, other,
+             layers.c_str(), (l->m_shaderLayer && l->m_shaderLayer->isVisible()) ? "on" : "off",
+             (unsigned)(h & 0xffffffffULL));
+    return b;
+}
 // After how many doomed exits to give up with "nothing from this entry"
 // (cfg `secmaxdoomed`). Each one costs a replay + 10 grace lines ≈ 1,300 steps,
 // measured 344 of them in 104 seconds. That is plenty as evidence, so stop there.
@@ -389,6 +528,16 @@ inline int g_held = 0;               // currently pressing? (for handleButton de
 // DIFFERENT THING FROM THE PLAIN REPLAY — history and measurements are in the
 // note on secArmHold in phase1.cpp. It is made switchable for A/B testing.
 inline bool g_jumpBuf = true;
+// cfg `secjbkeep` (on by default since 2026-10; 0 = off): after a held restore has raised
+// m_jumpBuffered, put back each body's own value as the point had it -- the head's from the plain
+// flight (g_headJb), a node's from its capture (DashState::jumpBuf). Raising it on BOTH bodies is a
+// buffered press for a body whose press was spent long ago: a custom level's dual section (a search
+// from t=741), a flipped UFO holds a gravity dash ring's press from t=746 while the spider partner,
+// flipped by the ring the same press fired, falls to the floor; the plain flight lands it at t=802
+// and holds on to t=944, while every restored branch had the spider teleport on landing, into a saw
+// -- the spine died on that tick. With the node's own value the spine lives on.
+inline bool g_jbKeep = true;
+inline int8_t g_headJb[2] = {-1, -1};   // m_jumpBuffered of p1 / p2 in the plain flight, -1 = none
 
 // Dash (dash ring type 37/38) state.
 //
@@ -420,6 +569,7 @@ struct DashState {
     GameObject* potentialSlope = nullptr;
     GameObject* snappedTo = nullptr;
     GameObject* lastPortal = nullptr;
+    int8_t jumpBuf = -1;   // m_jumpBuffered at the capture (cfg secjbkeep), -1 = not taken
 };
 
 // 1 node = "the input sequence from the section start". Walking the parents
@@ -451,8 +601,26 @@ struct Node {
     // On levels where the counter never moves it is always 0 and affects
     // neither the key nor the cap.
     uint16_t cnt;
+    uint8_t mini;    // player 1 mini? (a family of the cap under cfg secsizefam)
+    uint8_t dual;    // in a dual section? (then y2 is player 2's y; see g_p2Key)
+    float y2;
 };
 inline std::vector<Node> g_nodes;
+// THE CHECKPOINT DOES NOT CARRY EVERY PLAYER MEMBER (cfg `seccpplayer`, on). A load puts back
+// what GD's checkpoint saves and leaves the rest of the player as the last run left it. On the
+// section search's checkpoint paths -- the head, a cross-check's replay origins, a leaf's replay,
+// an exit's survival lines -- that "last run" is whichever branch was stepped before, so the replay
+// the psnap nodes are checked against started from a player no run of its inputs would have.
+// Measured at a custom level's dual section (a search from t=24,680): loading the head's
+// checkpoint again left player 2's m_padRingRelated, m_stateJumpBuffered, m_wasRobotJump,
+// m_blackOrbRelated and its slope members at the values the branch before had given them, where
+// the first load had left the plain flight's; and every load, the first included, cleared player
+// 1's m_stateRingJump where the plain flight had it set. After
+// each such load the search now writes back its own snapshot of that point: at the head, the
+// player as the plain flight brought it there (taken before the head's checkpoint is made), and
+// at a cross-check anchor, the snapshot retaken from the replay that made it.
+inline bool g_cpPlayer = true;
+inline std::vector<uint8_t> g_headPlain;
 // Per-node dash state (same index as g_nodes). Held because the checkpoint's
 // RESTORE does not read it back -- see the note above DashState.
 inline std::vector<DashState> g_dash;
@@ -480,6 +648,22 @@ inline std::vector<double> g_vy;
 // explained: the first tick of a boost is the same either way.
 inline std::vector<double> g_accel;
 inline std::vector<uint8_t> g_pad;
+// ...and all four for PLAYER 2 (cfg `secp2extras`, on). Every one of them was written back to
+// m_player1 only, so in a dual section p2 took its boost accumulator and pad flag from whichever
+// node was stepped last, and on the checkpoint path its y velocity off the 0.001 grid as well.
+// MEASURED on a custom level (dual robots mirrored about y=285 in the game, their y summing to
+// 570.000 on every tick): a checkpoint-branched search from t=7,985 kept player 1 on the plan
+// (spine y 267.1 at x=13,372.6, the game 267.12) while player 2 came up 25 px high with vy 7.45
+// against the game's 5.695 at x=13,374.6, and died on a saw there -- the plan it was replaying
+// flew on to x=14,736. With p2's four written back, the loop's window from t=8,585 was solved and
+// the run went on past x=14,736; without, that window and the three wider ones behind it came back
+// EXHAUSTED, as before (same build, cfg secp2extras=1/0). The psnap path gave the same rounds
+// either way on that level: psnap copies p2's bytes, the velocity among them.
+inline bool g_p2Extras = true;
+inline std::vector<DashState> g_dash2;
+inline std::vector<double> g_vy2;
+inline std::vector<double> g_accel2;
+inline std::vector<uint8_t> g_pad2;
 // ...and the same thing for the plain checkpoint/restore path (hole 2),
 // which the section runs use and which had no dash handling at
 // all. MEASURED without injection: lv22 checkpoint at t=2,112 mid-dash,
@@ -487,6 +671,15 @@ inline std::vector<uint8_t> g_pad;
 // -0.272, -0.570, ...) while the run from the head holds y=241.7341 at
 // vy=0.000.
 inline DashState g_ckptDash;
+// cfg `secheaddash` (on by default since 2026-10; 0 = off): the section search's head takes its
+// dash from the plain flight (g_ckptDash, and g_ckptDash2 for player 2) instead of from what the
+// head's checkpoint load left, which never has one. Without it a head inside a dash put every node
+// back undashed: the node's psnap restore brings the plain flight's m_isDashing back and the head's
+// DashState, taken after the load, sets it to 0 again. A custom level's dual section: the loop's
+// window from t=812, inside a flipped UFO's dash held from t=746, lost its spine 7 ticks in (t=819)
+// on the snapshot and on checkpoints alike, where the plan flew on to t=889.
+inline bool g_headDash = true;
+inline DashState g_ckptDash2;
 // Per-node checkpoints. Kept alive ONLY FOR THE FRONTIER and released as the
 // layer advances (holding hundreds to thousands returns to the old
 // implementation's OOM). Index is the same as g_nodes.
@@ -560,8 +753,23 @@ inline int cntNow(GJBaseGameLayer* l) {
 // cap 120, so most slices are a single layer -- the frame is handed back as soon as one is done,
 // never in the middle of one. 0 disables slicing entirely (the old single-frame behaviour, kept
 // so the two can be compared).
-inline int g_sliceMs = 12;
+//
+// 50 ms, not the 12 it was: every frame between two slices costs the game's own frame work (~4 ms
+// measured, nearly all of it outside the game layer's update -- `secsolve: frames=`), and at 12 ms
+// that was a fifth of a search's wall time. A heavy custom level solved cold at both, side by side:
+// the same 8,707 search layers and 50 rounds, 2,794 frames between slices (34 s) against 737
+// (3.5 s), the search 166.5 s against 136.8 s, the restore unchanged. The window still takes about
+// twenty frames a second while a search runs.
+inline int g_sliceMs = 50;
 inline std::chrono::steady_clock::time_point g_sliceStart;
+// What the frames between two slices cost (print only, `secsolve: frames=`): the wall time from
+// the end of one slice to the start of the next -- everything the game does in a frame that is
+// not the search -- and the part of it the overlays took.
+inline long long g_frames = 0;
+inline double g_frameGapMs = 0.0, g_overlayMs = 0.0;
+inline double g_outsideMs = 0.0;   // ...of which outside the game layer's update (the frame)
+inline std::chrono::steady_clock::time_point g_sliceEnd;
+inline bool g_sliceEnded = false;
 
 inline bool sliceExpired() {
     if (g_sliceMs <= 0) return false;
@@ -623,6 +831,9 @@ inline void reset() {
     g_task.destroy();
     g_taskLayer = nullptr;
     g_frontierNow = 0;
+    g_keepDropped = 0;   // cfg seckeepsize's count (a search also starts it at 0)
+    g_psnapLied = false;
+    g_spineLostT = -1;
     g_done = false;
     g_active = false;
     // A search dropped in the middle -- the player left the level -- also leaves these raised,
@@ -637,6 +848,7 @@ inline void reset() {
     g_held = 0;
     g_nodes.clear();
     g_dash.clear();
+    g_dash2.clear();
     g_cps.clear();
     releaseAnchors();
     g_movSet.clear();

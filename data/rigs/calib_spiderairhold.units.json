@@ -1,0 +1,52 @@
+[
+ {
+  "x0": 90.0,
+  "x1": 1290.0,
+  "cell": "held",
+  "press_a": 10,
+  "press_b": 400,
+  "x_pad": 690.0,
+  "pad_t_est": 533,
+  "press_t": 543
+ },
+ {
+  "x0": 1290.0,
+  "x1": 2490.0,
+  "cell": "held",
+  "press_a": 40,
+  "press_b": 400,
+  "x_pad": 1890.0,
+  "pad_t_est": 1457,
+  "press_t": 1497
+ },
+ {
+  "x0": 2490.0,
+  "x1": 3690.0,
+  "cell": "held",
+  "press_a": 80,
+  "press_b": 400,
+  "x_pad": 3090.0,
+  "pad_t_est": 2382,
+  "press_t": 2462
+ },
+ {
+  "x0": 3690.0,
+  "x1": 4890.0,
+  "cell": "released",
+  "press_a": 40,
+  "press_b": 40,
+  "x_pad": 4290.0,
+  "pad_t_est": 3306,
+  "press_t": 3346
+ },
+ {
+  "x0": 4890.0,
+  "x1": 6090.0,
+  "cell": "grounded",
+  "press_a": 600,
+  "press_b": 600,
+  "x_pad": 5490.0,
+  "pad_t_est": 4230,
+  "press_t": 4830
+ }
+]

@@ -2,9 +2,27 @@
 #include "mod/playlayer_helpers.hpp"
 // For PROCESS_MEMORY_COUNTERS's named fields -- the struct is only used through
 // GetProcAddress("K32GetProcessMemoryInfo"), so nothing links psapi.
+#ifdef GEODE_IS_WINDOWS
 #include <psapi.h>
+#endif
 
 using namespace p1;
+
+// The rest of the player at each entry snapshot, same index as g_snaps (cfg snapplayer): what
+// psnap's byte copy cannot carry -- the containers (the slope map, the touched rings and pads) and
+// the pointers to the objects the player stands on, rides or dashes from -- carried by C++
+// assignment, as the section search carries them.
+struct SnapExtra {
+    secsolve::DashState dash, dash2;
+    psnap::Touch touch;
+    // GD's anti-cheat check (PlayLayer::m_damageVerified): not in the checkpoint, and outside
+    // practice mode resetLevel clears it, which puts GD's spike back on player 1 until a
+    // destroyPlayer with it clears the check again -- and every substep the spike is hit,
+    // checkCollisions returns before postCollision. Measured on lv16: 11 such calls after each
+    // restore, so a ramp left within those substeps (t=6,404; 10,809) never launched the player.
+    bool damageVerified = true;
+};
+static std::vector<SnapExtra> g_snapExtras;
 
 // Time spent INSIDE the restore, summed across the search. `lms` on the seclayer
 // line is the whole layer's elapsed time, so `lms/lrest` is "layer time per
@@ -43,7 +61,7 @@ static double g_secStepMs = 0.0;
 // nothing but the player (user report on the panel, 2026-09-25; reproduced in a worker with
 // skiprender=0: the faults began with the reset after the first rung).
 static void clearCheckpointsUnsectioned(PlayLayer* pl) {
-    static_assert(offsetof(CheckpointObject, m_physicalCheckpointObject) == 0xe58,
+    static_assert(offsetof(CheckpointObject, m_physicalCheckpointObject) == gdoff::kCheckpointObject,
                   "the object removeCheckpoint takes out of its section");
     if (!pl || !pl->m_checkpointArray) return;
     for (unsigned i = 0; i < pl->m_checkpointArray->count(); ++i) {
@@ -60,7 +78,7 @@ static void clearCheckpointsUnsectioned(PlayLayer* pl) {
         // 5,710 -> 41,726 children over one run of a custom level's slice, the restore 24 -> 72 us.
         if (o) {
             auto*& attached = *reinterpret_cast<cocos2d::CCNode**>(
-                reinterpret_cast<char*>(o) + 0x2f0);
+                reinterpret_cast<char*>(o) + gdoff::kObjGlowSprite);
             if (attached) {
                 attached->removeFromParentAndCleanup(true);
                 attached->release();
@@ -86,6 +104,9 @@ static void clearCheckpointsUnsectioned(PlayLayer* pl) {
 // which is a completely different hypothesis (something held until the frame ends,
 // not something transient). No third guess: the struct has names.
 static void procMemMB(size_t& cur, size_t& peak) {
+#ifndef GEODE_IS_WINDOWS
+    cur = peak = 0;   // Windows only; 0 = not measured
+#else
     using Fn = int(__stdcall*)(HANDLE, PROCESS_MEMORY_COUNTERS*, DWORD);
     static Fn fn = (Fn)GetProcAddress(GetModuleHandleA("kernel32.dll"),
                                       "K32GetProcessMemoryInfo");
@@ -96,6 +117,7 @@ static void procMemMB(size_t& cur, size_t& peak) {
         cur = pmc.WorkingSetSize / (1024 * 1024);
         peak = pmc.PeakWorkingSetSize / (1024 * 1024);
     }
+#endif
 }
 
 // NOT counting the autorelease pool directly: CCPoolManager::getCurReleasePool is
@@ -159,7 +181,9 @@ static void sectionCensus(GJBaseGameLayer* layer, size_t& live, size_t& phys) {
         if (!beg || !end || end < beg) return 0;
         return (size_t)(end - beg) / elem;
     };
-    const size_t fam[2][2] = {{0x35b0, 0x3658}, {0x35c8, 0x3670}};
+    const size_t fam[2][2] = {
+        {gdoff::kLayerNonEffectObjects, gdoff::kLayerNonEffectObjectsSizes},
+        {gdoff::kLayerCollisionBlockSections, gdoff::kLayerCollisionBlockSectionSizes}};
     for (const auto& f : fam) {
         const uint8_t* secV = b + f[0];
         const uint8_t* cntV = b + f[1];
@@ -547,7 +571,7 @@ class $modify(GJBaseGameLayer) {
                              found->hasBeenActivatedByPlayer(player) ? 1 : 0,
                              (int)found->m_isGroupDisabled,
                              (int)found->m_isGroupDisabledTemp,
-                             (int)*((unsigned char*)found + 0x740));
+                             (int)*((unsigned char*)found + gdoff::kRingClaimTouch));
                 }
                 char b[448];
                 snprintf(b, sizeof(b),
@@ -599,6 +623,9 @@ class $modify(GJBaseGameLayer) {
         }
         hookdepth::Guard hg(hookdepth::BGL_UPDATE);
         stallwatch::Mark sm(stallwatch::UPDATE);
+        if (secsolve::inFlight() && secsolve::g_sliceEnded)
+            secsolve::g_outsideMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - secsolve::g_sliceEnd).count();
         ++g_frame;
         // The discriminating experiment for hole 2's two-tick gap.
         // resetLevel sets m_resumeTimer unconditionally, and the question is
@@ -759,6 +786,16 @@ class $modify(GJBaseGameLayer) {
                     const int asked = g_cfg.snapAt[g_nextSnap];
                     while (g_nextSnap < g_cfg.snapAt.size()
                            && g_cfg.snapAt[g_nextSnap] <= g_tick) ++g_nextSnap;
+                    // Taken before the checkpoint, as the section search takes its head's.
+                    std::vector<uint8_t> snapPlayer;
+                    SnapExtra extra;
+                    if (g_cfg.snapPlayer && m_player1) {
+                        psnap::captureRaw(m_player1, this, snapPlayer);
+                        secCaptureDash(extra.dash);
+                        if (m_player2) secCaptureDash(extra.dash2, m_player2);
+                        psnap::captureTouch(m_player1, extra.touch, this);
+                        extra.damageVerified = pl->m_damageVerified;
+                    }
                     if (auto* cp = pl->markCheckpoint()) {
                         cp->retain();
                         int snapHeld = 0;
@@ -769,7 +806,8 @@ class $modify(GJBaseGameLayer) {
                         }
                         g_snaps.push_back({(long long)g_tick, cp,
                                            g_nextInput, g_nextToggle,
-                                           snapHeld, {}});
+                                           snapHeld, {}, std::move(snapPlayer)});
+                        g_snapExtras.push_back(std::move(extra));
                         char sb[192];
                         snprintf(sb, sizeof(sb),
                                  "snap: asked=%d at=%lld x=%.3f y=%.3f "
@@ -791,6 +829,15 @@ class $modify(GJBaseGameLayer) {
                     // came back with the run's own -4.026 every time).
                     if (g_cfg.vyTestOn && m_player1)
                         m_player1->m_yVelocity = g_cfg.vyTest;
+                    // The player as the plain flight brought it here, for the section search's
+                    // head (secsolve::g_cpPlayer): the checkpoint does not carry all of it.
+                    if (m_player1) psnap::captureRaw(m_player1, this, secsolve::g_headPlain);
+                    // ...and each body's m_jumpBuffered, which a held restore raises (secjbkeep)
+                    secsolve::g_headJb[0] = m_player1 ? (int8_t)(m_player1->m_jumpBuffered ? 1 : 0)
+                                                      : (int8_t)-1;
+                    secsolve::g_headJb[1] = (m_player2 && m_player2 != m_player1)
+                                                ? (int8_t)(m_player2->m_jumpBuffered ? 1 : 0)
+                                                : (int8_t)-1;
                     g_ckpt = markCheckpointAtPhys(pl);
                     if (g_ckpt) {
                         g_ckpt->retain();
@@ -824,6 +871,11 @@ class $modify(GJBaseGameLayer) {
                         if (g_cfg.oobTest && m_player1)
                             reinterpret_cast<char*>(m_player1)[kOobLatchOff] = 1;
                         secCaptureDash(secsolve::g_ckptDash);
+                        // ...and player 2's, for a section search's head (cfg secheaddash)
+                        if (m_player2 && m_player2 != m_player1)
+                            secCaptureDash(secsolve::g_ckptDash2, m_player2);
+                        else
+                            secsolve::g_ckptDash2 = secsolve::DashState{};
                         // Where the plan's input stream had got to. A restore
                         // rewinds the game to this tick but g_nextInput is a
                         // forward-only cursor, so without putting it back the
@@ -1098,10 +1150,51 @@ class $modify(GJBaseGameLayer) {
                         // change is accepted against is that the held=1 column
                         // goes to about zero and the held=0 column does not move.
                         pl->m_queuedButtons.clear();
-                        if (s.held) {
+                        // ...and the player as the pass had it (cfg snapplayer). The checkpoint
+                        // does not carry all of it: loadFromCheckpoint copies its fields back and
+                        // then calls the mode setters, which overwrite some of them again
+                        // (m_accelerationOrSpeed goes to 1.5 for a robot, which reads as "the
+                        // hold's boost is over"), and m_touchedPad is left as the run before the
+                        // restore had it. Measured on lv19, snapshots at t=9,200..11,200 verified
+                        // in one pass: 2/6 reproduced the head run without this, 6/6 with it,
+                        // and writing back those two members alone also gave 6/6 where either
+                        // one alone gave 2/6. The held=0 snapshots that failed failed because a
+                        // restored run that had come apart ran before them; one restored on its
+                        // own reproduced.
+                        //
+                        // With it, a held entry is armed the way the section search arms one
+                        // (secArmHold), not pressed again. A press is a new press: it fires a
+                        // ring the player is touching there and then. Measured on lv18 at
+                        // t=2,400, the re-press took a ring the pass held through (vy 5.348 ->
+                        // 8.05); writing the player back over that undid the jump but not the
+                        // ring's use, the restored run came apart 104 px, and every snapshot
+                        // after it in the pass came apart too, where 51/52 had reproduced.
+                        const bool putPlayer = g_cfg.snapPlayer && m_player1 && !s.player.empty();
+                        if (s.held && putPlayer) {
+                            m_player1->m_holdingButtons[1] = true;
+                            if (m_player2) m_player2->m_holdingButtons[1] = true;
+                        } else if (s.held) {
                             g_injecting = true;
                             this->handleButton(true, 1, true);
                             g_injecting = false;
+                        }
+                        if (putPlayer) psnap::restore(m_player1, this, s.player.data());
+                        // ...and what the byte copy cannot carry: the containers and object
+                        // pointers (the restore leaves the slope map's count and m_currentSlope
+                        // different from the pass's), carried as the section search carries them,
+                        // and GD's anti-cheat check (see SnapExtra). The check is the one the gate
+                        // measured: on lv16 at t=6,400 and 10,800 the pass left a ramp at its top
+                        // with the ramp's speed (vy 9.208, 3.683) and the restored run stayed on it
+                        // (vy -0.215) -- postCollision, which launches it, was skipped while the
+                        // spike was being hit. The containers and pointers alone did not change
+                        // that, and no snapshot of the gate needed them.
+                        const size_t si = (size_t)(&s - g_snaps.data());
+                        if (putPlayer && si < g_snapExtras.size()) {
+                            const SnapExtra& e = g_snapExtras[si];
+                            secRestoreDash(e.dash);
+                            if (m_player2) secRestoreDash(e.dash2, m_player2);
+                            psnap::restoreTouch(m_player1, e.touch, this);
+                            pl->m_damageVerified = e.damageVerified;
                         }
                         g_nextInput = s.nextInput;
                         g_nextToggle = s.nextToggle;
@@ -1228,7 +1321,14 @@ class $modify(GJBaseGameLayer) {
         // Pause/step for manual experiments (F2/F3/F4). Keys and the overlay are handled
         // here first so they work outside a session too (if a later return stopped the
         // keys from being picked up, the pause could never be released)
-        updateOverlays(this);
+        {
+            const bool searching = secsolve::inFlight();
+            const auto ot0 = std::chrono::steady_clock::now();
+            updateOverlays(this);
+            if (searching)
+                secsolve::g_overlayMs += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - ot0).count();
+        }
         audio::sync();
         notify::watchdog();   // un-freeze and hide a notification a purge left pinned
         notify::selfTest();   // cfg `notifytest=1` only
@@ -1248,6 +1348,27 @@ class $modify(GJBaseGameLayer) {
         }
         if (!secsolve::inFlight())
             dpsolve::poll();   // installs the in-process solver's plan at a frame boundary
+        // cfg cpflight: the plan poll just installed -- or the probe it queued -- starts from a
+        // checkpoint here, at the same boundary; and a clear from a checkpoint is flown again from
+        // the head (mod/cp_flight.hpp).
+        if (static_cast<GJBaseGameLayer*>(PlayLayer::get()) == this && !secsolve::inFlight()) {
+            if (cpflight::g_pending.rec) cpStart(PlayLayer::get());
+            if (cpflight::g_headPending) {
+                cpflight::g_headPending = false;
+                if (auto* pl = PlayLayer::get()) pl->resetLevel();
+            }
+            if (cpflight::g_controlPending) {   // the probe's control: the same plan from the head
+                cpflight::g_controlPending = false;
+                if (auto* pl = PlayLayer::get()) {
+                    cpflight::g_probeCap.controlCarry = cpflight::sigDiff(
+                        cpflight::g_probeCap.sourceSig, cpflight::carrySig(pl));
+                    cpflight::g_controlStarting = true;
+                    pl->resetLevel();
+                    cpflight::g_controlStarting = false;
+                    g_paused = false;   // held since the probe's end, as the probe's own start is
+                }
+            }
+        }
         pollProbeHotkeys();
         handleProbeRequest(this);
         // ---- one slice of the section search, then the frame goes back to the game ----
@@ -1266,10 +1387,18 @@ class $modify(GJBaseGameLayer) {
                 secsolve::g_noKill = false;
             } else {
                 secsolve::g_sliceStart = std::chrono::steady_clock::now();
+                if (secsolve::g_sliceEnded) {
+                    secsolve::g_frameGapMs += std::chrono::duration<double, std::milli>(
+                        secsolve::g_sliceStart - secsolve::g_sliceEnd).count();
+                    ++secsolve::g_frames;
+                }
                 secsolve::g_task.resume();
+                secsolve::g_sliceEnd = std::chrono::steady_clock::now();
+                secsolve::g_sliceEnded = true;
                 if (secsolve::g_task.done()) {
                     secsolve::g_task.destroy();
                     secsolve::g_taskLayer = nullptr;
+                    secsolve::g_sliceEnded = false;
                 }
                 return;
             }
@@ -1577,6 +1706,7 @@ class $modify(GJBaseGameLayer) {
                 { stallwatch::Mark gm(stallwatch::GD_UPDATE);
                   GJBaseGameLayer::update(g_cfg.fastdt); }
                 ++g_lastBatchCalls;
+                cpAfterUpdate();   // cfg cpflight: between two update calls, where a restore lands
             }
         } else {
             // F8 spectating speed (1x/2x/4x). Rather than increasing dt, call several times
@@ -1647,6 +1777,7 @@ class $modify(GJBaseGameLayer) {
                 if (i > 0 && g_sessionOver) break;
                 stallwatch::Mark gm(stallwatch::GD_UPDATE);
                 GJBaseGameLayer::update(stepDt);   // pinned while seeking; see above
+                cpAfterUpdate();
             }
         }
         // Post-session heartbeat. "Freezes after replay" cannot be told from a hang, so
@@ -1732,11 +1863,16 @@ class $modify(GJBaseGameLayer) {
     }
 
     void safeVisit() {
+#ifdef GEODE_IS_WINDOWS
         __try {
             GJBaseGameLayer::visit();
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             logVisitCrashSwallowed();
         }
+#else
+        // No SEH on Android: the draw runs unguarded, and a fault in it ends the game.
+        GJBaseGameLayer::visit();
+#endif
     }
 
     // ---- Section-limited GD solver (read the design notes in src/solver/secsolve.hpp) ----
@@ -1769,8 +1905,8 @@ class $modify(GJBaseGameLayer) {
     // is dropped. Setting the gate
     // ahead of time does not help either -- loadFromCheckpoint overwrites the
     // field from the UI before it reads it. So it is written back here.
-    void secCaptureDash(secsolve::DashState& d) {
-        auto* p = m_player1;
+    void secCaptureDash(secsolve::DashState& d, PlayerObject* who = nullptr) {
+        auto* p = who ? who : m_player1;
         if (!p) { d = secsolve::DashState{}; return; }
         d.on = p->m_isDashing;
         d.ring = reinterpret_cast<GameObject*>(p->m_dashRing);
@@ -1789,9 +1925,10 @@ class $modify(GJBaseGameLayer) {
         d.potentialSlope = p->m_currentPotentialSlope;
         d.snappedTo = p->m_objectSnappedTo;
         d.lastPortal = p->m_lastActivatedPortal;
+        d.jumpBuf = (int8_t)(p->m_jumpBuffered ? 1 : 0);
     }
-    void secRestoreDash(const secsolve::DashState& d) {
-        auto* p = m_player1;
+    void secRestoreDash(const secsolve::DashState& d, PlayerObject* who = nullptr) {
+        auto* p = who ? who : m_player1;
         if (!p) return;
         p->m_isDashing = d.on;
         p->m_dashRing = reinterpret_cast<DashRingObject*>(d.ring);
@@ -1810,6 +1947,48 @@ class $modify(GJBaseGameLayer) {
         p->m_currentPotentialSlope = d.potentialSlope;
         p->m_objectSnappedTo = d.snappedTo;
         p->m_lastActivatedPortal = d.lastPortal;
+    }
+    // cfg secjbkeep: the point's own m_jumpBuffered, written after secArmHold has raised it (see
+    // secsolve::g_jbKeep). Only the section search's own restores call this.
+    void secRestoreJb(const secsolve::DashState& d, PlayerObject* who = nullptr) {
+        auto* p = who ? who : m_player1;
+        if (!secsolve::g_jbKeep || !p || d.jumpBuf < 0) return;
+        p->m_jumpBuffered = d.jumpBuf != 0;
+    }
+
+    // Player 2's share of the per-node extras (cfg secp2extras, secsolve::g_dash2 and the rest):
+    // taken wherever player 1's are and written back wherever theirs are. Outside a dual section
+    // GD does not move p2, so what is put back is what is already there.
+    PlayerObject* secP2() {
+        return (secsolve::g_p2Extras && m_player2 && m_player2 != m_player1) ? m_player2 : nullptr;
+    }
+    // Player 2 while a dual section has it (secsolve::g_p2Key), else null.
+    PlayerObject* secDualP2() {
+        return (m_gameState.m_isDualMode && m_player2 && m_player2 != m_player1) ? m_player2
+                                                                                 : nullptr;
+    }
+    float secDualY2() {
+        auto* q = secDualP2();
+        return q ? (float)psnap::physPosition(q, this).y : 0.f;
+    }
+    void secPushP2() {
+        auto* q = secP2();
+        secsolve::g_dash2.emplace_back();
+        if (q) secCaptureDash(secsolve::g_dash2.back(), q);
+        secsolve::g_vy2.push_back(q ? q->m_yVelocity : 0.0);
+        secsolve::g_accel2.push_back(q ? q->m_accelerationOrSpeed : 0.0);
+        secsolve::g_pad2.push_back(q && q->m_touchedPad ? 1 : 0);
+    }
+    // `vyToo`: the checkpoint path, whose restore puts the velocity on the 0.001 grid (psnap
+    // carries it).
+    void secRestoreP2(size_t ni, bool vyToo) {
+        auto* q = secP2();
+        if (!q || ni >= secsolve::g_vy2.size()) return;
+        secRestoreDash(secsolve::g_dash2[ni], q);
+        secRestoreJb(secsolve::g_dash2[ni], q);
+        if (vyToo) q->m_yVelocity = secsolve::g_vy2[ni];
+        q->m_accelerationOrSpeed = secsolve::g_accel2[ni];
+        q->m_touchedPad = secsolve::g_pad2[ni] != 0;
     }
 
     // m_holdingButtons alone is not enough to restore a held button.
@@ -1898,6 +2077,24 @@ class $modify(GJBaseGameLayer) {
         g_injecting = false;
         secsolve::g_held = 0;
         if (heldAfter) secArmHold();
+        // cfg secheaddash: back at the head, each body's dash as the plain flight had it (the
+        // load never carries one); the head's DashState is then taken from this
+        if (secsolve::g_headDash && cp == g_ckpt) {
+            secRestoreDash(secsolve::g_ckptDash);
+            if (auto* q = secP2()) secRestoreDash(secsolve::g_ckptDash2, q);
+        }
+        // cfg secjbkeep: back at the head, each body's m_jumpBuffered as the plain flight had it
+        if (secsolve::g_jbKeep && cp == g_ckpt) {
+            if (m_player1 && secsolve::g_headJb[0] >= 0)
+                m_player1->m_jumpBuffered = secsolve::g_headJb[0] != 0;
+            if (m_player2 && m_player2 != m_player1 && secsolve::g_headJb[1] >= 0)
+                m_player2->m_jumpBuffered = secsolve::g_headJb[1] != 0;
+        }
+        // cfg secforcesize: back at the head, at the size asked for. (Where the search then puts
+        // the plain flight's player over the load, it forces the size again after it.)
+        if (secsolve::g_forceP1Size >= 0 && cp == g_ckpt && m_player1
+            && (m_player1->m_vehicleSize < 0.9f) != (secsolve::g_forceP1Size == 1))
+            m_player1->togglePlayerScale(secsolve::g_forceP1Size == 1, true);
     }
 
     // Advance 1 tick. The input is held by secsolve::g_feed (applied on the
@@ -1911,6 +2108,29 @@ class $modify(GJBaseGameLayer) {
     void secStep(int down, float) {
         secsolve::g_feed = down;
         GJBaseGameLayer::update((float)secsolve::g_dt);
+    }
+
+    // An end the frame raised between a search's slices. checkForEnd (0x3b4cf0) latches the
+    // attempt's end at layer+0x3878 and starts the end animation (0x3aba00, its only caller), which
+    // raises m_levelEndAnimationStarted (+0x3570) and schedules levelComplete as its last action,
+    // frames later. GD asks checkForEnd once a frame, not once a physics step, so a search step
+    // never does -- the frame between two slices did, on whatever the search had left in the
+    // player, and its completion was taken for the session's clear. Measured on a custom level:
+    // the plan filed was the one the search had started from, which died short of the end, and
+    // the slice's flight on the level itself was skipped. (Judging a branch that reaches the end
+    // inside the search was tried, by asking checkForEnd after every step, and never fired where
+    // the frame did; what the frame's end test reads that the step does not is not known yet.)
+    //
+    // So before every search step both bytes go back down -- GD skips processCommands while
+    // +0x3570 is up, which would freeze every branch after it. The completion the animation
+    // raises later then arrives with the byte down, or during the search, and is refused (the
+    // levelComplete hook).
+    void secStepBegin(PlayLayer* pl) {
+        static_assert(offsetof(PlayLayer, m_levelEndAnimationStarted) == 0x3570,
+                      "the byte 0x3aba00 raises and pauseGame tests first");
+        if (!pl || !pl->m_levelEndAnimationStarted) return;
+        pl->m_levelEndAnimationStarted = false;
+        *(reinterpret_cast<uint8_t*>(pl) + 0x3878) = 0;   // checkForEnd's latch (2.2081)
     }
 
     // A checkpoint taken where the physics stands. After a secStep during a mirror transition the
@@ -1935,6 +2155,274 @@ class $modify(GJBaseGameLayer) {
         for (int i = 0; i < 2; ++i)
             if (moved[i]) ps[i]->setPosition(drawn[i]);
         return cp;
+    }
+
+    // ---- cfg cpflight: loop flights from a checkpoint (mod/cp_flight.hpp) ----
+
+    // The game events our own checkpoints raise, dropped (see cpflight::g_inTake).
+    void gameEventTriggered(GJGameEvent event, int material, int playerID) {
+        if ((cpflight::g_inTake && event == GJGameEvent::Checkpoint)
+            || (cpflight::g_starting && event == GJGameEvent::CheckpointRespawn)) {
+            ++cpflight::g_eventsDropped;
+            return;
+        }
+        GJBaseGameLayer::gameEventTriggered(event, material, playerID);
+    }
+
+    // After every update call: a checkpoint when one is due, and the end of a probe that has outlived
+    // the flight it repeats.
+    void cpAfterUpdate() {
+        // cfg cpflightlayerdiff: the layer's and player 1's bytes after the calls that follow a
+        // checkpoint, recorded by the flight that took it and compared by a flight restored from it
+        if (g_cfg.cpFlightLayerDiff && m_player1 && cpflight::g_diffStep < cpflight::kDiffSteps) {
+            auto* pl = PlayLayer::get();
+            const auto* lb = reinterpret_cast<const uint8_t*>(pl);
+            const auto* pb = reinterpret_cast<const uint8_t*>(m_player1);
+            if (pl && cpflight::g_diffCollect) {
+                auto& r = *cpflight::g_diffCollect;
+                r.afterLayer.emplace_back(lb, lb + sizeof(PlayLayer));
+                r.afterPlayer.emplace_back(pb, pb + sizeof(PlayerObject));
+                r.afterTick.push_back(g_tick);
+                r.afterTweens.push_back(cpflight::tweensLine(this));
+                if (++cpflight::g_diffStep >= cpflight::kDiffSteps) cpflight::g_diffCollect.reset();
+            } else if (pl && cpflight::g_diffCompare) {
+                auto& r = *cpflight::g_diffCompare;
+                const size_t k = (size_t)cpflight::g_diffStep;
+                if (k < r.afterLayer.size() && r.afterTick[k] == g_tick) {
+                    cpflight::layerDiff(r.afterLayer[k], pl, g_tick);
+                    std::vector<uint8_t> tmp = r.afterPlayer[k];
+                    writeResult("cpflight: playerdiff follows (offsets from player 1)");
+                    cpflight::layerDiff(tmp, m_player1, g_tick);
+                    const std::string tw = cpflight::tweensLine(this);
+                    if (k < r.afterTweens.size() && tw != r.afterTweens[k])
+                        writeResult("cpflight: tweens t=" + std::to_string(g_tick) + " flight:" + r.afterTweens[k]
+                                    + " | restored:" + tw);
+                    else
+                        writeResult("cpflight: tweens t=" + std::to_string(g_tick) + " same:" + tw);
+                }
+                if (++cpflight::g_diffStep >= cpflight::kDiffSteps) cpflight::g_diffCompare.reset();
+            }
+        }
+        if (cpflight::g_objAfter > 0) {
+            --cpflight::g_objAfter;
+            cpflight::objLine(this, "after-update", g_tick);
+        }
+        if (cpflight::g_next >= 0 && g_tick >= cpflight::g_next)
+            if (auto* pl = PlayLayer::get(); pl && static_cast<GJBaseGameLayer*>(pl) == this) cpTake(pl);
+        cpflight::nodeWatch(this, g_tick, nullptr);
+        // the probe's control at the boundary where the probe's checkpoint was taken: its carry state,
+        // for the comparison with the probe's right after the restore (cpflight::compareCarryFull)
+        if (cpflight::g_controlFlying && !cpflight::g_controlAtT.have && cpflight::g_probeCap.from >= 0
+            && g_tick >= cpflight::g_probeCap.from)
+            if (auto* pl = PlayLayer::get(); pl && static_cast<GJBaseGameLayer*>(pl) == this)
+                cpflight::g_controlAtT = cpflight::captureCarryFull(pl, g_tick);
+        if (cpflight::g_probeFlying && cpflight::g_probeSet
+            && g_tick > cpflight::g_probeSet->end + cpflight::kProbeOverrun) {
+            writeResult(cpflight::probeCapture(g_tick, m_player1 ? m_player1->getPositionX() : -1.f,
+                                               "outlived its source"));
+            g_paused = true;
+        } else if (cpflight::g_controlFlying && g_tick > cpflight::g_probeCap.end + cpflight::kProbeOverrun) {
+            writeResult(cpflight::controlEnd(g_tick, m_player1 ? m_player1->getPositionX() : -1.f,
+                                             "outlived the probe"));
+            g_paused = true;
+        }
+    }
+
+    // A checkpoint of the loop's flight at the tick just run, with what it does not carry, as the
+    // entry-snapshot gate takes one (snapat), and taken out of GD's list at once so that no reset of
+    // GD's own can load it. Between two update calls, which is where a restore also lands: the frame
+    // boundaries of the flight do not move.
+    void cpTake(PlayLayer* pl) {
+        const long long S = g_cfg.cpFlight;
+        const long long T = g_tick;
+        if (!m_player1 || !cpflight::g_live || cpflight::g_live->attempt != g_attempt || S <= 0) {
+            cpflight::g_next = -1;
+            return;
+        }
+        if (pl->m_playerDied || m_player1->m_isDead) return;
+        // A tick without an anchor row cannot be checked after a restore: the next slot instead.
+        if (T < 1 || (size_t)T >= anchors::g_live.size() || !anchors::g_live[(size_t)T].valid) {
+            cpflight::g_next = (T / S + 1) * S;
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = std::make_shared<cpflight::Rec>();
+        r->tick = T;
+        psnap::captureRaw(m_player1, this, r->player);
+        secCaptureDash(r->dash);
+        if (m_player2) secCaptureDash(r->dash2, m_player2);
+        psnap::captureTouch(m_player1, r->touch, this);
+        r->damageVerified = pl->m_damageVerified;
+        {
+            auto hb = m_player1->m_holdingButtons.find(1);
+            r->held = (hb != m_player1->m_holdingButtons.end() && hb->second) ? 1 : 0;
+        }
+        r->oobLatch = (int)(unsigned char)reinterpret_cast<const char*>(m_player1)[kOobLatchOff];
+        r->nextInput = g_nextInput;
+        r->nextToggle = g_nextToggle;
+        {
+            auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
+            r->seedTrig = *reinterpret_cast<long long*>(base + gdoff::kSeedTriggerRva);
+            r->seedVarIndex = *reinterpret_cast<long long*>(base + gdoff::kSeedVarIndexRva);
+            r->seedVarTable = *reinterpret_cast<long long*>(base + gdoff::kSeedVarTableRva);
+            r->seedKept = *reinterpret_cast<long long*>(reinterpret_cast<char*>(this)
+                                                        + gdoff::kLayerRandomSeed);
+        }
+        cpflight::captureCamera(this, r->camera);
+        cpflight::captureArea(this, r->area);
+        if (g_cfg.cpFlightLayerDiff)
+            r->layerBytes.assign(reinterpret_cast<const uint8_t*>(pl),
+                                 reinterpret_cast<const uint8_t*>(pl) + sizeof(PlayLayer));
+        cpflight::objLine(this, "take", T);
+        if (g_cfg.cpFlightObj >= 0) cpflight::g_objAfter = 3;
+        cpflight::captureBooks(*r);
+        cpflight::g_inTake = true;
+        CheckpointObject* cp = markCheckpointAtPhys(pl);
+        cpflight::g_inTake = false;
+        if (!cp) {
+            writeResult("cpflight: markCheckpoint returned 0 at t=" + std::to_string(T)
+                        + " - no more checkpoints this attempt");
+            cpflight::g_next = -1;
+            return;
+        }
+        cp->retain();
+        r->cp = cp;
+        r->layer = pl;
+        r->objects = pl->m_objects ? (size_t)pl->m_objects->count() : 0;
+        clearCheckpointsUnsectioned(pl);
+        if (g_cfg.cpFlightLayerDiff) {
+            cpflight::g_diffCollect = r;
+            cpflight::g_diffCompare.reset();
+            cpflight::g_diffStep = 0;
+        }
+        cpflight::add(std::move(r));
+        cpflight::g_takeMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // Start the installed plan -- or the probe -- from the checkpoint poll chose. The restore is the
+    // entry-snapshot gate's, which reproduced the head run on 313/313 snapshots: the checkpoint, the
+    // player's bytes and containers, a hold armed rather than pressed again (a press fires the ring
+    // the player touches there), GD's anti-cheat check. On top of it what a restore of the loop
+    // needs: the out-of-bounds latch, GD's random seeds as the flight had them (rngfix has just set
+    // them to the start-of-level values), and the cursors and tick. The books are the reset hook's
+    // (cpflight::splice). A restore that does not land on the row the attempt recorded there is not
+    // flown: the plan goes from the head.
+    void cpStart(PlayLayer* pl) {
+        cpflight::Choice c = std::move(cpflight::g_pending);
+        cpflight::g_pending = cpflight::Choice{};
+        if (!pl) return;
+        if (!c.rec || !c.set || !m_player1) {
+            if (!c.probe) pl->resetLevel();
+            return;
+        }
+        const cpflight::Rec& r = *c.rec;
+        if (c.probe && cpflight::firstDifference(c.set->plan, g_cfg.inputs) != LLONG_MAX) {
+            writeResult("cpflight: probe dropped - the installed plan is not the one that died");
+            return;
+        }
+        // The carry once more, at the reset itself (it was judged at the install or the queueing).
+        if (const int d = cpflight::sigDiff(c.set->startSig, cpflight::carrySig(this)); d != 0) {
+            if (c.probe) {
+                ++cpflight::g_probeSkips;
+                return;
+            }
+            cpflight::countCarryMiss(d);
+            pl->resetLevel();
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        clearCheckpointsUnsectioned(pl);
+        pl->storeCheckpoint(r.cp);
+        cpflight::g_starting = &c;
+        g_restorePending = true;
+        pl->resetLevel();
+        g_restorePending = false;
+        cpflight::g_starting = nullptr;
+        clearCheckpointsUnsectioned(pl);
+        pl->m_queuedButtons.clear();
+        if (r.held) {
+            m_player1->m_holdingButtons[1] = true;
+            if (m_player2) m_player2->m_holdingButtons[1] = true;
+        }
+        psnap::restore(m_player1, this, r.player.data());
+        secRestoreDash(r.dash);
+        if (m_player2) secRestoreDash(r.dash2, m_player2);
+        psnap::restoreTouch(m_player1, r.touch, this);
+        // ...and the two object pointers restoreTouch leaves to cfg secsnapobj: the object the
+        // player is snapped to and the one it collided with. A restore of the loop is on the same
+        // layer, whose objects are never re-created, so they are carried. Measured on lv22 at t=600
+        // without them: the rows after the restore took a different m_snapDistance from t=602.
+        m_player1->m_objectSnappedTo = r.touch.objectSnappedTo;
+        m_player1->m_collidedObject = r.touch.collidedObject;
+        if (m_player2 && r.touch.second) {
+            m_player2->m_objectSnappedTo = r.touch.second->objectSnappedTo;
+            m_player2->m_collidedObject = r.touch.second->collidedObject;
+        }
+        pl->m_damageVerified = r.damageVerified;
+        reinterpret_cast<char*>(m_player1)[kOobLatchOff] = (char)r.oobLatch;
+        {
+            auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
+            *reinterpret_cast<long long*>(base + gdoff::kSeedTriggerRva) = r.seedTrig;
+            *reinterpret_cast<long long*>(base + gdoff::kSeedVarIndexRva) = r.seedVarIndex;
+            *reinterpret_cast<long long*>(base + gdoff::kSeedVarTableRva) = r.seedVarTable;
+            *reinterpret_cast<long long*>(reinterpret_cast<char*>(this) + gdoff::kLayerRandomSeed) =
+                r.seedKept;
+        }
+        cpflight::restoreCamera(this, r.camera);
+        cpflight::objLine(this, "reset", r.tick);
+        cpflight::restoreArea(this, r.area);
+        cpflight::objLine(this, "restored", r.tick);
+        cpflight::nodeWatch(this, r.tick, "restored");
+        if (g_cfg.cpFlightObj >= 0) cpflight::g_objAfter = 3;
+        g_nextInput = r.nextInput;
+        g_nextToggle = r.nextToggle;
+        g_tick = r.tick;
+        if (g_cfg.cpFlightLayerDiff) cpflight::layerDiff(r.layerBytes, pl, r.tick);
+        // The state of row T+1 (see cp_flight.hpp): the position the attempt that took the checkpoint
+        // recorded at the head of the next substep, which nothing between the two moves.
+        const AnchorRow& row = c.set->rows[(size_t)r.tick + 1];
+        const auto pos = m_player1->getPosition();
+        const float vy = (float)m_player1->m_yVelocity;
+        char b[320];
+        if (pos.x != row.x || pos.y != row.y) {
+            snprintf(b, sizeof(b), "cpflight: the restore at t=%lld came back at x=%.4f y=%.4f vy=%.4f, "
+                     "not row t+1's x=%.4f y=%.4f vy=%.4f - %s", r.tick, (double)pos.x, (double)pos.y,
+                     (double)vy, (double)row.x, (double)row.y, (double)row.vy,
+                     c.probe ? "no probe" : "flying the plan from the head");
+            writeResult(b);
+            ++cpflight::g_refused;
+            if (!c.probe) {
+                cpflight::g_forceHead = true;
+                pl->resetLevel();
+            } else {
+                g_paused = true;
+            }
+            return;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        cpflight::g_startMs += ms;
+        if (g_cfg.cpFlightLayerDiff) {
+            cpflight::g_diffCompare = c.rec;
+            cpflight::g_diffCollect.reset();
+            cpflight::g_diffStep = 0;
+        }
+        if (c.probe) {
+            cpflight::g_probeFlying = true;
+            cpflight::g_ended = false;   // counted as a probe flight
+            cpflight::g_probeSet = c.set;
+            cpflight::g_probeRec = c.rec;
+            cpflight::g_probeAtT = cpflight::captureCarryFull(pl, r.tick);   // for the control's comparison
+        } else {
+            ++cpflight::g_starts;
+            cpflight::g_ticksSkipped += r.tick;
+        }
+        snprintf(b, sizeof(b), "cpflight: %s attempt %d from the checkpoint at t=%lld x=%.1f (taken by "
+                 "attempt %d%s), restored in %.1f ms", c.probe ? "probe" : "flight", g_attempt, r.tick,
+                 (double)row.x, c.set->attempt,
+                 c.probe ? (", which died at t=" + std::to_string(c.set->end)).c_str() : "", ms);
+        writeResult(b);
     }
 
     // Measure whether a player-only restore can replace a full checkpoint restore
@@ -2715,6 +3203,8 @@ class $modify(GJBaseGameLayer) {
         g_snapOn = false;
         g_worldOn = false;
         g_movSet.clear();
+        // cfg secsnapem / secsnapemfrom: whether this search's snapshots carry the effect manager
+        psnap::g_snapEMActive = psnap::g_snapEM && (long long)g_ckptTick >= psnap::g_snapEMFrom;
         if (g_snapMode == 1) {
             g_snapOn = (psnap::scalarCount() > 0);
         } else if (g_snapMode == 3) {
@@ -2812,6 +3302,15 @@ class $modify(GJBaseGameLayer) {
                                             : "psnap (3KB/1.4us)"));
             writeResult(qb);
         }
+        // cfg seccpfallback=0: a window of the repair loop the snapshot cannot branch in is not
+        // searched on checkpoints either. A checkpoint search costs ~20x a snapshot search per
+        // restore; in the logs of 09-22..09-30 it found a crossing in 5 of 58 (level 22, 406-926 s
+        // each; the others took 0-835 s for nothing), and level 19's in the bundle cold of 09-30
+        // took 1,568 s. The window goes back to the loop as searched and exhausted.
+        const bool cpRefused = !g_snapOn && g_secRung && !g_cfg.secCpFallback;
+        if (cpRefused)
+            writeResult("secsolve: not searched - the snapshot cannot branch in this window and "
+                        "cfg seccpfallback=0 keeps the loop's searches off checkpoints");
         // Out-of-bounds ceiling (see the note on g_maxY). Look only at collidable objects,
         // and only within the x range this section reaches.
         //
@@ -2844,6 +3343,7 @@ class $modify(GJBaseGameLayer) {
         g_died = false;
         g_nodes.clear();
         releaseAnchors();
+        secsolve::g_keepDropped = 0;   // cfg seckeepsize's count, this search
         // The head's `in` is the button as the checkpoint caught it (g_headHeld), not 0. The
         // expansion restores every node with its own `in` -- the head included -- and a head
         // stored as released turned the first held step of every branch into a fresh press.
@@ -2853,11 +3353,18 @@ class $modify(GJBaseGameLayer) {
         // that head and drifted 11.5 px off the plan it was replaying before the 20-layer
         // check put it back. The leaf and check replays already restored the head with
         // g_headHeld; only the expansion disagreed with them.
-        g_nodes.push_back({-1, (uint8_t)(g_headHeld ? 1 : 0), 0, 0.f, 0.f, 0.f, 0});
+        g_nodes.push_back({-1, (uint8_t)(g_headHeld ? 1 : 0), 0, 0.f, 0.f, 0.f, 0,
+                           (uint8_t)(m_player1 && m_player1->m_vehicleSize < 0.9f ? 1 : 0),
+                           (uint8_t)(secDualP2() ? 1 : 0), secDualY2()});
         g_dash.assign(1, secsolve::DashState{});  // section head (input unused)
         g_vy.assign(1, m_player1 ? m_player1->m_yVelocity : 0.0);
         g_accel.assign(1, m_player1 ? m_player1->m_accelerationOrSpeed : 0.0);
         g_pad.assign(1, m_player1 && m_player1->m_touchedPad ? 1 : 0);
+        secsolve::g_dash2.clear();
+        secsolve::g_vy2.clear();
+        secsolve::g_accel2.clear();
+        secsolve::g_pad2.clear();
+        secPushP2();                      // its dash is retaken below, as player 1's is
         // The section head IS the spine's first node: the verified solution
         // passed through here, so following its own inputs from this node is
         // the one rollout that must never be pruned (see g_spineOn).
@@ -2896,6 +3403,7 @@ class $modify(GJBaseGameLayer) {
         secRestoreFrom(pl, g_ckpt, g_headHeld);
         for (int f = 0; f < freeze; ++f) secStep(g_headHeld, dt);
         secCaptureDash(g_dash[0]);
+        if (auto* q = secP2()) secCaptureDash(secsolve::g_dash2[0], q);
         // Baseline for the counter delta (Node::cnt). Taken once in the section-head world.
         secsolve::g_cntBase = secsolve::countSum(this);
 
@@ -2903,9 +3411,28 @@ class $modify(GJBaseGameLayer) {
         // Node state on the psnap path. Unlike checkpoints it is 3KB, so holding the whole
         // frontier is light.
         std::vector<std::vector<uint8_t>> snaps;
+        // A cross-check anchor's snapshot, kept past the node's release for the next cross-check,
+        // whose replay starts at the anchor's checkpoint (secsolve::g_cpPlayer). Same keys as
+        // g_anchors.
+        std::unordered_map<int, std::vector<uint8_t>> anchorSnaps;
+        // cfg seccpcheck (print only): at each of the search's checkpoint loads, the members a load
+        // was measured to leave behind, as the point had them / right after the load / after the
+        // write-back (psnap::cpCheckLine). The first 8 of each site per search.
+        int cpChecks[5] = {0, 0, 0, 0, 0};
+        std::vector<uint8_t> cpLoad, cpAfter;
+        auto cpTakeLoad = [&]() {
+            if (psnap::g_cpCheck) psnap::captureRaw(m_player1, this, cpLoad);
+        };
+        auto cpReport = [&](int site, const char* name, long long at,
+                            const std::vector<uint8_t>& origin) {
+            if (!psnap::g_cpCheck || origin.empty() || cpLoad.empty() || cpChecks[site] >= 8) return;
+            ++cpChecks[site];
+            psnap::captureRaw(m_player1, this, cpAfter);
+            writeResult(psnap::cpCheckLine(name, at, origin, cpLoad, cpAfter, secsolve::g_cpPlayer));
+        };
         // The effect manager's queue (what CheckpointObject saves). Carried by C++
         // assignment, not bytes. Same index as snaps.
-        std::vector<gd::vector<PulseEffectAction>> pulses;
+        std::vector<psnap::EMSnap> pulses;   // the effect manager per node (psnap::EMSnap)
         // GJGameState (in-progress moves/rotations, portals, object physics). The main
         // suspect.
         //
@@ -2955,6 +3482,20 @@ class $modify(GJBaseGameLayer) {
         if (keepSnaps) {
             secRestoreFrom(pl, g_ckpt, g_headHeld);
             for (int i = 0; i < freeze; ++i) secStep(g_headHeld, dt);
+            cpTakeLoad();
+            // The head's player is the plain flight's, not what the load left (g_cpPlayer).
+            if (secsolve::g_cpPlayer && !secsolve::g_headPlain.empty())
+                psnap::restore(m_player1, this, secsolve::g_headPlain.data());
+            // cfg secforcesize: after the plain flight's player, which would put the size back --
+            // and before the head's snapshot, which every later return to the head restores.
+            if (secsolve::g_forceP1Size >= 0 && m_player1
+                && (m_player1->m_vehicleSize < 0.9f) != (secsolve::g_forceP1Size == 1)) {
+                m_player1->togglePlayerScale(secsolve::g_forceP1Size == 1, true);
+                writeResult(std::string("secsolve: player 1 forced to ")
+                            + (secsolve::g_forceP1Size == 1 ? "mini" : "normal")
+                            + " size at the head (cfg secforcesize) - a probe, not a route");
+            }
+            cpReport(0, "head", g_ckptTick, secsolve::g_headPlain);
             snaps.resize(1);
             pulses.resize(1);
             states.resize(1);
@@ -2989,6 +3530,12 @@ class $modify(GJBaseGameLayer) {
         // cfg secbound: the level's box, from where every object stands at the section head.
         g_boundSkips = 0;
         g_shaderSkips = 0;
+        if (g_shaderSig) writeResult("shadersig: search start " + shaderSig(this));
+        g_frames = 0;
+        g_frameGapMs = 0.0;
+        g_overlayMs = 0.0;
+        g_outsideMs = 0.0;
+        g_sliceEnded = false;
         if (g_boundOn && this->m_objects) {
             double x0 = 1e18, x1 = -1e18, y0 = 1e18, y1 = -1e18;
             for (unsigned i = 0; i < this->m_objects->count(); ++i) {
@@ -3010,10 +3557,14 @@ class $modify(GJBaseGameLayer) {
             std::map<int, int> items = solver::g_itemCounts;
             bool missFired = solver::g_coinMissFired;
             float prevX = solver::g_prevTickX;
-            ~CoinBook() {
+            bool armed = true;   // cfg secbookfirst: put back before the reset, not at the end
+            void restore() {
                 solver::g_coinPickupTick = pickup; solver::g_coinGdTick = gd;
                 solver::g_coinLiveSaid = said; solver::g_itemCounts = items;
                 solver::g_coinMissFired = missFired; solver::g_prevTickX = prevX;
+            }
+            ~CoinBook() {
+                if (armed) restore();
             }
         } coinBook;
         // Unlike the loop's coinmiss, not off for a whole level with rotated gameplay (all three
@@ -3076,9 +3627,15 @@ class $modify(GJBaseGameLayer) {
                 const bool moveAhead = c < solver::g_coinMoveX.size()
                                        && solver::g_coinMoveX[c] > -1e8f
                                        && hx <= solver::g_coinMoveX[c];
-                const bool passed = coinObj[c] && coinFinal[c] && !moveAhead
-                                    && !m_player1->m_isGoingLeft && !m_player1->m_isSideways
-                                    && hx > coinObj[c]->getObjectRect().getMaxX() + 15.f;
+                bool passed = coinObj[c] && coinFinal[c] && !moveAhead
+                              && !m_player1->m_isGoingLeft && !m_player1->m_isSideways
+                              && hx > coinObj[c]->getObjectRect().getMaxX() + 15.f;
+                // cfg secrungcoinoff: the coin this rung was fired for, passed at the head while
+                // its group is off, is not taken -- GD never credited it, and counting it as done
+                // lets every leaf answer the rung (SubZero 4003, head t=10,596: bits 7 -> 7).
+                if (passed && secsolve::g_rungCoinOff && (int)c == secsolve::g_rungCoin
+                    && coinObj[c]->m_isGroupDisabled)
+                    passed = false;
                 if (!coinObj[c] || taken || passed) head |= 1u << c;
             }
             coinBits[0] = head;
@@ -3121,6 +3678,7 @@ class $modify(GJBaseGameLayer) {
         // Why the search stopped, for the report line: "none" is the ordinary
         // end (exhausted, or a leaf crossed). See g_deadlineSec.
         const char* stopWhy = "none";
+        secsolve::g_nonFinite = 0;   // objects handed to re-bucketing at a non-finite position
         // Results of the leaf cross-check (filled by evalLeaf below). Used in the report.
         g_leafVerified = false;
         g_leafDeadAt = -1;
@@ -3147,7 +3705,7 @@ class $modify(GJBaseGameLayer) {
                 if ((size_t)ni < snaps.size())
                     std::vector<uint8_t>().swap(snaps[(size_t)ni]);
                 if ((size_t)ni < pulses.size()) {
-                    gd::vector<PulseEffectAction> tmp;
+                    psnap::EMSnap tmp;
                     std::swap(pulses[(size_t)ni], tmp);
                 }
                 if ((size_t)ni < states.size() && states[(size_t)ni])
@@ -3178,6 +3736,13 @@ class $modify(GJBaseGameLayer) {
             const int md = p ? modeIdx(p) : -1;
             return md == 1 || md == 3 || md == 4 || md == 7;
         };
+        // cfg secgracedash: a body riding a dash ring's dash is controllable -- the release ends
+        // the dash (see secsolve::g_graceDash). Either body in a dual.
+        auto dashing = [this]() {
+            if (m_player1 && m_player1->m_isDashing) return true;
+            return m_gameState.m_isDualMode && m_player2 && m_player2 != m_player1
+                   && m_player2->m_isDashing;
+        };
 
         // ---- Leaf cross-check (plain replay + exit survivability) -------------------
         // Verify "on the spot" when the goal is reached. Formerly the cross-check ran once
@@ -3186,6 +3751,9 @@ class $modify(GJBaseGameLayer) {
         // searching (there may be other paths).
         // Return 0=SOLVED / 1=UNVERIFIED (not reproduced by replay) / 2=DOOMED (exit is a
         // dead end)
+        // The last leaf check's input and node lists (size, capacity), for the containment's line:
+        // they live inside evalLeaf and are gone by the time an exception reaches the catch.
+        size_t leafSeqN = 0, leafSeqCap = 0, leafPathN = 0, leafPathCap = 0;
         auto evalLeaf = [&](int leaf) -> int {
             g_leafVerified = false;
             g_leafDeadAt = -1;
@@ -3201,11 +3769,18 @@ class $modify(GJBaseGameLayer) {
             }
             std::reverse(seq.begin(), seq.end());
             std::reverse(path.begin(), path.end());
+            leafSeqN = seq.size(); leafSeqCap = seq.capacity();
+            leafPathN = path.size(); leafPathCap = path.capacity();
             secRestoreFrom(pl, g_ckpt, g_headHeld);
             for (int f = 0; f < freeze; ++f) secStep(g_headHeld, dt);
+            cpTakeLoad();
+            if (secsolve::g_cpPlayer && keepSnaps && !snaps.empty() && !snaps[0].empty())
+                psnap::restore(m_player1, this, snaps[0].data());
+            cpReport(1, "leaf", (long long)seq.size(), secsolve::g_headPlain);
             bool dead = false;
             for (size_t i = 0; i < seq.size(); ++i) {
                 g_died = false;
+                secStepBegin(pl);
                 secStep((int)seq[i], dt); ++steps;
                 if (!m_player1 || m_player1->m_isDead || g_died) {
                     dead = true; g_leafDeadAt = (int)i + 1; break;
@@ -3246,6 +3821,10 @@ class $modify(GJBaseGameLayer) {
             CheckpointObject* lcp = markCheckpointAtPhys(pl);
             if (!lcp) return 0;
             lcp->retain();
+            // ...and the player at the exit, for the loads of lcp below (g_cpPlayer).
+            std::vector<uint8_t> lcpSnap, lcpOrigin;
+            if (secsolve::g_cpPlayer && keepSnaps) psnap::captureRaw(m_player1, this, lcpSnap);
+            if (psnap::g_cpCheck) psnap::captureRaw(m_player1, this, lcpOrigin);
             graceOk = 0;
             for (size_t pi = 0;
                  pi < sizeof(kGracePeriods) / sizeof(int) && graceOk == 0; ++pi) {
@@ -3253,6 +3832,9 @@ class $modify(GJBaseGameLayer) {
                 if (pi) {
                     secRestoreFrom(pl, lcp, 0); ++restores;
                     for (int f = 0; f < freeze; ++f) secStep(0, dt);
+                    cpTakeLoad();
+                    if (!lcpSnap.empty()) psnap::restore(m_player1, this, lcpSnap.data());
+                    cpReport(2, "exit", (long long)pi, lcpOrigin);
                 }
                 bool gdead = false;
                 for (int i = 0; i < g_grace; ++i) {
@@ -3268,7 +3850,7 @@ class $modify(GJBaseGameLayer) {
                     // A mode that steers in the air is controllable on every tick, including
                     // the last ones before a wall it can no longer miss; with secgracefly it
                     // has to live that many ticks first (see g_graceFly).
-                    if (controllable(m_player1)
+                    if ((controllable(m_player1) || (secsolve::g_graceDash && dashing()))
                         && (g_graceFly <= 0 || !flyMode(m_player1) || i + 1 >= g_graceFly)) {
                         graceOk = 1;
                         break;
@@ -3284,6 +3866,7 @@ class $modify(GJBaseGameLayer) {
                     const int per = kGracePeriods[pi];
                     secRestoreFrom(pl, lcp, 0); ++restores;
                     for (int f = 0; f < freeze; ++f) secStep(0, dt);
+                    if (!lcpSnap.empty()) psnap::restore(m_player1, this, lcpSnap.data());
                     int i = 0;
                     for (; i < g_leafLife; ++i) {
                         const int in = per == 0 ? 0 : per < 0 ? 1 : ((i % per) == 0 ? 1 : 0);
@@ -3308,6 +3891,7 @@ class $modify(GJBaseGameLayer) {
         // as real from "depth stops growing" alone, without this split, was the weak point
         // of update 32.
         int layDead = 0, layDup = 0, layCap = 0;
+        long long capTotal = 0;   // nodes the cap dropped over the whole search (all layers)
         double layMaxX = 0.0, layMinY = 0.0, layMaxY = 0.0, layMinX = 0.0;
         double deadMaxX = 0.0;
         // What the verified plan holds at this layer -- the spine's own input.
@@ -3333,13 +3917,63 @@ class $modify(GJBaseGameLayer) {
             }
             return held;
         };
-        for (int depth = 1; depth <= g_horizon && foundLeaf < 0; ++depth) {
+        // The spine as a check on the snapshot (secsolve::g_spineUntil): noted when a layer ends
+        // without the spine's child while the plan it flies was still alive in the game there.
+        // The search goes on -- whatever it finds is replayed from the head before it counts, so a
+        // snapshot that is wrong about the spine cannot make a wrong answer, only miss a right one;
+        // a search that then finds nothing is asked again on checkpoints (the rung's end).
+        secsolve::g_psnapLied = false;
+        secsolve::g_spineLostT = -1;
+        auto spineLied = [&](int depth) {
+            if (!g_snapOn || secsolve::g_spineUntil <= 0 || g_spine < 0 || secsolve::g_psnapLied)
+                return;
+            if (g_spineNext >= 0 && std::find(nxt.begin(), nxt.end(), g_spineNext) != nxt.end())
+                return;
+            const long long t = (long long)g_ckptTick + 1 + depth;
+            if (t >= secsolve::g_spineUntil - secsolve::kSpineSlack) return;
+            secsolve::g_psnapLied = true;
+            secsolve::g_spineLostT = t;
+        };
+        // An exception out of the search gives the search up, not the game. The search's coroutine
+        // would hand it to std::terminate (SecTask's unhandled_exception), which ended the whole
+        // game: MOAI's window at t=9,628 (depth 1,654) threw "vector too long" at depth 66 in every
+        // run, with and without cfg cpflight. Caught around the layers, it ends only the search: the
+        // layer being built is let go, the verdict is EXHAUSTED with stop=exception, and everything
+        // after the layers -- the checkpoints and anchors released, the rung's hand-back, the level
+        // reset, the render hold let go -- runs as after any search that found nothing. Where it was
+        // is printed (the step is postmortem::g_secPhase), and how far the search's lists had grown,
+        // length_error (a list asked past its limit) and bad_alloc (the process out of memory) apart.
+        auto giveUp = [&](const char* kind, const char* what) {
+            char eb[320];
+            snprintf(eb, sizeof(eb), "secsolve: gave up the search - an exception at depth %d (step %d, node %d): %s",
+                     (int)postmortem::g_secPhaseDepth, (int)postmortem::g_secPhase,
+                     (int)postmortem::g_secPhaseNode, what);
+            writeResult(eb);
+            char sb[480];
+            snprintf(sb, sizeof(sb), "secsolve: exception kind=%s stage=%s depth=%d node=%d size/capacity "
+                     "cur=%zu/%zu nxt=%zu/%zu nodes=%zu/%zu snaps=%zu/%zu acts=%zu/%zu path=%zu/%zu "
+                     "seq=%zu/%zu", kind, postmortem::secPhaseName((int)postmortem::g_secPhase),
+                     (int)postmortem::g_secPhaseDepth, (int)postmortem::g_secPhaseNode, cur.size(),
+                     cur.capacity(), nxt.size(), nxt.capacity(), g_nodes.size(), g_nodes.capacity(),
+                     snaps.size(), snaps.capacity(), acts.size(), acts.capacity(), leafPathN,
+                     leafPathCap, leafSeqN, leafSeqCap);
+            writeResult(sb);
+            for (int ni : nxt) releaseCp(ni);
+            nxt.clear();
+            foundLeaf = -1;
+            stopWhy = "exception";
+        };
+        try {
+        if (cpRefused) stopWhy = "no-cp";
+        for (int depth = 1; depth <= g_horizon && foundLeaf < 0 && !cpRefused; ++depth) {
             nxt.clear();
             seen.clear();
             layDead = layDup = layCap = 0;
             layMaxX = deadMaxX = 0.0;
             layMinY = 1e9; layMaxY = -1e9; layMinX = 1e9;
             g_depth = depth;
+            postmortem::g_secPhaseDepth = depth;
+            postmortem::g_secPhase = 1;
             // The search's own clock (cfg `secdeadline`). Checked HERE, at the
             // top of a layer, because this is the one place where `cur` is the
             // live frontier and `nxt` is empty -- breaking anywhere later would
@@ -3412,6 +4046,8 @@ class $modify(GJBaseGameLayer) {
                 // layer: an expansion begins by restoring, so the world between two of them is
                 // not a state anything reads.
                 if (g_sliceMs > 0 && sliceExpired()) co_await std::suspend_always{};
+                postmortem::g_secPhaseNode = ni;
+                postmortem::g_secPhase = 2;
                 CheckpointObject* base = nullptr;
                 if (!g_snapOn) {
                     base = (size_t)ni < g_cps.size() ? g_cps[(size_t)ni] : nullptr;
@@ -3430,14 +4066,21 @@ class $modify(GJBaseGameLayer) {
                         // Restore the world first. Restoring the player triggers no
                         // collision test, but restoring the world goes through setPosition,
                         // so section re-registration runs. Keep the order fixed.
+                        postmortem::g_secPhase = 10;
                         if (g_worldOn && (size_t)ni < worlds.size())
                             psnap::restoreWorld(this, g_movSet, worlds[(size_t)ni]);
+                        postmortem::g_secPhase = 11;
                         psnap::restore(m_player1, this, snaps[(size_t)ni].data());
+                        postmortem::g_secPhase = 12;
                         psnap::restoreEM(this, pulses[(size_t)ni]);
+                        postmortem::g_secPhase = 13;
                         if (states[(size_t)ni]) psnap::restoreState(this, *states[(size_t)ni]);
+                        postmortem::g_secPhase = 14;
                         if (touches[(size_t)ni])
                             psnap::restoreTouch(m_player1, *touches[(size_t)ni], this);
+                        postmortem::g_secPhase = 15;
                         if ((size_t)ni < acts.size()) psnap::restoreAct(acts[(size_t)ni]);
+                        postmortem::g_secPhase = 16;
                         // The wave trail is not in the snapshot (see g_trailClear)
                         if (secsolve::g_trailClear) {
                             for (PlayerObject* p : {m_player1, m_player2})
@@ -3456,14 +4099,18 @@ class $modify(GJBaseGameLayer) {
                         if (g_nodes[(size_t)ni].in) secArmHold();
                         // Dash is not carried either (the mask does not copy pointers, so
                         // `m_dashRing` is lost). See the note on DashState.
-                        if ((size_t)ni < g_dash.size())
+                        if ((size_t)ni < g_dash.size()) {
                             secRestoreDash(g_dash[(size_t)ni]);
+                            secRestoreJb(g_dash[(size_t)ni]);
+                        }
                         // The boost accumulator is not in the psnap mask either
                         // (see g_accel). Same field, same reason, both paths.
                         if (m_player1 && (size_t)ni < g_accel.size()) {
                             m_player1->m_accelerationOrSpeed = g_accel[(size_t)ni];
                             m_player1->m_touchedPad = g_pad[(size_t)ni] != 0;
                         }
+                        // ...both bodies (see g_dash2).
+                        secRestoreP2((size_t)ni, false);
                         // Rebuild the candidate list. On the checkpoint path this happens by
                         // itself through the 2 frozen steps, but the psnap path has no
                         // freeze.
@@ -3478,8 +4125,10 @@ class $modify(GJBaseGameLayer) {
                         secRestoreFrom(pl, base, g_nodes[(size_t)ni].in);
                         ++restores;
                         // Dash is not in the checkpoint. Restore it here
-                        if ((size_t)ni < g_dash.size())
+                        if ((size_t)ni < g_dash.size()) {
                             secRestoreDash(g_dash[(size_t)ni]);
+                            secRestoreJb(g_dash[(size_t)ni]);
+                        }
                         // ...and the exact y velocity, which the restore puts
                         // back on the 0.001 grid (hole 3, measured:
                         // 1.9815 comes back 1.982). One restore loses half a
@@ -3500,6 +4149,8 @@ class $modify(GJBaseGameLayer) {
                             m_player1->m_accelerationOrSpeed = g_accel[(size_t)ni];
                             m_player1->m_touchedPad = g_pad[(size_t)ni] != 0;
                         }
+                        // ...both bodies (see g_dash2).
+                        secRestoreP2((size_t)ni, true);
                         // Idle the frozen ticks with "the input that node was holding"
                         // (physics does not advance so the state is unchanged, but button
                         // continuity is kept)
@@ -3553,7 +4204,31 @@ class $modify(GJBaseGameLayer) {
                     g_stepDepth = depth;
                     {
                         const auto stepT0 = std::chrono::steady_clock::now();   // print only
+                        postmortem::g_secPhase = 20;
+                        secStepBegin(pl);
+                        postmortem::g_secPhase = 21;
                         secStep(branch, dt); ++steps;
+                        postmortem::g_secPhase = 22;
+                        // An object the step put at a position that is not a number: the game's
+                        // world in this search is no longer one the game can be in (see
+                        // secsolve::g_nonFinite), and every branch after this one steps in it.
+                        if (secsolve::g_nonFinite > 0) {
+                            char nb[240];
+                            snprintf(nb, sizeof(nb), "object uid %d (id %d) went to position (%g, %g) on "
+                                     "the step from node %d, branch %d", secsolve::g_nonFiniteUid,
+                                     secsolve::g_nonFiniteId, secsolve::g_nonFiniteX, secsolve::g_nonFiniteY,
+                                     ni, branch);
+                            throw std::runtime_error(nb);
+                        }
+                        // cfg secthrow: the containment's own test (Config::secThrowKind).
+                        if (g_cfg.secThrowKind != 0 && depth == g_cfg.secThrowDepth && !nxt.empty()
+                            && secsolve::g_secThrowsDone < (g_cfg.secThrowKind == 3 ? 2 : 1)) {
+                            const bool alloc = g_cfg.secThrowKind == 2
+                                               || (g_cfg.secThrowKind == 3 && secsolve::g_secThrowsDone == 1);
+                            ++secsolve::g_secThrowsDone;
+                            if (alloc) throw std::bad_alloc();
+                            throw std::length_error("cfg secthrow: a length_error on purpose");
+                        }
                         g_secStepMs += std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - stepT0).count();
                     }
@@ -3611,7 +4286,14 @@ class $modify(GJBaseGameLayer) {
                                                    && px <= solver::g_coinMoveX[c]);
                             // not there now: passing it is no miss
                             if (coinObj[c]->m_isGroupDisabled) {
-                                if (past) bitsHere |= bit;
+                                // ...nor a pickup of the coin this rung was fired for (cfg
+                                // secrungcoinoff): the bit said "done", and the rung's leaf test
+                                // read it as "taken" -- SubZero 4003's third coin, its group off
+                                // for want of a fourth press, was "taken" by six spliced leaves
+                                // and credited by GD on none.
+                                if (past && !(secsolve::g_rungCoinOff
+                                              && (int)c == secsolve::g_rungCoin))
+                                    bitsHere |= bit;
                                 continue;
                             }
                             if (pr.intersectsRect(cr)) { bitsHere |= bit; continue; }
@@ -3664,12 +4346,15 @@ class $modify(GJBaseGameLayer) {
                         g_nodes.push_back({ni, (uint8_t)branch,
                                            (uint8_t)(p->m_isDashing ? 1 : 0),
                                            (float)py, (float)pv, (float)px,
-                                           (uint16_t)secsolve::cntNow(this)});
+                                           (uint16_t)secsolve::cntNow(this),
+                                           (uint8_t)(p->m_vehicleSize < 0.9f ? 1 : 0),
+                                           (uint8_t)(secDualP2() ? 1 : 0), secDualY2()});
                         g_dash.emplace_back();
                         secCaptureDash(g_dash.back());
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);
                         g_accel.push_back(p ? p->m_accelerationOrSpeed : 0.0);
                         g_pad.push_back(p && p->m_touchedPad ? 1 : 0);
+                        secPushP2();
                         coinBits.push_back(bitsHere);
                         g_cps.push_back(nullptr);
                         if (keepSnaps) {
@@ -3714,10 +4399,21 @@ class $modify(GJBaseGameLayer) {
                     // `acts` instead of scanning them again.
                     std::vector<uint8_t> actHere;
                     uint64_t actSigHere = 0;
+                    postmortem::g_secPhase = 30;
                     if (g_snapOn && psnap::g_snapAct) actSigHere = psnap::captureActSig(actHere);
+                    postmortem::g_secPhase = 31;
                     // (cfg seccoins: a state that has the coin is not the same state as one
                     // that has not) -- and nor is one that has taken a ring, pad or portal
-                    // the other has not (cfg secactkey).
+                    // the other has not (cfg secactkey) -- and, in a dual section, nor is one
+                    // whose player 2 is elsewhere (cfg secp2key).
+                    long long p2Here = 0;
+                    if (secsolve::g_p2Key) {
+                        if (auto* q = secDualP2())
+                            p2Here = keyOf(secDualY2(), q->m_yVelocity, (int)modeIdx(q),
+                                           q->m_vehicleSize < 0.9f ? 1 : 0,
+                                           q->m_isUpsideDown ? 1 : 0, 0, 0.0,
+                                           q->m_isDashing ? 1 : 0, 0);
+                    }
                     const long long k = keyOf(py, pv, (int)modeIdx(p),
                                               p->m_vehicleSize < 0.9f ? 1 : 0,
                                               p->m_isUpsideDown ? 1 : 0, branch,
@@ -3727,7 +4423,9 @@ class $modify(GJBaseGameLayer) {
                                                       * 0x9E3779B97F4A7C15ULL)
                                         ^ (psnap::g_actKey
                                                ? (long long)(actSigHere * psnap::kActKeyMul)
-                                               : 0LL);
+                                               : 0LL)
+                                        ^ (long long)((unsigned long long)p2Here
+                                                      * 0xD6E8FEB86659FD93ULL);
                     // The spine is the verified solution's own continuation:
                     // this parent is the spine and this branch is what the plan
                     // does at this tick. It is exempt from the dedupe -- see
@@ -3748,12 +4446,15 @@ class $modify(GJBaseGameLayer) {
                         g_nodes.push_back({ni, (uint8_t)branch,
                                            (uint8_t)(p->m_isDashing ? 1 : 0),
                                            (float)py, (float)pv, (float)px,
-                                           (uint16_t)cntHere});
+                                           (uint16_t)cntHere,
+                                           (uint8_t)(p->m_vehicleSize < 0.9f ? 1 : 0),
+                                           (uint8_t)(secDualP2() ? 1 : 0), secDualY2()});
                         g_dash.emplace_back();
                         secCaptureDash(g_dash.back());
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);
                         g_accel.push_back(p ? p->m_accelerationOrSpeed : 0.0);
                         g_pad.push_back(p && p->m_touchedPad ? 1 : 0);
+                        secPushP2();
                         coinBits.push_back(bitsHere);
                         g_cps.push_back(nullptr);
                         snaps.emplace_back();
@@ -3763,14 +4464,20 @@ class $modify(GJBaseGameLayer) {
                         acts.emplace_back(std::move(actHere));
                         actSigs.push_back(actSigHere);
                         actSigSeen.insert(actSigHere);
+                        postmortem::g_secPhase = 40;
                         psnap::capture(p, this, snaps.back());
+                        postmortem::g_secPhase = 41;
                         psnap::captureEM(this, pulses.back());
+                        postmortem::g_secPhase = 42;
                         psnap::captureState(this, *states.back());
+                        postmortem::g_secPhase = 43;
                         psnap::captureTouch(p, *touches.back(), this);
+                        postmortem::g_secPhase = 44;
                         if (g_worldOn) {
                             worlds.emplace_back();
                             psnap::captureWorld(g_movSet, worlds.back());
                         }
+                        postmortem::g_secPhase = 45;
                         ++cpMade;
                     } else {
                         CheckpointObject* cp = markCheckpointAtPhys(pl);
@@ -3779,12 +4486,15 @@ class $modify(GJBaseGameLayer) {
                         g_nodes.push_back({ni, (uint8_t)branch,
                                            (uint8_t)(p->m_isDashing ? 1 : 0),
                                            (float)py, (float)pv, (float)px,
-                                           (uint16_t)cntHere});
+                                           (uint16_t)cntHere,
+                                           (uint8_t)(p->m_vehicleSize < 0.9f ? 1 : 0),
+                                           (uint8_t)(secDualP2() ? 1 : 0), secDualY2()});
                         g_dash.emplace_back();
                         secCaptureDash(g_dash.back());
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);
                         g_accel.push_back(p ? p->m_accelerationOrSpeed : 0.0);
                         g_pad.push_back(p && p->m_touchedPad ? 1 : 0);
+                        secPushP2();
                         coinBits.push_back(bitsHere);
                         actSigs.push_back(0);
                         g_cps.push_back(cp);
@@ -3806,6 +4516,8 @@ class $modify(GJBaseGameLayer) {
                     cpPeak = std::max(cpPeak, (long long)(cur.size() + nxt.size()));
                 }
             }
+            postmortem::g_secPhase = 50;
+            postmortem::g_secPhaseNode = -1;
             // Prune the layer to the cap. Never take the first cap in insertion order.
             // Children are ordered "parent order x branch order", which is roughly
             // ascending y (if parents are in y order, their children come low branch then
@@ -3818,135 +4530,264 @@ class $modify(GJBaseGameLayer) {
             // Exempting it inside each branch of the cap would mean touching
             // both of them and their release paths; lifting it out cannot drop
             // it by accident, and the layer being cap+1 wide costs nothing.
+            // cfg seckeepsize: a branch that changed player 1's size is not the route asked for,
+            // and neither is the spine once it does.
+            if (secsolve::g_keepP1Size >= 0) {
+                size_t w = 0;
+                for (int ni : nxt) {
+                    if ((int)g_nodes[(size_t)ni].mini == secsolve::g_keepP1Size) nxt[w++] = ni;
+                    else { releaseCp(ni); ++secsolve::g_keepDropped; }
+                }
+                nxt.resize(w);
+            }
             int spineHeld = -1;
             if (g_spineOn && g_spineNext >= 0) {
                 auto it = std::find(nxt.begin(), nxt.end(), g_spineNext);
                 if (it != nxt.end()) { spineHeld = *it; nxt.erase(it); }
             }
             bool capByX = false;
-            if (nxt.size() > g_cap) {
-                // Do not crush the x families. With two exits of a rotated gameplay
-                // section, families 40px apart in x line up at the same depth. Ordering by
-                // y alone and taking at even spacing keeps the y-band edges but can drop a
-                // whole family. In a section where x decides the phase (= passing the
-                // moving spikes), that is fatal.
-                // Cut x into buckets and take from the buckets round-robin.
-                // Buckets are cut by x and the "kind of state". While dashing, y is fixed,
-                // so with y-ordered even spacing those nodes get buried inside and dropped.
-                // The rarer the kind, the less it may be dropped (it is the path).
-                std::unordered_map<long long, std::vector<int>> buckets;
-                for (int ni : nxt) {
-                    const auto& nd = g_nodes[(size_t)ni];
-                    // cnt is a family too (same reason as dash): branches that hit are rare
-                    // and get buried among pass-through branches under y-even spacing. They
-                    // are the path.
-                    // ...and so is a coin taken (cfg seccoins): the branches that took it are
-                    // few, and they are the route.
-                    const long long b = (long long)std::llround(nd.x / 16.0)
-                                        + (nd.dash ? 1000003LL : 0LL)
-                                        + (long long)nd.cnt * 2000003LL
-                                        + (coinsOn ? (long long)coinBits[(size_t)ni] * 3000017LL
-                                                   : 0LL)
-                                        // ...and the set of objects used (cfg secactkey): the
-                                        // branch that kept a ring for later is the rare one.
-                                        + (psnap::g_actKey && (size_t)ni < actSigs.size()
-                                               ? (long long)(actSigs[(size_t)ni] % 1000003ull)
-                                                     * 5000011LL
-                                               : 0LL);
-                    buckets[b].push_back(ni);
-                }
-                if (buckets.size() > 1) {
-                    for (auto& kv : buckets) {
-                        std::sort(kv.second.begin(), kv.second.end(),
-                                  [&](int a, int b2) {
-                                      const auto& na = g_nodes[(size_t)a];
-                                      const auto& nb = g_nodes[(size_t)b2];
-                                      if (na.y != nb.y) return na.y < nb.y;
-                                      return na.vy < nb.vy;
-                                  });
-                    }
-                    std::vector<long long> keys;
-                    keys.reserve(buckets.size());
-                    for (auto& kv : buckets) keys.push_back(kv.first);
-                    std::sort(keys.begin(), keys.end());
-                    std::vector<int> keepv;
-                    keepv.reserve(g_cap);
-                    std::unordered_set<int> kept;
-                    // The share per bucket. Even a small family always gets one.
-                    const size_t per = std::max<size_t>(1, g_cap / keys.size());
-                    for (long long k : keys) {
-                        auto& v = buckets[k];
-                        const size_t take = std::min(per, v.size());
-                        for (size_t i = 0; i < take && keepv.size() < g_cap; ++i) {
-                            const size_t idx = take > 1
-                                ? (size_t)((double)i * (double)(v.size() - 1)
-                                           / (double)(take - 1) + 0.5)
-                                : v.size() / 2;
-                            if (kept.insert(v[idx]).second) keepv.push_back(v[idx]);
-                        }
-                    }
-                    // Fill the remainder in y order (raises the band's resolution)
-                    if (keepv.size() < g_cap) {
-                        std::vector<int> rest;
-                        for (int ni : nxt) if (!kept.count(ni)) rest.push_back(ni);
-                        std::sort(rest.begin(), rest.end(), [&](int a, int b2) {
-                            return g_nodes[(size_t)a].y < g_nodes[(size_t)b2].y;
-                        });
-                        const size_t need = g_cap - keepv.size();
-                        for (size_t i = 0; i < need && i < rest.size(); ++i) {
-                            const size_t idx = need > 1
-                                ? (size_t)((double)i * (double)(rest.size() - 1)
-                                           / (double)(need - 1) + 0.5)
-                                : rest.size() / 2;
-                            if (kept.insert(rest[idx]).second)
-                                keepv.push_back(rest[idx]);
-                        }
-                    }
-                    for (int ni : nxt)
-                        if (!kept.count(ni)) { releaseCp(ni); ++layCap; }
-                    nxt.swap(keepv);
-                    capByX = true;
-                }
-            }
-            if (nxt.size() > g_cap) {
-                // Which axis the "band" forms on depends on the section. A normal section
-                // spreads in y, but in a rotated gameplay section y is the clock and nearly
-                // equal across branches; the spread is in x. Ordering by y and taking at
-                // even spacing then means taking by "the ordering within nearly-equal y",
-                // defeating the purpose of keeping the band edges. Order along the axis
-                // that spreads.
-                double ylo = 1e18, yhi = -1e18, xlo = 1e18, xhi = -1e18;
-                for (int ni : nxt) {
+            // The order the cap reads a family in: y, then vy.
+            auto yThenVy = [&](int a, int b) {
+                const auto& na = g_nodes[(size_t)a];
+                const auto& nb = g_nodes[(size_t)b];
+                if (na.y != nb.y) return na.y < nb.y;
+                return na.vy < nb.vy;
+            };
+            // cfg seccover: q of the nodes in v (sorted by yThenVy) that cover the (y, vy)
+            // plane -- one per cell of the finest square grid (over v's own ranges) that has at
+            // most q - 2 occupied cells, the first in the sorted order of each, and both y edges.
+            // Cells the grid leaves over are filled evenly in the sorted order. The button is a
+            // further axis, as it is in the dedupe key: a cube resting on a block at (y, 0) jumps
+            // next tick if it is held and stays if not, and sharing a cell the one kept would be
+            // whichever sorted first. (Not measured to decide a search yet; the key's reason.)
+            auto pickCover = [&](const std::vector<int>& v, size_t q) {
+                std::vector<int> out;
+                if (q == 0) return out;
+                if (v.size() <= q) { out = v; return out; }
+                if (q == 1) { out.push_back(v[v.size() / 2]); return out; }
+                if (q == 2) { out.push_back(v.front()); out.push_back(v.back()); return out; }
+                float ylo = 1e30f, yhi = -1e30f, vlo = 1e30f, vhi = -1e30f;
+                float y2lo = 1e30f, y2hi = -1e30f;
+                bool withY2 = false;   // player 2's y as a further axis (cfg secp2key)
+                for (int ni : v) {
                     const auto& n = g_nodes[(size_t)ni];
-                    ylo = std::min(ylo, (double)n.y); yhi = std::max(yhi, (double)n.y);
-                    xlo = std::min(xlo, (double)n.x); xhi = std::max(xhi, (double)n.x);
+                    ylo = std::min(ylo, n.y); yhi = std::max(yhi, n.y);
+                    vlo = std::min(vlo, n.vy); vhi = std::max(vhi, n.vy);
+                    if (secsolve::g_p2Key && n.dual) {
+                        withY2 = true;
+                        y2lo = std::min(y2lo, n.y2); y2hi = std::max(y2hi, n.y2);
+                    }
                 }
-                capByX = (xhi - xlo) > (yhi - ylo);
-                std::sort(nxt.begin(), nxt.end(), [&](int a, int b) {
-                    const auto& na = g_nodes[(size_t)a];
-                    const auto& nb = g_nodes[(size_t)b];
-                    if (capByX) {
-                        if (na.x != nb.x) return na.x < nb.x;
+                const double ys = std::max(1e-6, (double)(yhi - ylo));
+                const double vs = std::max(1e-6, (double)(vhi - vlo));
+                const double y2s = std::max(1e-6, (double)(y2hi - y2lo));
+                auto cellOf = [&](int ni, long long k) {
+                    const auto& n = g_nodes[(size_t)ni];
+                    const long long cy =
+                        std::min(k - 1, (long long)((n.y - ylo) / ys * (double)k));
+                    const long long cv =
+                        std::min(k - 1, (long long)((n.vy - vlo) / vs * (double)k));
+                    long long c = cy * (k + 1) + cv;
+                    if (withY2)
+                        c = c * (k + 1)
+                            + (n.dual ? std::min(k - 1, (long long)((n.y2 - y2lo) / y2s
+                                                                     * (double)k))
+                                      : k);
+                    return c * 2 + (n.in ? 1 : 0);
+                };
+                auto occupied = [&](long long k) {
+                    std::unordered_set<long long> c;
+                    for (int ni : v) c.insert(cellOf(ni, k));
+                    return c.size();
+                };
+                long long lo = 1, hi = 8192;
+                while (lo < hi) {
+                    const long long mid = (lo + hi + 1) / 2;
+                    if (occupied(mid) + 2 <= q) lo = mid; else hi = mid - 1;
+                }
+                std::unordered_set<long long> cells;
+                std::unordered_set<int> in;
+                out.reserve(q);
+                out.push_back(v.front()); in.insert(v.front());
+                out.push_back(v.back()); in.insert(v.back());
+                for (int ni : v) {
+                    if (out.size() >= q) break;
+                    if (!cells.insert(cellOf(ni, lo)).second) continue;
+                    if (in.insert(ni).second) out.push_back(ni);
+                }
+                if (out.size() < q) {
+                    std::vector<int> rest;
+                    for (int ni : v) if (!in.count(ni)) rest.push_back(ni);
+                    const size_t need = q - out.size();
+                    for (size_t i = 0; i < need && i < rest.size(); ++i) {
+                        const size_t idx = need > 1
+                            ? (size_t)((double)i * (double)(rest.size() - 1)
+                                       / (double)(need - 1) + 0.5)
+                            : rest.size() / 2;
+                        if (in.insert(rest[idx]).second) out.push_back(rest[idx]);
+                    }
+                }
+                return out;
+            };
+            // The cap proper: `list` down to `cap` nodes, the others released.
+            auto pruneTo = [&](std::vector<int>& list, size_t cap) {
+                if (list.size() > cap) {
+                    // Do not crush the x families. With two exits of a rotated gameplay
+                    // section, families 40px apart in x line up at the same depth. Ordering by
+                    // y alone and taking at even spacing keeps the y-band edges but can drop a
+                    // whole family. In a section where x decides the phase (= passing the
+                    // moving spikes), that is fatal.
+                    // Cut x into buckets and take from the buckets round-robin.
+                    // Buckets are cut by x and the "kind of state". While dashing, y is fixed,
+                    // so with y-ordered even spacing those nodes get buried inside and dropped.
+                    // The rarer the kind, the less it may be dropped (it is the path).
+                    std::unordered_map<long long, std::vector<int>> buckets;
+                    for (int ni : list) {
+                        const auto& nd = g_nodes[(size_t)ni];
+                        // cnt is a family too (same reason as dash): branches that hit are rare
+                        // and get buried among pass-through branches under y-even spacing. They
+                        // are the path.
+                        // ...and so is a coin taken (cfg seccoins): the branches that took it are
+                        // few, and they are the route.
+                        const long long b = (long long)std::llround(nd.x / 16.0)
+                                            + (nd.dash ? 1000003LL : 0LL)
+                                            + (long long)nd.cnt * 2000003LL
+                                            + (coinsOn ? (long long)coinBits[(size_t)ni] * 3000017LL
+                                                       : 0LL)
+                                            // ...and the set of objects used (cfg secactkey): the
+                                            // branch that kept a ring for later is the rare one.
+                                            + (psnap::g_actKey && (size_t)ni < actSigs.size()
+                                                   ? (long long)(actSigs[(size_t)ni] % 1000003ull)
+                                                         * 5000011LL
+                                                   : 0LL);
+                        buckets[b].push_back(ni);
+                    }
+                    if (buckets.size() > 1) {
+                        for (auto& kv : buckets) {
+                            std::sort(kv.second.begin(), kv.second.end(),
+                                      [&](int a, int b2) {
+                                          const auto& na = g_nodes[(size_t)a];
+                                          const auto& nb = g_nodes[(size_t)b2];
+                                          if (na.y != nb.y) return na.y < nb.y;
+                                          return na.vy < nb.vy;
+                                      });
+                        }
+                        std::vector<long long> keys;
+                        keys.reserve(buckets.size());
+                        for (auto& kv : buckets) keys.push_back(kv.first);
+                        std::sort(keys.begin(), keys.end());
+                        std::vector<int> keepv;
+                        keepv.reserve(cap);
+                        std::unordered_set<int> kept;
+                        // The share per bucket. Even a small family always gets one.
+                        const size_t per = std::max<size_t>(1, cap / keys.size());
+                        for (long long k : keys) {
+                            auto& v = buckets[k];
+                            const size_t take = std::min(per, v.size());
+                            if (secsolve::g_cover) {
+                                for (int ni : pickCover(v, take))
+                                    if (keepv.size() < cap && kept.insert(ni).second)
+                                        keepv.push_back(ni);
+                                continue;
+                            }
+                            for (size_t i = 0; i < take && keepv.size() < cap; ++i) {
+                                const size_t idx = take > 1
+                                    ? (size_t)((double)i * (double)(v.size() - 1)
+                                               / (double)(take - 1) + 0.5)
+                                    : v.size() / 2;
+                                if (kept.insert(v[idx]).second) keepv.push_back(v[idx]);
+                            }
+                        }
+                        // Fill the remainder in y order (raises the band's resolution)
+                        if (keepv.size() < cap) {
+                            std::vector<int> rest;
+                            for (int ni : list) if (!kept.count(ni)) rest.push_back(ni);
+                            std::sort(rest.begin(), rest.end(), [&](int a, int b2) {
+                                return g_nodes[(size_t)a].y < g_nodes[(size_t)b2].y;
+                            });
+                            const size_t need = cap - keepv.size();
+                            if (secsolve::g_cover) {
+                                std::sort(rest.begin(), rest.end(), yThenVy);
+                                for (int ni : pickCover(rest, need))
+                                    if (kept.insert(ni).second) keepv.push_back(ni);
+                            }
+                            for (size_t i = 0; !secsolve::g_cover && i < need && i < rest.size();
+                                 ++i) {
+                                const size_t idx = need > 1
+                                    ? (size_t)((double)i * (double)(rest.size() - 1)
+                                               / (double)(need - 1) + 0.5)
+                                    : rest.size() / 2;
+                                if (kept.insert(rest[idx]).second)
+                                    keepv.push_back(rest[idx]);
+                            }
+                        }
+                        for (int ni : list)
+                            if (!kept.count(ni)) { releaseCp(ni); ++layCap; ++capTotal; }
+                        list.swap(keepv);
+                        capByX = true;
+                    }
+                }
+                if (list.size() > cap) {
+                    // Which axis the "band" forms on depends on the section. A normal section
+                    // spreads in y, but in a rotated gameplay section y is the clock and nearly
+                    // equal across branches; the spread is in x. Ordering by y and taking at
+                    // even spacing then means taking by "the ordering within nearly-equal y",
+                    // defeating the purpose of keeping the band edges. Order along the axis
+                    // that spreads.
+                    double ylo = 1e18, yhi = -1e18, xlo = 1e18, xhi = -1e18;
+                    for (int ni : list) {
+                        const auto& n = g_nodes[(size_t)ni];
+                        ylo = std::min(ylo, (double)n.y); yhi = std::max(yhi, (double)n.y);
+                        xlo = std::min(xlo, (double)n.x); xhi = std::max(xhi, (double)n.x);
+                    }
+                    capByX = (xhi - xlo) > (yhi - ylo);
+                    std::sort(list.begin(), list.end(), [&](int a, int b) {
+                        const auto& na = g_nodes[(size_t)a];
+                        const auto& nb = g_nodes[(size_t)b];
+                        if (capByX) {
+                            if (na.x != nb.x) return na.x < nb.x;
+                            if (na.y != nb.y) return na.y < nb.y;
+                            return na.vy < nb.vy;
+                        }
                         if (na.y != nb.y) return na.y < nb.y;
                         return na.vy < nb.vy;
+                    });
+                    const size_t n = list.size();
+                    std::vector<int> keepv;
+                    keepv.reserve(cap);
+                    std::unordered_set<int> kept;
+                    const bool cover = secsolve::g_cover && !capByX;
+                    if (cover)
+                        for (int ni : pickCover(list, cap))
+                            if (kept.insert(ni).second) keepv.push_back(ni);
+                    for (size_t i = 0; !cover && i < cap; ++i) {
+                        const size_t idx = cap > 1
+                            ? (size_t)((double)i * (double)(n - 1) / (double)(cap - 1) + 0.5)
+                            : n / 2;
+                        if (kept.insert(list[idx]).second) keepv.push_back(list[idx]);
                     }
-                    if (na.y != nb.y) return na.y < nb.y;
-                    return na.vy < nb.vy;
-                });
-                const size_t n = nxt.size();
-                std::vector<int> keepv;
-                keepv.reserve(g_cap);
-                std::unordered_set<int> kept;
-                for (size_t i = 0; i < g_cap; ++i) {
-                    const size_t idx = g_cap > 1
-                        ? (size_t)((double)i * (double)(n - 1) / (double)(g_cap - 1) + 0.5)
-                        : n / 2;
-                    if (kept.insert(nxt[idx]).second) keepv.push_back(nxt[idx]);
+                    for (int ni : list)
+                        if (!kept.count(ni)) { releaseCp(ni); ++layCap; ++capTotal; }
+                    list.swap(keepv);
                 }
-                for (int ni : nxt)
-                    if (!kept.count(ni)) { releaseCp(ni); ++layCap; }
-                nxt.swap(keepv);
+            };
+            // cfg secsizefam: the two sizes of player 1 are pruned apart, half the cap each (what
+            // one cannot fill goes to the other).
+            if (secsolve::g_sizeFam && nxt.size() > g_cap) {
+                std::vector<int> fam[2];
+                for (int ni : nxt) fam[g_nodes[(size_t)ni].mini ? 1 : 0].push_back(ni);
+                if (!fam[0].empty() && !fam[1].empty()) {
+                    const size_t q0 = std::min(fam[0].size(),
+                                               std::max(g_cap / 2,
+                                                        g_cap - std::min(g_cap, fam[1].size())));
+                    const size_t q1 = std::min(fam[1].size(), g_cap - q0);
+                    pruneTo(fam[0], q0);
+                    pruneTo(fam[1], q1);
+                    nxt.swap(fam[0]);
+                    nxt.insert(nxt.end(), fam[1].begin(), fam[1].end());
+                }
             }
+            pruneTo(nxt, g_cap);
             // ...and the spine goes back in, whatever the pruning decided.
             if (spineHeld >= 0) nxt.push_back(spineHeld);
             // ---- Detect and repair (cfg `secverifyevery`) --------------------
@@ -3955,8 +4796,10 @@ class $modify(GJBaseGameLayer) {
             // dropping them here leaves a frontier that is reachable on the real game only.
             // Surviving nodes have their snapshots retaken from the real state after the
             // replay (if they had drifted, that fixes them there).
+            postmortem::g_secPhase = 55;
             if (g_snapOn && g_verifyEvery > 0 && !nxt.empty()
                 && depth % g_verifyEvery == 0) {
+                postmortem::g_secPhase = 60;
                 std::vector<int> ok;
                 ok.reserve(nxt.size());
                 int vDead = 0, vFixed = 0, vAnchored = 0;
@@ -3968,6 +4811,7 @@ class $modify(GJBaseGameLayer) {
                 // ancestor checkpoint replay from the section head.
                 std::vector<int> anc((size_t)nxt.size(), -1);
                 std::unordered_map<int, CheckpointObject*> newAnchors;
+                std::unordered_map<int, std::vector<uint8_t>> newAnchorSnaps;
                 if (g_anchor) {
                     for (size_t k = 0; k < nxt.size(); ++k) {
                         int a = nxt[k];
@@ -4015,9 +4859,21 @@ class $modify(GJBaseGameLayer) {
                             psnap::restoreAct(acts[(size_t)a]);
                         originCheck(a);
                         ++restores; ++vAnchored;
+                        // cfg secjbkeep: the origin's own m_jumpBuffered, both bodies, in the
+                        // place the expansion path writes it (before the frozen ticks)
+                        if ((size_t)a < g_dash.size()) secRestoreJb(g_dash[(size_t)a]);
+                        if (auto* q = secP2(); q && (size_t)a < secsolve::g_dash2.size())
+                            secRestoreJb(secsolve::g_dash2[(size_t)a], q);
                         for (int f = 0; f < freeze; ++f) {
                             secStep(g_nodes[(size_t)a].in, dt); ++steps;
                         }
+                        cpTakeLoad();
+                        // ...and the origin's own player (g_cpPlayer).
+                        const auto it = anchorSnaps.find(a);
+                        if (secsolve::g_cpPlayer && it != anchorSnaps.end() && !it->second.empty())
+                            psnap::restore(m_player1, this, it->second.data());
+                        if (it != anchorSnaps.end())
+                            cpReport(4, "checkanchor", (long long)depth, it->second);
                     } else {
                         secRestoreFrom(pl, g_ckpt, g_headHeld); ++restores;
                         if (psnap::g_snapAct && !acts.empty()) psnap::restoreAct(acts[0]);
@@ -4025,6 +4881,10 @@ class $modify(GJBaseGameLayer) {
                         for (int f = 0; f < freeze; ++f) {
                             secStep(g_headHeld, dt); ++steps;
                         }
+                        cpTakeLoad();
+                        if (secsolve::g_cpPlayer && !snaps.empty() && !snaps[0].empty())
+                            psnap::restore(m_player1, this, snaps[0].data());
+                        cpReport(3, "checkhead", (long long)depth, secsolve::g_headPlain);
                     }
                     bool dead = false;
                     for (size_t s = 0; s < seq.size(); ++s) {
@@ -4092,6 +4952,8 @@ class $modify(GJBaseGameLayer) {
                         if (CheckpointObject* ac = markCheckpointAtPhys(pl)) {
                             ac->retain();
                             newAnchors[ni] = ac;
+                            if (secsolve::g_cpPlayer || psnap::g_cpCheck)
+                                newAnchorSnaps[ni] = snaps[(size_t)ni];
                         }
                     }
                     ok.push_back(ni);
@@ -4108,6 +4970,7 @@ class $modify(GJBaseGameLayer) {
                         std::vector<uint8_t>().swap(acts[(size_t)an]);
                 }
                 g_anchors.swap(newAnchors);
+                anchorSnaps.swap(newAnchorSnaps);
                 // A measurement of how much psnap lied. The prior gates (sweep, moving
                 // objects, moving portals) are all just guesses at "may it be used", and
                 // lv22's ball section passed through every one of them and produced
@@ -4134,9 +4997,10 @@ class $modify(GJBaseGameLayer) {
                     writeResult(db);
                 }
                 nxt.swap(ok);
-                if (nxt.empty()) { deepest = depth; break; }
+                if (nxt.empty()) { deepest = depth; spineLied(depth); break; }
             }
             deepest = depth;
+            spineLied(depth);
             if (g_log) {
                 // Layer fingerprint. For directly reading, from one run of each, at which
                 // layer the checkpoint path and the psnap path first split. Comparing
@@ -4166,6 +5030,7 @@ class $modify(GJBaseGameLayer) {
                     std::chrono::steady_clock::now() - t0).count()
                     - layerT0 * 1000.0);
                 size_t secLive = 0, secPhys = 0;
+                postmortem::g_secPhase = 70;
                 sectionCensus(pl, secLive, secPhys);
                 char lb[768];
                 snprintf(lb, sizeof(lb),
@@ -4199,6 +5064,14 @@ class $modify(GJBaseGameLayer) {
                              wt && wt->m_pointArray ? (int)wt->m_pointArray->count() : -1);
                     strncat(lb, sx, sizeof(lb) - strlen(lb) - 1);
                 }
+                // ...and, under cfg secsizefam, how many of the kept nodes are normal size.
+                if (secsolve::g_sizeFam) {
+                    int normal = 0;
+                    for (int ni : nxt) normal += g_nodes[(size_t)ni].mini ? 0 : 1;
+                    char sf[40];
+                    snprintf(sf, sizeof(sf), " normal=%d", normal);
+                    strncat(lb, sf, sizeof(lb) - strlen(lb) - 1);
+                }
                 // ...and what the restores leave behind in the scene (print only): the actions
                 // running on the play layer (resetLevel queues a 0.2 s startGameDelayed on every
                 // call), and the nodes under it two and three levels down. The restore's cost
@@ -4229,8 +5102,12 @@ class $modify(GJBaseGameLayer) {
                         return n ? (long long)n->getChildrenCount() : -1;
                     };
                     snprintf(sn, sizeof(sn), " shd=%lld,%lld,%lld,%lld,%lld,%lld",
-                             kidsAt(0xfd0), kidsAt(0xfe0), kidsAt(0xfe8), kidsAt(0xff0),
-                             kidsAt(0xff8), kidsAt(0x3178));
+                             kidsAt(gdoff::kLayerObjectParent),
+                             kidsAt(gdoff::kLayerAboveShaderParent),
+                             kidsAt(gdoff::kLayerObjectLayer),
+                             kidsAt(gdoff::kLayerInShaderObjectLayer),
+                             kidsAt(gdoff::kLayerAboveShaderObjectLayer),
+                             kidsAt(gdoff::kLayerShaderLayer));
                     strncat(lb, sn, sizeof(lb) - strlen(lb) - 1);
                     // resetLevel sorts the children of every child of the node at +0x1028
                     // (qsortAllChildrenWithIndex, 3b8eb0): how many there are, in total, and the
@@ -4239,7 +5116,7 @@ class $modify(GJBaseGameLayer) {
                         long long sortKids = -1, sortGrand = 0, sortMax = 0, dirty = 0;
                         // A CCArray, not a node: resetLevel reads its ccArray at +0x38.
                         auto* ch = *reinterpret_cast<cocos2d::CCArray* const*>(
-                            reinterpret_cast<const char*>(this) + 0x1028);
+                            reinterpret_cast<const char*>(this) + gdoff::kLayerBatchNodes);
                         if (ch) {
                             sortKids = ch->count();
                             for (unsigned i = 0; i < ch->count(); ++i) {
@@ -4306,6 +5183,14 @@ class $modify(GJBaseGameLayer) {
                 if (sliceExpired()) co_await std::suspend_always{};
             }
         }
+        } catch (const std::length_error& e) {
+            giveUp("length_error", e.what());
+        } catch (const std::bad_alloc& e) {
+            giveUp("bad_alloc", e.what());
+        } catch (const std::exception& e) {
+            giveUp("other", e.what());
+        }
+        postmortem::g_secPhase = 0;
         for (int ni : cur) releaseCp(ni);
         releaseAnchors();
 
@@ -4382,16 +5267,17 @@ class $modify(GJBaseGameLayer) {
         // What the object-activation carry cost (psnap::captureAct): objects in reach = bytes
         // per node, the nodes that hold a copy, and the time spent saving and restoring them.
         if (g_snapOn) {
-            char ab[256];
+            char ab[320];
             snprintf(ab, sizeof(ab),
                      "secsnapact: on=%d key=%d selfcheck=%d objs=%zu bytesPerNode=%zu nodes=%zu "
                      "cpPeak=%lld captures=%lld restores=%lld capUs=%.0f restUs=%.0f "
-                     "p1Objs=%d p2Objs=%d sigs=%zu",
+                     "p1Objs=%d p2Objs=%d sigs=%zu decos=%zu decoUsed=%d decoEver=%d",
                      psnap::g_snapAct ? 1 : 0, psnap::g_actKey ? 1 : 0, actSelfCheck,
                      psnap::g_actObjs.size(), psnap::g_actObjs.size(),
                      acts.size(), cpPeak, psnap::g_actCaptures, psnap::g_actRestores,
                      psnap::g_actCapUs, psnap::g_actRestUs, psnap::actSeenCount(1),
-                     psnap::actSeenCount(2), actSigSeen.size());
+                     psnap::actSeenCount(2), actSigSeen.size(), psnap::g_actDecos.size(),
+                     psnap::actDecosUsed(), psnap::actDecosEver());
             writeResult(ab);
             snprintf(ab, sizeof(ab), "secorigin: checks=%lld used=%lld lost=%lld", originChecks,
                      originUsed, originLost);
@@ -4408,6 +5294,19 @@ class $modify(GJBaseGameLayer) {
                      coinMissBranches, took, coinBits[0], lb, secsolve::g_rungCoin, coinLessLeaves);
             writeResult(kb);
         }
+        if (secsolve::g_psnapLied) {
+            char lb[256];
+            snprintf(lb, sizeof(lb), "secsolve: the plan's own branch died at t=%lld on the player "
+                     "snapshot, where the game flew it to t=%lld - the snapshot parts from the game in "
+                     "this window (secsolve::g_spineUntil)%s",
+                     secsolve::g_spineLostT, secsolve::g_spineUntil,
+                     foundLeaf >= 0 ? "; what it found was replayed from the head" : "");
+            writeResult(lb);
+        }
+        if (secsolve::g_keepP1Size >= 0)
+            writeResult("secsolve: kept player 1 " + std::string(secsolve::g_keepP1Size ? "mini" : "normal")
+                        + " - " + std::to_string(secsolve::g_keepDropped)
+                        + " branches that changed its size dropped (cfg seckeepsize)");
         if (g_boundOn) {
             char bb[200];
             snprintf(bb, sizeof(bb), "secsolve: bound x %.0f..%.0f y %.0f..%.0f - %lld section "
@@ -4421,6 +5320,16 @@ class $modify(GJBaseGameLayer) {
                      g_shaderSkips);
             writeResult(hb);
         }
+        {
+            char fb[160];
+            snprintf(fb, sizeof(fb), "secsolve: frames=%lld between slices %.0f ms (outside the update %.0f ms, overlays %.0f ms)",
+                     g_frames, g_frameGapMs, g_outsideMs, g_overlayMs);
+            writeResult(fb);
+        }
+        if (g_shaderSig) {
+            writeResult("shadersig: search end " + shaderSig(this));
+            g_shaderSigPending = true;
+        }
         {   // print only: the per-node vectors' own footprint at the end of the search (every
             // node ever made keeps its element), the nodes still holding a game state, and the
             // process's working set
@@ -4429,7 +5338,7 @@ class $modify(GJBaseGameLayer) {
             for (const auto& v : acts) actBytes += v.capacity();
             const double elemsMB =
                 (double)(states.capacity() * sizeof(states[0]) + touches.capacity() * sizeof(touches[0])
-                         + pulses.capacity() * sizeof(gd::vector<PulseEffectAction>)
+                         + pulses.capacity() * sizeof(psnap::EMSnap)
                          + (snaps.capacity() + acts.capacity() + worlds.capacity())
                                * sizeof(std::vector<uint8_t>)) / (1024.0 * 1024.0);
             size_t curMB = 0, peakMB = 0;
@@ -4471,6 +5380,13 @@ class $modify(GJBaseGameLayer) {
         // other, so the loop's invariant ("the prefix GD replayed is true") holds.
         if (g_secRung) {
             g_secRung = false;
+            // cfg dpsecstate: the probe's answer is a verdict, not a plan (repair.hpp stateFire).
+            const int stateKind = g_secState;
+            g_secState = 0;
+            if (stateKind) {
+                secsolve::g_forceP1Size = -1;
+                secsolve::g_keepP1Size = -1;
+            }
             secsolve::g_on = false;
             secsolve::g_rungCoin = -1;
             if (unverLeaves > 0)
@@ -4481,7 +5397,7 @@ class $modify(GJBaseGameLayer) {
             g_cfg.fastloops = g_secSaveFastloops;
             g_cfg.maxAttempts = g_secSaveMaxAttempts;
             secsolve::g_targetDepth = g_secSaveTargetDepth;
-            if (foundLeaf >= 0) {
+            if (foundLeaf >= 0 && stateKind != 1) {
                 // The input at depth d is the plain run's at tick ckptTick + d (the
                 // measured pairing quoted at the verdict line above).
                 const std::vector<uint8_t> seq = secsolve::inputVecOf(foundLeaf);
@@ -4503,7 +5419,9 @@ class $modify(GJBaseGameLayer) {
                 // is, and its death keeps that plan's walk as the rejoin target (g_rjKeepTarget):
                 // the next search, from the game's own state, comes back onto the plan where it
                 // can and keeps its inputs from there.
-                if (g_cfg.dpSecReuse) {
+                // (Not after a kept window of cfg dpsecstate: the rest of that plan is the size the
+                // probe showed the wall will not let through.)
+                if (g_cfg.dpSecReuse && stateKind != 2) {
                     dpsolve::g_rjKeepTarget = true;
                     writeResult("secrung: the rest of the plan stays the rejoin target of the "
                                 "search after the splice");
@@ -4532,6 +5450,9 @@ class $modify(GJBaseGameLayer) {
                 // crossing back to the model. If the spliced plan turns out to die before
                 // the wall, every rung is pinned out and runLadder drops the pin.
                 g_secPin = std::max(base + (long long)seq.size(), g_secPinWall);
+                if (stateKind == 2)   // cfg dpsecstate: the splice is the way on now
+                    dpsolve::stateAdopt(plan, base + (long long)seq.size(),
+                                        g_nodes[(size_t)foundLeaf].x);
                 char rb[224];
                 snprintf(rb, sizeof(rb),
                          "secrung: spliced %zu ticks from t=%lld (%zu inputs now), pinned at "
@@ -4542,8 +5463,11 @@ class $modify(GJBaseGameLayer) {
                 // The handoff installed the deepest plan (g_best) to replay to the section head;
                 // that is what GD flies next, so it is the loop's plan too (see g_plan above).
                 dpsolve::g_plan = g_cfg.inputs;
-                writeResult("secrung: the search found nothing - the loop carries on from the "
-                            "deepest plan");
+                writeResult(stateKind == 1
+                                ? std::string("secrung: the probe ") + (foundLeaf >= 0 ? "crossed" : "did not cross")
+                                      + " - a verdict, nothing is spliced; the loop carries on from the deepest plan"
+                                : std::string("secrung: the search found nothing - the loop carries on from the "
+                                              "deepest plan"));
             }
             // The section head is a one-shot of the SESSION: practice mode goes on once and the
             // checkpoint is placed once (resetSessionState clears both), and the one-way handoff
@@ -4551,16 +5475,83 @@ class $modify(GJBaseGameLayer) {
             // its own checkpoint and search from this one's head. Measured (lv4003, old model):
             // a rung fired at t=7700 searched from x=3,836, the first rung's head at t=5184.
             // cfg dpsecrent: what this rung cost, counted (see kWorkSecStep) -- taken while the
-            // head tick is still known; the next round starts.
-            dpsolve::autoRungDone(g_ckptTick, steps, secsolve::g_snapOn);
+            // head tick is still known; the next round starts. (cfg dpseccaptiers: whether a
+            // larger cap could search this window differently -- only if this search's cap
+            // dropped something and was the cap it was asked for, not the checkpoint path's
+            // clamp above, which a larger request would meet the same way.)
+            // (The probe and the kept windows of cfg dpsecstate run their own cap tiers, so they
+            // never ask for the last window again at a larger cap; an ordinary window that only
+            // keeps the run's size -- kind 3 -- is an ordinary window.)
+            const bool ownTiers = stateKind == 1 || stateKind == 2;
+            // A snapshot search that found nothing after its spine died before its plan did
+            // (secsolve::g_spineUntil) is asked again at once on checkpoints -- the same window, the
+            // same try: the ladder counts the checkpoint search's answer, not this one's.
+            // cfg secredoreach: not when the snapshot search reached the plan's verified death anyway
+            // -- its deepest live layer (ckptTick + deepest) at or past the tick the game flew the plan
+            // to. The snapshot's lie then did not stop the search short of the wall the game met. The
+            // re-ask that found the crossing (level 22's switch band) had its snapshot search dead at
+            // t=2,552 against a death at t=2,938; in the cold logs of 09-29/30, 17 of 21 re-asks had
+            // reached the death (level 21's wall at t=11,273 in every run: reach 11,276; a dual custom
+            // level: 823 against 788), and every one of those checkpoint searches came back
+            // EXHAUSTED, after 43-388 s.
+            const long long snapReach = (long long)g_ckptTick + deepest;
+            const bool reachedDeath = g_cfg.secRedoReach && secsolve::g_spineUntil > 0
+                                      && snapReach >= secsolve::g_spineUntil - secsolve::kSpineSlack;
+            const bool redoCp = secsolve::g_psnapLied && foundLeaf < 0 && stateKind == 0
+                                && g_secLastReq.start >= 0 && !reachedDeath && g_cfg.secCpFallback;
+            if (secsolve::g_psnapLied && foundLeaf < 0 && stateKind == 0 && reachedDeath)
+                writeResult("secrung: not asked again on checkpoints - the snapshot search lived to t="
+                            + std::to_string(snapReach) + " against the plan's verified death at t="
+                            + std::to_string(secsolve::g_spineUntil) + " (cfg secredoreach)");
+            else if (secsolve::g_psnapLied && foundLeaf < 0 && stateKind == 0 && !g_cfg.secCpFallback)
+                writeResult("secrung: not asked again on checkpoints (cfg seccpfallback=0) - the loop "
+                            "carries on from the deepest plan");
+            if (redoCp) {
+                g_secReqStart = g_secLastReq.start;
+                g_secReqTarget = g_secLastReq.target;
+                g_secReqDepth = g_secLastReq.depth;
+                g_secReqHorizon = g_secLastReq.horizon;
+                g_secReqCap = g_secLastReq.cap;
+                g_secReqCoin = -1;       // a coin wall's rung is never checked this way
+                g_secReqRung = true;
+                g_secReqForceCp = true;
+                g_secReqPending = true;
+                writeResult("secrung: asking the same window again on checkpoints");
+            } else {
+                // (A checkpoint redo that found nothing is not searched again at a larger cap:
+                // the ladder goes to its next window, further back -- on that level of 22 the
+                // cap-200 retry of the same window only spent the time the run had left.)
+                const bool cpRedo = g_secCpRedo;
+                dpsolve::autoRungDone(g_ckptTick, steps, secsolve::g_snapOn,
+                                      ownTiers ? true : foundLeaf >= 0,
+                                      !ownTiers && !cpRedo && capTotal > 0
+                                          && (g_secReqCap <= 0
+                                              || secsolve::g_cap >= (size_t)g_secReqCap));
+                if (ownTiers) dpsolve::stateRungDone(stateKind, foundLeaf >= 0);
+            }
+            g_secCpRedo = false;
             if (g_ckpt) { g_ckpt->release(); g_ckpt = nullptr; }
             g_ckptTick = -1;
             g_headHeld = 0;
             g_practiceOn = false;
             dpsolve::g_stop = false;     // the loop may spawn solves again
-            g_paused = false;
+            g_paused = redoCp;           // ...unless the redo is queued: held until it is taken
             g_forceCleanStart = true;    // drop the search's practice mode and checkpoints
             g_hudPhase = "secrung: replaying the spliced plan";
+            // cfg secbookfirst: the coin books go back to the searched attempt's HERE, before the
+            // reset below starts the next attempt. Left to coinBook's destructor, they went back
+            // at co_return -- after resetLevel had already started that attempt and cleared them
+            // (hooks_playlayer), or a checkpoint flight had spliced its own (cp_flight) -- so the
+            // new attempt began with the old one's: its item counter, its coin pickup ticks, its
+            // coinlive latches. GD's counter is 0 at an attempt's head (nothing announces the
+            // reset: updateCounters is called only by item triggers), so every row up to the first
+            // press carried the old count. SubZero 4003: the flight after a rung whose prefix had
+            // pressed three times recorded item 1 = 3 from t=0, and anchors at t=6,612..13,212
+            // passed --itembase 1:3 where GD held 0 (the next press there reads itemcnt v=1).
+            if (secsolve::g_bookFirst) {
+                coinBook.restore();
+                coinBook.armed = false;
+            }
             if (auto* pl = PlayLayer::get()) pl->resetLevel();
             // ...and only then the screen and the visibility pass (secRenderHold).
             secRenderRelease();
@@ -4580,6 +5571,13 @@ class $modify(GJBaseGameLayer) {
         // While the section solver is running, it holds the button one tick at a time.
         // The plan's input feed is stopped (a restore resets g_tick and g_nextInput to 0,
         // so mixing them would replay the plan again from the section head).
+        // The input cursor as this attempt's first tick on the active layer finds it, whatever
+        // else has run since the attempt's reset (see g_nextInputAtStart).
+        if (!g_attemptFed && !secsolve::g_active
+            && static_cast<GJBaseGameLayer*>(PlayLayer::get()) == this) {
+            g_attemptFed = true;
+            g_nextInputAtStart = g_nextInput;
+        }
         if (secsolve::g_active) {
             if (secsolve::g_feed != secsolve::g_held) {
                 g_injecting = true;
@@ -4587,7 +5585,18 @@ class $modify(GJBaseGameLayer) {
                 g_injecting = false;
                 secsolve::g_held = secsolve::g_feed;
             }
-        } else if (g_started && !g_sessionOver) {
+        // Only the active PlayLayer is fed, as only it advances g_tick (below). A level swapped
+        // in (level_slice.hpp) is built and reset while the layer it replaces still runs the rest
+        // of its frame, and those updates took the carried plan's inputs up to g_tick from the
+        // cursor the new layer's reset had just set to 0: the new layer's first attempt then
+        // started past the press at t=0. (The first swap carries no plan yet, so nothing was
+        // taken there.) Measured on a custom level that starts as a ship: the copy's deepest plan,
+        // flown on the level itself for a wall check, stayed on the ground from t=2 and died at
+        // t=88, where the same plan had flown to t=27,528 on the copy and on the level itself --
+        // a false parting at t=2 that put objects back around x=1. Fed only here, the flight
+        // matched the copy's attempt tick for tick and died at t=27,528 the same way.
+        } else if (g_started && !g_sessionOver
+                   && static_cast<GJBaseGameLayer*>(PlayLayer::get()) == this) {
             while (g_nextInput < g_cfg.inputs.size()
                    && g_cfg.inputs[g_nextInput].step <= g_tick) {
                 auto& in = g_cfg.inputs[g_nextInput];
@@ -4687,8 +5696,8 @@ class $modify(GJBaseGameLayer) {
                      m_player1->m_isOnGround ? 1 : 0, secsolve::g_held,
                      m_player1->getPositionX(), m_player1->m_playerSpeed,
                      m_player1->m_isGoingLeft ? 1 : 0, m_player1->m_isSideways ? 1 : 0,
-                     m_player1->m_isPlatformer ? 1 : 0, lb[0x418] ? 1 : 0,
-                     *reinterpret_cast<const float*>(lb + 0x41c), (double)dt);
+                     m_player1->m_isPlatformer ? 1 : 0, lb[gdoff::kLayerUnkBool10] ? 1 : 0,
+                     *reinterpret_cast<const float*>(lb + gdoff::kLayerLevelFlipping), (double)dt);
             writeResult(rb);
         }
         // Keep what this pass does over each snapshot's
@@ -4825,12 +5834,12 @@ class $modify(GJBaseGameLayer) {
                     // measurement. The magnitude is closed, so only these 3 signs remain.
                     // Their names cannot be pulled from bindings, so emit raw bytes.
                     const char* pb = reinterpret_cast<const char*>(m_player1);
-                    const int f1 = (int)(unsigned char)pb[0x9bf];
-                    const int f2 = (int)(unsigned char)pb[0x9c2];
-                    const int f3 = (int)(unsigned char)pb[0x9c3];
+                    const int f1 = (int)(unsigned char)pb[gdoff::kPlayerUpsideDown];
+                    const int f2 = (int)(unsigned char)pb[gdoff::kPlayerGoingLeft];
+                    const int f3 = (int)(unsigned char)pb[gdoff::kPlayerSideways];
                     float rmul = 0.f, rspd = 0.f;
-                    std::memcpy(&rmul, pb + 0xb84, sizeof(float));
-                    std::memcpy(&rspd, pb + 0x720, sizeof(float));
+                    std::memcpy(&rmul, pb + gdoff::kPlayerGravityMod, sizeof(float));
+                    std::memcpy(&rspd, pb + gdoff::kPlayerRotationSpeed, sizeof(float));
                     char b[512];
                     snprintf(b, sizeof(b),
                         "pobb: t=%lld size=%.3f rot=%.3f "
@@ -4861,7 +5870,8 @@ class $modify(GJBaseGameLayer) {
             && (g_cfg.hbTo == 0 || g_tick <= g_cfg.hbTo)) {
             const char* pb = reinterpret_cast<const char*>(m_player1);
             // 0x600-0xa20 in chunks of 0x80 bytes (384 characters per line)
-            for (int base = 0x600; base < 0xa20; base += 0x80) {
+            for (int base = (int)gdoff::kPlayerFlagsDumpBegin;
+                 base < (int)gdoff::kPlayerFlagsDumpEnd; base += 0x80) {
                 char b[600];
                 int n = snprintf(b, sizeof(b), "pflags: t=%lld o=%03x",
                                  (long long)g_tick, base);
@@ -4893,11 +5903,11 @@ class $modify(GJBaseGameLayer) {
             // t=1,469 and is never updated, so the teleport target surface can only be
             // named by this raw field. 0x960/0x968 are the candidates' min/max.
             GameObject* tg =
-                *reinterpret_cast<GameObject**>((char*)p + 0x5e8);
+                *reinterpret_cast<GameObject**>((char*)p + gdoff::kPlayerCurrentSlope2);
             const double tgLo =
-                *reinterpret_cast<double*>((char*)p + 0x960);
+                *reinterpret_cast<double*>((char*)p + gdoff::kPlayerCollidedBottomMaxY);
             const double tgHi =
-                *reinterpret_cast<double*>((char*)p + 0x968);
+                *reinterpret_cast<double*>((char*)p + gdoff::kPlayerCollidedLeftMaxX);
             const int snId = sn ? sn->m_uniqueID : -1;
             const int slId = sl ? sl->m_uniqueID : -1;
             const int tgId = tg ? tg->m_uniqueID : -1;
@@ -5187,8 +6197,11 @@ class $modify(GJBaseGameLayer) {
         // run) swallows its deaths and legitimately runs the whole level and beyond --
         // the overlong guard was killing it at 40k ticks forever, and the session never
         // got past attempt one.
+        // !secsolve::g_active: a section search's steps are not the attempt's ticks. They count
+        // on in g_tick, and on a custom level's last search (head t=27,072) the overlong guard
+        // fired at 40,001 inside it and killed whichever branch was being stepped.
         if (g_started && !g_sessionOver && m_player1 && !m_player1->m_isDead
-            && !g_cfg.noDeath) {
+            && !g_cfg.noDeath && !secsolve::g_active) {
             static float s_stallX = 0.f, s_stallY = 0.f;
             static long long s_stallSince = -1;
             // The END-ZONE pin is not a stall: GD locks the player at the end wall
@@ -5461,7 +6474,8 @@ class $modify(GJBaseGameLayer) {
             && !dpsolve::g_recordAttempt && !dpsolve::g_running.load() && !secsolve::g_active
             && !secsolve::g_on && dpsolve::g_planClaimsGoal) {
             const int ch =
-                *reinterpret_cast<int const*>(reinterpret_cast<char const*>(this) + 0x33c);
+                *reinterpret_cast<int const*>(reinterpret_cast<char const*>(this)
+                                               + gdoff::kLayerCurrentChannel);
             const double wx = m_player1->getPositionX(), wy = m_player1->getPositionY();
             for (const solver::CoinGate& g : solver::g_coinGates) {
                 if (ch != g.chan) continue;
@@ -5569,7 +6583,7 @@ class $modify(GJBaseGameLayer) {
         // of lines per attempt; not gated on dpsolve so a plain replay shows it.
         if (g_started && !g_sessionOver) {
             const float mp = *reinterpret_cast<float const*>(
-                reinterpret_cast<char const*>(this) + 0x36a8);
+                reinterpret_cast<char const*>(this) + gdoff::kLayerMaxGameplayY);
             static float mpLast = -1.f;
             if (std::fabs(mp - mpLast) > 0.5f) {
                 mpLast = mp;
@@ -5643,7 +6657,7 @@ class $modify(GJBaseGameLayer) {
                    // (= height 300 divided by 0.92593 and 0.74074). Read by raw offset
                    // because bindings has no name for it
                    << ',' << *reinterpret_cast<const float*>(
-                                 reinterpret_cast<const char*>(this) + 0x1a8)
+                                 reinterpret_cast<const char*>(this) + gdoff::kLayerCameraZoom)
                    // gframe: current rotation (0/1/2/3 = 0/90/180/270).
                    // Needed for re-anchoring. Starting with --start inside a rotated
                    // gameplay section, the model has no way to know which orientation it
@@ -5738,14 +6752,19 @@ class $modify(GJBaseGameLayer) {
                    // The size check is the layout check: MSVC's unordered_map is
                    // 0x40 bytes, which is exactly the distance between the two.
                    << ',' << [this]() {
-                          static_assert(sizeof(std::unordered_map<int, int>) == 0x40);
-                          static_assert(sizeof(std::unordered_map<int, bool>) == 0x40);
+                          // gd::unordered_map is std::unordered_map on Windows and GD's
+                          // GNU-STL layout on Android (0x38 bytes there).
+                          static_assert(sizeof(gd::unordered_map<int, int>)
+                                        == gdoff::kLayerSpawnChannel1 - gdoff::kLayerSpawnChannel0);
+                          static_assert(sizeof(gd::unordered_map<int, bool>)
+                                        == gdoff::kLayerSpawnChannel1 - gdoff::kLayerSpawnChannel0);
                           auto const* base = reinterpret_cast<char const*>(this);
-                          const int ch = *reinterpret_cast<int const*>(base + 0x33c);
-                          auto const& idx = *reinterpret_cast<
-                              std::unordered_map<int, int> const*>(base + 0x348);
-                          auto const& rev = *reinterpret_cast<
-                              std::unordered_map<int, bool> const*>(base + 0x388);
+                          const int ch =
+                              *reinterpret_cast<int const*>(base + gdoff::kLayerCurrentChannel);
+                          auto const& idx = *reinterpret_cast<gd::unordered_map<int, int> const*>(
+                              base + gdoff::kLayerSpawnChannel0);
+                          auto const& rev = *reinterpret_cast<gd::unordered_map<int, bool> const*>(
+                              base + gdoff::kLayerSpawnChannel1);
                           auto const i = idx.find(ch);
                           auto const r = rev.find(ch);
                           return std::to_string(ch) + ','
@@ -5782,7 +6801,7 @@ class $modify(GJBaseGameLayer) {
                           for (auto const& [uid, o] : objs) {
                               if (!s.empty()) s += '|';
                               s += std::to_string(uid) + ':' + std::to_string(
-                                  o ? (int)*(reinterpret_cast<uint8_t const*>(o) + 0x28e) : -1);
+                                  o ? (int)*(reinterpret_cast<uint8_t const*>(o) + gdoff::kObjGroupDisabled) : -1);
                           }
                           return s;
                       }()
@@ -5799,17 +6818,23 @@ class $modify(GJBaseGameLayer) {
                    // portal band off the grid (SubZero 4003's spider band 1354.5/1651.5 is
                    // 270 / 0.9091 high). Read by raw offset; bindings name none of the three.
                    << ',' << *reinterpret_cast<const float*>(
-                                 reinterpret_cast<const char*>(this) + 0x23c)
-                   << ',' << (int)*(reinterpret_cast<const uint8_t*>(this) + 0x2a0)
+                                 reinterpret_cast<const char*>(this) + gdoff::kLayerUnkPoint17Y)
+                   << ',' << (int)*(reinterpret_cast<const uint8_t*>(this) + gdoff::kLayerUnkBool1)
                    << ',' << *reinterpret_cast<const float*>(
-                                 reinterpret_cast<const char*>(this) + 0x1b4)
+                                 reinterpret_cast<const char*>(this) + gdoff::kLayerCameraOffsetY)
                    // freemode/bandforce: the two layer bytes checkCollisions reads before it
                    // clamps at all (0x2139b8). [+0x311] set = no band clamp for any mode;
                    // it is the Free Mode byte (property 111) that playerWillSwitchMode
                    // (0x212ef0) copies from each mode portal it takes. [+0x422] set = clamp
                    // even outside the six flying modes. Read by raw offset.
-                   << ',' << (int)*(reinterpret_cast<const uint8_t*>(this) + 0x311)
-                   << ',' << (int)*(reinterpret_cast<const uint8_t*>(this) + 0x422)
+                   << ',' << (int)*(reinterpret_cast<const uint8_t*>(this) + gdoff::kLayerFreeMode)
+                   << ',' << (int)*(reinterpret_cast<const uint8_t*>(this) + gdoff::kLayerDualMode)
+                   // p2rot: the SECOND body's sprite angle. `rot` has only ever been p1's, and a
+                   // turned object's test reads the body's own angle -- for a mirrored UFO pair,
+                   // the negative of p1's -- so the second body's portal and hazard timing could
+                   // not be checked against anything. Appended at the END like every column
+                   // since p2ground2: readers index the earlier ones by position.
+                   << ',' << (m_player2 ? m_player2->getRotation() : 0.f)
                    << '\n';
         }
     }
@@ -5902,7 +6927,7 @@ class $modify(GJBaseGameLayer) {
     // a removed object is marked out, so a second removal is GD's own no-op.
     void removeObjectFromSection(GameObject* object) {
         GJBaseGameLayer::removeObjectFromSection(object);
-        static_assert(offsetof(GameObject, m_outerSectionIndex) == 0x278,
+        static_assert(offsetof(GameObject, m_outerSectionIndex) == gdoff::kObjOuterSectionIndex,
                       "the index removeObjectFromSection tests on entry");
         if (secsolve::g_on && object) object->m_outerSectionIndex = -1;
     }
@@ -5911,6 +6936,23 @@ class $modify(GJBaseGameLayer) {
     // keeps the section it had. Only the re-bucketing is skipped; the object's position is
     // whatever the game made it.
     void updateObjectSection(GameObject* object) {
+        if (secsolve::g_active && object
+            && !(std::isfinite(object->m_positionX) && std::isfinite(object->m_positionY)
+                 && std::fabs(object->m_positionX) < secsolve::kPosLimit
+                 && std::fabs(object->m_positionY) < secsolve::kPosLimit)) {
+            if (secsolve::g_nonFinite++ == 0) {
+                secsolve::g_nonFiniteUid = object->m_uniqueID;
+                secsolve::g_nonFiniteId = object->m_objectID;
+                secsolve::g_nonFiniteX = object->m_positionX;
+                secsolve::g_nonFiniteY = object->m_positionY;
+#ifdef GEODE_IS_WINDOWS
+                // who asked for the re-bucketing (the caller in the game is the frame after this one)
+                postmortem::emit("secnan: an object at a non-finite position handed to re-bucketing");
+                postmortem::writeBacktrace("secnan:");
+#endif
+            }
+            return;
+        }
         if (secsolve::g_active && secsolve::g_boundOn && object
             && (object->m_positionX < secsolve::g_boxX0 || object->m_positionX > secsolve::g_boxX1
                 || object->m_positionY < secsolve::g_boxY0

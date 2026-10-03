@@ -88,6 +88,19 @@ constexpr float COIN_RADIUS = 20.f;
 // column was added nothing had ever checked it against GD. A coin route is
 // built on that claim, so it has to become a measurement first.
 inline std::vector<long long> g_coinGdTick;
+// The coins this attempt has, by either witness (the HUD's count: GD's call, or our own pickup
+// test -- see hud.hpp), and the most any attempt of this level has had. Display only: nothing in
+// the loop reads it. Updated when an attempt's record is cleared (hooks_playlayer.cpp) and zeroed
+// with the level's coin list (buildPois).
+inline size_t coinsThisAttempt() {
+    size_t got = 0;
+    for (size_t i = 0; i < g_coins.size(); ++i)
+        if ((i < g_coinGdTick.size() && g_coinGdTick[i] >= 0)
+            || (i < g_coinPickupTick.size() && g_coinPickupTick[i] >= 0))
+            ++got;
+    return got;
+}
+inline size_t g_coinBest = 0;
 // pickupItem calls that matched no row in g_coins. GD collects unique ITEMS
 // through the same call, so a non-zero count is information rather than an
 // error: it counts the collectibles the coin list does not know about (lv21's
@@ -518,7 +531,7 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
            << "," << forceOf(obj)
            << "," << freem << "," << touch << "," << spawn << "," << chan
            << "," << axis << "," << exstat << "," << rev
-           << "," << (int)(unsigned char)reinterpret_cast<const char*>(obj)[0x515]
+           << "," << (int)(unsigned char)reinterpret_cast<const char*>(obj)[gdoff::kObjPassable]
            << "\n";
     }
 }
@@ -613,6 +626,7 @@ inline void buildPois(GJBaseGameLayer* l) {
     });
     g_coinPickupTick.assign(g_coins.size(), -1);
     g_coinGdTick.assign(g_coins.size(), -1);
+    g_coinBest = 0;
     g_coinGdUnmatched = 0;
     // g_coinMoveX: the coins' groups, then every Move (901) that is not spawn-fired and targets one.
     g_coinMoveX.assign(g_coins.size(), -1e9f);
@@ -890,7 +904,13 @@ inline void buildPois(GJBaseGameLayer* l) {
               //   this corpus already has.
               "remap,item,item2,count,subcount,actgrp,thold,ttog,tdual,cmode,"
               "i1mode,i2mode,tgtmode,mod1,mod2,res1,res2,res3,tol,rnd1,rnd2,"
-              "sgn1,sgn2\n";
+              "sgn1,sgn2,"
+              //   sponly:     a toggle ring's (1594, RingObject) m_isSpawnOnly
+              //               (property 504): PlayerObject::ringJump SPAWNS its target
+              //               group instead of toggling it (the second slot of the
+              //               layer's +0x198 handler, taken when ring+0x741 is set).
+              //               0 on everything that is not a RingObject.
+              "sponly\n";
         // uid → groups it belongs to. One object can belong to several groups,
         // so the mapping is many-to-many
         std::ofstream gf(std::string(DATA_DIR) + "/objgroups.txt", std::ios::trunc);
@@ -1041,9 +1061,11 @@ inline void buildPois(GJBaseGameLayer* l) {
                        << it->m_resultType2 << "," << it->m_resultType3 << ","
                        << it->m_tolerance << "," << it->m_roundType1 << ","
                        << it->m_roundType2 << "," << it->m_signType1 << ","
-                       << it->m_signType2 << "\n";
+                       << it->m_signType2;
                 else
-                    tf << ",-1,-1,-1,0,0,-1,-1,-1,0,-1,-1,-1,-1\n";
+                    tf << ",-1,-1,-1,0,0,-1,-1,-1,0,-1,-1,-1,-1";
+                auto* ring = geode::cast::typeinfo_cast<RingObject*>(obj);
+                tf << "," << ((ring && ring->m_isSpawnOnly) ? 1 : 0) << "\n";
             }
             ++nTrig;
         }

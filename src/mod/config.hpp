@@ -48,8 +48,28 @@ inline std::string workerTag() {
 
 inline void updateWindowTitle();   // the definition comes after the g_cfg / g_started declarations
 
+// Set once a snapshot has written a player's bytes back (solver/psnap.hpp restorePlayer): the
+// mode flags (m_isShip, m_isRobot, ...) then hold the snapshot's while the mode sprites stay as
+// they were -- the mode toggles that show and hide them are never called -- and GD's own toggles
+// act only on a flag that changes, so a later reset leaves several modes drawn at once. Here, ahead
+// of both, because psnap.hpp and repair.hpp (tidyPlayerModes) read it.
+inline bool g_psnapPlayerWritten = false;
+
 struct InputCmd { int step; bool down; };
 struct ToggleCmd { int step; std::string mode; };
+
+// The glitch-avoid mode's margins when it is simply switched on (the play menu, `glitchavoid=1`),
+// each from an official solution the user named as a glitch: lv22's early dash release passes a
+// 1x portal 12.3 px clear, and lv17's wave threads 0-4 px over a row of spikes.
+// The ship's is NOT from a glitch but from what the level asks for: lv1's third coin lies behind a
+// slot exactly as tall as the ship (a step's top at 480, the ceiling at 510), and the coin route
+// flies it 11.4 px into the step; over the whole coin solution the ship's box sinks 5.6-12.1 px
+// into a block at eleven places, every one of them ordinary flying. At 3 px the mode forbade the
+// coin (lv1 coins on, 2/3 on every clear). 14 is the user's choice: above 12.1, under the half
+// (15) that the half-sunk ride reaches.
+constexpr double kGlitchPortalDefault = 15.0;
+constexpr double kGlitchWaveDefault = 5.0;
+constexpr double kGlitchEmbedDefault = 14.0;
 
 struct Config {
     bool enabled = false;
@@ -148,6 +168,12 @@ struct Config {
     // cfg `dpoffboardkill` (off): pass the loop's playfield bound to the search (--offboard). It
     // closes an off-board stall the default route does not reach, and costs lv22 34 s on it.
     bool dpOffBoardKill = false;
+    // cfg `offboardtp` (on by default since 2026-10; 0 = off): the loop's off-board credit
+    // (repair.hpp offBoardTick) disarms on a teleport (a one-tick |dy| over kOffBoardTpDy) and
+    // re-arms once the player is back inside GD's band -- lv22 with coins teleports a spider to y
+    // 3,210 while the band stays 90/414 for 112 ticks, and the credit fired at the teleport while
+    // GD flew on (see offBoardTick).
+    bool offBoardTp = true;
     // cfg `dpadaptivehorizon` (needs dpstephorizon): choose the next plan length from where the
     // game ended the last one. Killed within the step of its anchor = the model is wrong here, plan
     // the step; alive past it = the model is right here, plan the level. Always on since the flag clean-up.
@@ -179,23 +205,17 @@ struct Config {
     // at the same tick at 40,000). The tiers did carry SubZero 4003 and two custom levels to the
     // end in runs without a section solve -- which is what an A/B with this off has to answer.
     int dpCapTiers = 1;
-    // cfg `dpsectierfirst=1` (0 = off, the default): when the ladder finds no anchor, the wall goes
-    // to a section solve before the capacity is raised (escalate() in repair.hpp) -- one window per
-    // escalation, each further back, as autoFire draws them -- and only a wall none of those
-    // windows crossed goes on to the next tier. The user's order (2026-09-26): a full frontier is
-    // usually a divergence, so the game's own search goes first, and more states only after it.
-    int dpSecTierFirst = 0;
+    // cfg `dpsectierfirst` (on by default since 2026-10; 0 = off): when the ladder finds no anchor,
+    // the wall goes to a section solve before the capacity is raised (escalate() in repair.hpp) --
+    // one window per escalation, each further back, as autoFire draws them -- and only a wall none
+    // of those windows crossed goes on to the next tier. The user's order (2026-09-26): a full
+    // frontier is usually a divergence, so the game's own search goes first, and more states only
+    // after it.
+    int dpSecTierFirst = 1;
     // cfg `dpsecmaxback=N` (0 = no limit, the default): no section-solve window begins more than N
     // ticks before its wall (repair.hpp autoWindow, where the measurement is); a wall whose next
     // window would is done, and with dpsectierfirst the capacity tier comes next.
     int dpSecMaxBack = 0;
-    // cfg `dpwalkgates=1`: the single-trajectory walks fire the item gates the search's step does
-    // (dp --walkgates) -- the witness resim inside every search, and the fixup recorder's replay,
-    // which under coinroute also takes --coins and --items so it has the gate tables and the same
-    // item givers the search reads. Off: the replay stays as it was, with no coin arguments.
-    // ON BY DEFAULT (`dpwalkgates=0` turns it off). Without coinroute
-    // it only adds --walkgates, which dp now defaults to anyway and which is inert without --coins.
-    bool dpWalkGates = true;
     // cfg `coinmissrev=1` (off): the coinroute attempt cut (hooks_gamelayer.cpp) skips the coins
     // dp's search does not call missed when passed (Outcome::coinNoPrune -- something past them
     // turns the player round). Without it the cut ends the attempt on the way out past a coin the
@@ -221,6 +241,10 @@ struct Config {
     // (passing a coin says nothing there), so the refused clear is the only miss the loop hears --
     // and filed at the goal it sends the ladder thousands of ticks away from the coin.
     bool coinMissPost = true;    // ON BY DEFAULT with the SubZero coin set (0 = off)
+    // cfg `coinmissearly` (on by default since 2026-10; 0 = off; with coinmisspost and
+    // routeprereq): a coin whose box the attempt went past unopened is filed as missed at that
+    // attempt's death, without waiting for a refused clear (repair.hpp fileCoinMissEarly).
+    bool coinMissEarly = true;
     // cfg `coinoverdepth` (on; 0 = off; with coinmisspost): an attempt that has every coin the deepest
     // plan had, and has taken in the game a coin the deepest plan missed, is progress whatever tick
     // it died on. coinmisspost ranks the deepest plan at its closest approach to that coin, which is
@@ -235,19 +259,25 @@ struct Config {
     // attempt; the failing route passed it at 102 px at t=13,557 but was ranked at t~9,650, 1,336 px
     // away, where no repair reaches it -- and the route GD credited it to took it at t=13,707.
     bool coinApproachOff = true; // ON BY DEFAULT with the SubZero coin set (0 = off)
-    // cfg `routeprereq` (off; 1 = on; only a coin session builds the census): a coin that needs
-    // something entered first (solver/route.hpp: the
+    // cfg `coinapproachreach` (on by default since 2026-10; 0 = off; with coinapproachoff): among
+    // the passes made while the coin was off, the last one within pickup reach is ranked rather
+    // than the closest. lv22's third
+    // coin on the 1x route: passed at 1.9 px while off at t=12,055, and at 23.6 px at t=14,960 where
+    // the six presses that switch it on can already have happened (repair.hpp coinApproach).
+    bool coinApproachReach = true;
+    // cfg `routeprereq` (on by default since 2026-10; 0 = off; only a coin session builds the
+    // census): a coin that needs something entered first (solver/route.hpp: the
     // touch box, key or toggle block whose chain switches the coin, or a platform/orb near it, on)
     // is ranked, in an attempt that has not switched that on, at the attempt's closest approach to
     // the BOX rather than to the coin (coinmisspost's rank), and the search anchored before the box
     // is told to enter it (--needtrig-uid). SubZero 4002's second coin: its platforms come on only
     // from the key 4,314 px before it, and every repair went to the coin. Until a coin is engaged
     // (the fallback below) nothing reads the census, so the loop and the DP argv are the old ones.
-    // OFF BY DEFAULT: with the SubZero coin set on, SubZero 4001's coin-on cold took 33 rounds with
-    // it on and with it off (four runs, one last [fp]), and over the official 22 it never engaged
-    // either way. It stays for what the chain rig route2 shows: on, 9 rounds; off, no anchor past
-    // the second key.
-    bool routePrereq = false;
+    // It was off by default until 2026-10: with the SubZero coin set on, SubZero 4001's coin-on
+    // cold took 33 rounds with it on and with it off (four runs, one last [fp]), and over the
+    // official 22 it never engaged either way. It stays for what the chain rig route2 shows: on, 9
+    // rounds; off, no anchor past the second key.
+    bool routePrereq = true;
     // cfg `routeprereqafter=N` (10): ...and only for a coin the loop has not got by itself -- N
     // rounds after its miss was filed without GD crediting it, or when the ladder has run out of
     // anchors (escalate), whichever comes first. 0 = from the filing on. The model's own repairs at
@@ -279,12 +309,41 @@ struct Config {
                             // answer has to stay alive -- about the 70 px the measured
                             // windows ended past it, at normal speed
     int dpSecCap = 100;     // cfg `dpseccap`: the search's frontier cap
+    int dpSecCapTiers = 2;  // cfg `dpseccaptiers`: a window that found nothing, again at twice
+                            // the cap, up to this many times (repair.hpp autoCapRetry). 2 by
+                            // default since 2026-09-28: only a window whose search came back
+                            // empty with its cap binding is searched again, so a wall the base
+                            // cap crosses costs nothing more (0 = off).
+    // cfg `dpsecstate` (on by default since 2026-10; 0 = off; needs dpsecauto): a wall the first
+    // window and its cap tiers could not cross is asked whether player 1's size is what stops it --
+    // the same window, searched with the size the plan took at its last size portal undone -- and
+    // if so, the next windows begin before that portal and keep the other size (repair.hpp
+    // stateFire).
+    bool dpSecState = true;
     // cfg `dpsecchain` (on; 0 = off; needs dpsecauto): a wall right behind the pin -- the splice died
     // within kAutoCreep ticks of its end, which leaves the ladder nothing to plan with -- doubles
     // the next window's margin, and doubles it again for each such wall in a row (up to 8x).
     // Coin-off SubZero lv4001 with dpsecauto: 43 rungs, 30 of them 2-9 ticks past the last pin,
     // each window 254 deep and each advancing ~57 ticks -- 10,922 layers searched for 3,732 ticks.
     bool dpSecChain = true;
+    // cfg `secredoreach` (on by default since 2026-10; 0 = off): a snapshot search caught lying by
+    // its spine is not asked again on checkpoints when it reached the plan's verified death anyway
+    // (hooks_gamelayer, the rung's end).
+    bool secRedoReach = true;
+    // cfg `seccpfallback` (0 by default): a section search of the repair loop never runs on
+    // checkpoints -- not as the re-ask after a snapshot caught lying, nor when the snapshot does not
+    // qualify for the window; such a window is given back to the loop unsearched (hooks_gamelayer).
+    // `seccpfallback=1` brings both back (a diagnostic). Off by default since the release decision
+    // of 09-30: no section search at prim=cp over the official 22, coins off and on.
+    bool secCpFallback = false;
+    // cfg `secthrow=<length|alloc|both>@<depth>` (off; a measurement, never a default): the section
+    // search throws on purpose on the first step at that depth once the layer holds a child --
+    // std::length_error, std::bad_alloc, or (both) the first in the first search that gets there
+    // and the second in the next -- once per kind in the process. It is what shows the containment
+    // around the search's layers working: the game goes on, the search ends EXHAUSTED with
+    // stop=exception, and the rung gives the window back as a search that found nothing.
+    int secThrowKind = 0;    // 0 off, 1 length_error, 2 bad_alloc, 3 both
+    int secThrowDepth = 0;
     // cfg `dpsecchainspan`: how far past the pin (ticks) a wall still counts as right behind it.
     // 30 is the wall's own identity (kAutoCreep); on lv4003's wave, with the fitted prices and
     // the leaf from the middle, the walls came 10-90 ticks past each pin, so most links of a
@@ -299,16 +358,15 @@ struct Config {
     // 60 by default: 4003 762 -> 653 s (82 -> 77 rounds, rungs 53 -> 48, search 296 -> 213 s,
     // every rung still solved on its first try); 4001 and 4002 never have such a wall, [fp] identical.
     int dpSecPinBack = 60;
-    // cfg `dplearnresets` (-1 = no limit, the old behaviour): how many times one wall (one value of
-    // the best death) may send the ladder back to its shallowest rung because a round recorded
-    // fixups. On a custom level, x=29,779: a ship ring GD fires a tick before the model re-fired in the
-    // model after every re-anchor, so each round wrote one record one tick later and reset the
-    // ladder -- 13 rounds in a row, the backoff never past 96, while the route needed the anchor
-    // 105-119 ticks back (repair.hpp, the reset). 1 = the first lesson at a wall reopens it.
-    // Off by default (-1): the stall it was written for was not reproduced in a cold run, so
-    // there is no consumer yet whose wall is shown to be this reset repeating. On official lv16
-    // a cap of 1 took 21 rounds to 19, which alone does not justify changing the default.
-    int dpLearnResets = -1;
+    // cfg `dplearnresets` (1 by default since 2026-10; -1 = no limit, the old behaviour): how many
+    // times one wall (one value of the best death) may send the ladder back to its shallowest rung
+    // because a round recorded fixups. On a custom level, x=29,779: a ship ring GD fires a tick
+    // before the model re-fired in the model after every re-anchor, so each round wrote one record
+    // one tick later and reset the ladder -- 13 rounds in a row, the backoff never past 96, while
+    // the route needed the anchor 105-119 ticks back (repair.hpp, the reset). 1 = the first lesson
+    // at a wall reopens it. It was off (-1) until 2026-10: the stall it was written for was not
+    // reproduced in a cold run, and on official lv16 a cap of 1 took 21 rounds to 19.
+    int dpLearnResets = 1;
     // cfg `secdriftwhere=1` (diagnostic): at each psnap cross-check, print where the node that
     // drifted most first left its own ancestors (`secdrift:` line).
     bool secDriftWhere = false;
@@ -340,6 +398,11 @@ struct Config {
     // plans only what is left), one on 4002 16 s, and a rung about 17 s on either.
     bool dpSecRent = true;
     int dpSecRungPrior = 15;
+    // cfg `dpsecwallbudget=<s-equiv>` (0 = none): the section-solve work one wall episode may spend,
+    // in the rent's currency (1 = 1e6), counted from the rungs' replay ticks and search steps -- never
+    // a clock. Spent, the loop's further rungs there are refused and the fixup loop carries on
+    // (repair.hpp g_secEpisodeWork).
+    double dpSecWallBudget = 0.0;
     // cfg `dpseccoinrung` (on; 0 = off; with dpsecauto, under coinroute): the rung's wall is the COIN WALL --
     // the last cut for a coin, on the plan that was cut there -- until GD credits that coin, and the
     // search there must take it (repair.hpp g_coinWall). Off, the rung goes to
@@ -360,12 +423,33 @@ struct Config {
     // put objects back into the copy around where the two parted before the solve moves to the
     // level itself.
     int sliceAddBacks = 2;
+    // cfg `slicegiveupcopy` (on by default since 2026-10; 0 = off): when the loop gives up on the
+    // copy at a wall the level was flown to and shares (onVerifyDeath's "the level's own"), the
+    // solve goes on on a fresh copy with a full carry instead of on the level itself -- once per
+    // wall (levelslice::onGiveUp).
+    bool sliceGiveUpCopy = true;
     // cfg `slicecount=1`: print what the cut would remove and end the session without solving
     // (a census of levels against the threshold).
     bool sliceCount = false;
     // cfg `slicenoposition=1`: the cut drops the decorations kept for being read as a position
     // too -- wrong on purpose, to exercise the verification on the level and the add-back.
     bool sliceNoPosition = false;
+    // cfg `slicenotouch` (on by default since 2026-10; 0 = off): an id the game built both as a
+    // decoration and as one other type is decided per object by No Touch (key 121), so its
+    // decorations can be cut (slice.hpp).
+    bool sliceNoTouch = true;
+    // cfg `slicetriggers` (on by default since 2026-10; 0 = off): the cut drops the triggers that
+    // can only act on what the run cannot depend on -- movers outside the relevant groups and
+    // cosmetic triggers (slice.hpp).
+    bool sliceTriggers = true;
+    // cfg `sliceuids` (on; 0 = off): an object the cut leaves out is replaced in its place by a
+    // placeholder that takes the same uids, so the copy numbers its objects as the level does
+    // (slice.hpp "HOLDING THE UIDS"). Off removes it, which renumbers every object after it.
+    bool sliceUids = true;
+    // cfg `slicefirstref` (on by default since 2026-10; 0 = off): before a wall check's death is
+    // read as the cut's, the plan is flown on a fresh copy and the level's flight is compared with
+    // that first attempt instead of the copy's deepest attempt (level_slice.hpp onRefFlightEnd).
+    bool sliceFirstRef = true;
     // `dpseedplan=<path>`: skip the FIRST leveldp call and install this plan file instead, then
     // let the game verify it for real and search onward from wherever it actually lands. Empty
     // (the default) is a normal cold solve. See JobSeedPlan's note in repair.hpp for why this
@@ -389,6 +473,25 @@ struct Config {
     bool dpFixups = true;
     bool dpWorld = true;
     bool dpGroups = true;
+    // cfg `needpinrelease` (on; 0 = off): a needtrig box the anchor has already passed, which empties
+    // the frontier before tick 1, is released at once when a section-solve pin stands behind the
+    // anchor -- no rung can go back past the pin to enter it (repair.hpp runLadder).
+    bool needPinRelease = true;
+    // cfg `dpcoinwin=<yBin>,<vyBin>,<len>` (60,2,700 by default since 2026-10; 0 = off): dp
+    // --coinwin with coinroute, the alive cap's classes split by (y, vy) cell in the last <len> px
+    // before each coin a state still lacks, so a minority route to the coin is not thinned away (dp
+    // thread_pool.hpp g_coinWinY).
+    std::string dpCoinWin = "60,2,700";
+    // THE GLITCH-AVOID MODE, the user's choice on the play menu ("Avoid glitches", Solve only) or
+    // cfg `glitchavoid=1`; `glitchportal=<px>` / `glitchwave=<px>` set the two margins on their
+    // own. 0 = off, which is the default and what every cold runs with. Handed to the searches
+    // only (baseArgs), never to the fixup recorder's replay: the margins drop branches, they are
+    // not the game's physics, and a replay that "died" on one would teach the model a revive.
+    // What each margin drops is dp's thread_pool.hpp g_glitchPortal / g_glitchWave.
+    double glitchPortal = 0.0;
+    double glitchWave = 0.0;
+    double glitchEmbed = 0.0;   // cfg `glitchembed=<px>`: dp's g_glitchEmbed
+    bool glitchDeco = false;    // cfg `glitchdeco=1`: dp's --glitchdeco (hazard look-alikes)
     // cfg `dpfixp2`: let the SECOND BODY's transition error decide, on its own, that a dual
     // transition is worth a record -- see writeFixup's no-op test, which is where it acts.
     //
@@ -435,13 +538,11 @@ struct Config {
     // entry, strictest first (rotSeedFor in repair.hpp) -- and 4 = S, the game's own
     // consumption loop replayed over the recording (rotseed::seedSim). Refused, and named, when a
     // cfg `dparg=--rotqueue` already turns the queue on for every call.
-    // On by default (at A), paired with dpRotQToggle below: the queue
-    // without the toggle rule fires rotations the game only consumes (lv22 uid5809),
-    // so the two go on and off together. On by default (at S) too, with dpTouchSeedNow:
+    // On by default (at A), always with the toggle rule (--rotqtoggle on the anchored calls): the
+    // queue without it fires rotations the game only consumes (lv22 uid5809). On by default (at S) too, with dpTouchSeedNow:
     // on lv22 every anchored call's seed is derivable (122 of 122 against 46 of 157 at
     // A) -- derivable from S's rule, not independently checked in the game.
-    // `dprotseed=A dptouchseednow=0` is the previous default, `dprotseed=0
-    // dprotqtoggle=0` the one before it.
+    // `dprotseed=A dptouchseednow=0` is the previous default.
     int dpRotSeed = 4;
     // cfg `dprotseedanchor`: whether an exact seed also hands the queue to the ANCHORED
     // SEARCH (site=anchor), or only to the fixup resim. 1 = both (dprotseed's own
@@ -449,6 +550,11 @@ struct Config {
     // rotseed: line, marked queue=withheld, and gets no --rotqueue. The A/B arm for
     // whether the queue in the search is what an lv22 run piles up on.
     bool dpRotSeedAnchor = true;
+    // cfg `rotseedpre` (on; 0 = off): level S walks a turn row that consumed nothing once more at
+    // the position before the tick's button (repair.hpp rotseed::seedSim). lv22's glitch-avoid
+    // route teleports its spider on the turn's own tick and the seed was underivable for the whole
+    // run. A walk that turns on the first try never reaches the retry.
+    bool rotSeedPre = true;
     // cfg `dpswingpending`: an anchor taken on the tick a SWING's press takes effect carries
     // the pending flip in --start's 16th field (see swingPendingAt in repair.hpp). On since
     // v0.1.4; always on since the flag clean-up.
@@ -465,6 +571,16 @@ struct Config {
     // cannot be rebuilt offline with the inputs it actually had. Off by default: it only
     // writes files and log lines, and costs disk (lv22 keeps ~20 group versions).
     bool dpSnapshot = false;
+    // cfg `capture=1` (off by default): keep the per-attempt research copies beside each died
+    // plan -- dp_band_itN/dp_groups_itN, the recordings that plan was solved against, and the
+    // recorder's own dp_fixin_*/dp_attempt_itN files (keepRecorderInputs in repair.hpp). Off by
+    // default: a player's own Solve accumulates one such set per died attempt, and over a long
+    // run that is hundreds of MB to a GB of files nobody outside a harness reads. The cold/
+    // research harness (py/cold_regress.py, py/gdtas/worker.py and the other drivers that launch
+    // a solve session) turns it on explicitly with cfg `capture=1`. dp_died_itN -- the plan
+    // itself, ~15 KB -- is kept either way. An attempt from a run with this off has no recorder
+    // inputs to rebuild from: only the plan and the `[inputs]`/`[fixin]` summary lines survive it.
+    bool researchCapture = false;
     // cfg `dpcheck`: while a search runs, the game flies the search's checkpoints -- at fixed
     // layers past the anchor, the lineage of the frontier's first state -- and a checkpoint the
     // game kills cancels the search, runs the fixup recorder on that flight and solves the same
@@ -503,6 +619,18 @@ struct Config {
     // 61-148 fixups recorded there per run against 9, and game deaths with p1 exact and p2 160 px
     // away.
     int dpCapLadder = 125;
+    // cfg `dpplainbeside`: 1, the ladder's plain search starts with the ladder, in a second copy of
+    // the solver core on a thread of its own, and the ladder takes its result where it would have
+    // searched it (dp_bridge.hpp plainBeside). The call's answer is the same; only its time moves.
+    // 2, the instrument for that claim: both run, the ladder's own result is kept, and each call
+    // writes a `[beside]` line saying whether the other agreed. 3, THE GAMBLE, which gives the
+    // claim up for time: the plain search is taken as soon as it has finished and solved or died no
+    // earlier than the ladder's deepest death so far, stopping the ladder where it is (dp cli.hpp
+    // PlainElsewhere::ready). Which one finishes first depends on the machine, so a run is no
+    // longer reproducible; every plan is still flown and judged by the game. 0, off. Not given
+    // (-1): the settings menu's "Solve faster" decides between 3 and 0, and it is off by default
+    // (repair.hpp start()).
+    int dpPlainBeside = -1;
     // cfg `dpinputgrid` (1 = off): pass --inputgrid <n> to the searches, so the button changes only
     // on every n-th tick; repair.hpp baseArgs lifts it again once the loop escalates to a
     // capacity tier or restarts. 2 by default, measured with dpcapladder above.
@@ -514,12 +642,6 @@ struct Config {
     // object's +0x28e byte (the flag checkSpawnObjects tests before it calls triggerObject)
     // on every tick. Empty by default, and then the column reads "-". Print only.
     std::vector<int> dpWatchFired;
-    // cfg `dprotqtoggle=1`: pass --rotqtoggle to the anchored solves and the fixup resims,
-    // with --touchseed naming the touch Toggles the attempt had already entered by t0 (a
-    // geometric test on its own recorded positions -- GD's touch recorder never sees a
-    // touch Toggle). On by default with dpRotSeed; `dprotqtoggle=0`
-    // turns it off.
-    bool dpRotQToggle = true;
     // cfg `dpspentpad` (on by default since 2026-09-26; `dpspentpad=0` turns it off): pass dp's --spentpad to the anchored
     // solves and the fixup resims -- the pads GD had latched by t0 in this attempt (padseed,
     // recorded where GD sets the latch, activatedByPlayer). GD fires a pad once per attempt;
@@ -530,6 +652,19 @@ struct Config {
     // The pads come from the attempt the anchor row belongs to (anchors::seeds, banked with the
     // rows), not from the live recorder the next attempt's reset clears.
     bool dpSpentPad = true;
+    // cfg `dpxtrack` (on by default since 2026-10; 0 = off): pass dp's --xtrack to the anchored
+    // solves and the fixup resims -- GD's x on every tick of the anchor's attempt up to t0
+    // (xtrackArg), so the autonomous triggers behind the anchor are dated by GD's own crossing, not
+    // by distance over one speed. Measured on lv21's t=18,200 section with the reference run's x:
+    // all 248 such triggers land on GD's crossing (+ their delay) where the x estimate is off by
+    // 1,452 ticks on average.
+    bool dpXTrack = true;
+    // cfg `dpfineretry` (on by default since 2026-10; 0 = off): a ladder rung that comes back a
+    // doomed PARTIAL with no cap hit, on a wall GD died at in ship or UFO, is asked once more over a
+    // short window with fine dedupe bins, no input grid and a big cap (repair.hpp runLadder, the fine
+    // retry). The flying modes share the coarse bins (dp keyOf), and a corridor narrower than a bin
+    // merges the state that lives into the one that dies.
+    bool dpFineRetry = true;
     // (cfg `dpspentorb` is gone: dp --spentorb, the rings this attempt fired before t0, is passed
     // to the anchored solves and the fixup resims always since 2026-09-26. Without it an anchored
     // model re-fires a ring GD spent just before t0 -- an old custom level, six kitref
@@ -603,16 +738,59 @@ struct Config {
     // by a population mismatch, while this map's uids are dp's own portal uids
     // and land exactly (checked on lv22: dp numbers 7 portals and all 7 latch on
     // the tick GD activates them).
-    // OFF for now, and the reason is that no instrument here can see it. dp's
-    // State::portalLatch starts empty at an anchor, and empty means "nothing
-    // spent" -- which is exactly the behaviour before the latch existed, so an
-    // anchored section can only fail to inherit a refusal, never invent one.
-    // Measured: lv22's quick_regress sections are byte-identical with the latch
-    // on and off. The payload's effect is therefore invisible to the anchored
-    // suites and shows up only in a serial cold run, so it is turned on when
-    // there is a cold run to judge it rather than on the strength of the
-    // argument.
-    bool portalPayload = false;
+    // ON BY DEFAULT (user's decision, 2026-09-29). It was held off because no anchored instrument
+    // can see it (lv22's quick_regress sections are byte-identical either way) and on the argument
+    // that an empty latch "can only fail to inherit a refusal, never invent one". The refusal it
+    // fails to inherit is itself a false death: on lv22's glitch-avoid route with coins an anchor
+    // at t=6,862 overlaps a blue gravity portal (uid 13833) GD had already used -- the ball stays
+    // upside down through it -- and with an empty latch the model fired it again on the first tick,
+    // put gravity back and killed the ball on the spikes 51 ticks later, so every search from that
+    // anchor died there and the ladder could not back off through it. With the portal handed over
+    // the search went on to t=8,113, and GD's own plan replayed from the anchor matched GD to its
+    // death at 8,362.
+    bool portalPayload = true;
+    // cfg `portalpayloadlt` (on by default since 2026-10; 0 = off): the portal payload names the
+    // portals the attempt activated BEFORE t0 (`< t0`, the pads' and rings' convention), not up to
+    // and including it -- the hook's tick is one before the row that shows the activation
+    // (repair.hpp portalPayload).
+    bool portalPayloadLt = true;
+    // cfg `dpanchorrotstep` (on by default since 2026-10; 0 = off): the anchor also writes
+    // --start's 28th-30th fields -- flipT and armT as "not said" (-1) and the size of the spin the
+    // angle just made -- which dp reads as a ball's stake (State::rotStep). Without it every
+    // anchored ball starts with no stake and does not turn in the air until something stakes it
+    // (repair.hpp startArg).
+    bool dpAnchorRotStep = true;
+    // cfg `dpanchorrot2` (on by default since 2026-10; 0 = off): in a dual the anchor also writes
+    // --start's 31st-33rd fields -- the second body's sprite angle, the sign and the size of the
+    // step it just made -- which dp --rot2 seeds State::rot2 / rotNeg2 / rotStep2 from. Writes the
+    // 28th-30th too (as dpanchorrotstep would; 0 for the 30th when that is off) so the positions
+    // line up.
+    bool dpAnchorRot2 = true;
+    // Carry GD's slope-ride state into an anchored solve (cfg `histride=1`). The hist
+    // payload becomes version 4 -- version 3's values plus the ride's raw facts:
+    // slopeOn (+0x9b0), slopeUnder (+0x9b8), slopeUid (the ramp at +0x678), slopeAge
+    // (the ride's clock +0x598 against +0xaa0, in ticks) and slopeLanded (a grounded
+    // row since the ride's clock was stamped) -- and the solver is passed
+    // --anchorride, which maps them onto the model's ride fields (onSlope / slopeT /
+    // rideLanded, the not-yet-landed seat's seatT, or the underside's ceilT / ceilM4 /
+    // ceilMode). Without it an anchor taken mid-ride guesses a saturated, landed ride.
+    // What the recording point sees, measured with cfg `slopetrace`: +0x9b0 reads 1
+    // on every tick of a ride, with the ramp's uid, and the clock reads 1, 2, 3...
+    // ticks from the contact tick; a floor ride handed straight to an underside
+    // contact keeps the same clock; +0x9b8 is not cleared when the ride ends, so it
+    // means something only while +0x9b0 is 1.
+    // On by default since 2026-09-30, as one unit with dp's consumer (g_anchorRide, on by
+    // default in the same change): this key alone turns both, since the solver is passed
+    // --anchorride with it and --no-anchorride without it, so a recording and a consumer
+    // that disagree cannot arise from the cfg. cold_manifest.py counts, per anchored call,
+    // the payload's version against the consumer the call ran with, and `check` refuses a
+    // run where they disagree. The evidence: on the official levels a ride anchored after
+    // 18 grounded rows launched at vy 10.342 in the game; the geometric guess (a full
+    // ride) gave 13.065 and the recorded age gives 10.343. With the key on, both cold
+    // suites (coins on and off) came out identical to the key off -- the paths they take
+    // do not reach such an anchor, so that is safety, not a measured gain.
+    // With it off the payload is version 3, byte for byte, and the consumer is off.
+    bool histRide = true;
     // Seed an anchored solve's history values that --start does not carry
     // (dp's --anchor-state owns=hist; version 1 = the press latch ->
     // State::pressSpent, version 2 adds the Free Mode byte -> State::bandBranch).
@@ -654,6 +832,10 @@ struct Config {
     // exist at load time)
     bool standTrace = false;    // cfg standtrace=1
     bool noDeath = false;       // swallow deaths (cfg nodeath=1, observation only)
+    // cfg `anticheatpass` (on; 0 = off): where a death is swallowed (nodeath, the section search's
+    // no-kill), GD's anti-cheat spike still clears GD's check, as GD's own destroyPlayer does
+    // (hooks_playlayer.cpp). Off, the spike is hit on every substep and postCollision never runs.
+    bool antiCheatPass = true;
     // Rollback verification (method B: practice-mode checkpoints)
     int practiceAt = -1;     // turn practice mode ON at this tick
     int checkpointAt = -1;   // create a checkpoint at this tick
@@ -670,6 +852,32 @@ struct Config {
     // acceptance that a section's entry is faithful, and it doubles as the
     // regression detector for five known holes.
     int snapVerify = 0;
+    // cfg `snapplayer=0` (on by default): the restore of an entry snapshot writes back the
+    // player as the pass had it when the snapshot was taken, as the section search does at its
+    // head (secsolve::g_cpPlayer). Off restores with the checkpoint alone.
+    bool snapPlayer = true;
+    // cfg `cpflight=S` (600 by default since 2026-10; 0 = off): the loop's flights take a checkpoint
+    // every S ticks, and a plan whose inputs agree with an earlier attempt's up to one of them flies
+    // from it instead of from tick 0 (mod/cp_flight.hpp).
+    int cpFlight = 600;
+    // cfg `cpflightprobe=1` (with cpflight=S): the loop keeps flying from the head, and each death
+    // is flown again from its own latest checkpoint while the solve runs and compared with the head
+    // flight (`cpflight: probe` lines). Print only.
+    bool cpFlightProbe = false;
+    // cfg `cpflightobj=<uid>` (print only): that object's area offsets, stamp and rect around each
+    // checkpoint and restore of cfg cpflight (`cpflight: obj` lines).
+    int cpFlightObj = -1;
+    // cfg `cpflightprobeat=<tick>` (with cpflightprobe): probe from the latest checkpoint at or before
+    // that tick, so every death past it flies the same stretch again. -1 = the latest before the death.
+    int cpFlightProbeAt = -1;
+    // cfg `cpflightlayerdiff=1` (print only): the PlayLayer's raw bytes at each checkpoint, and after a
+    // restore the ranges that differ from them (`cpflight: layerdiff` lines).
+    bool cpFlightLayerDiff = false;
+    // cfg `cpflightcarrylog=1` (print only): each attempt's carry signature (`cpflight: carry` lines).
+    bool cpFlightCarryLog = false;
+    // cfg `cpflightnodewatch=<uid>[,<uid>...]` (print only): those objects' nodes at each reset and
+    // restore and whenever they move (`cpflight: node` lines).
+    std::string cpFlightNodeWatch = "-";
     // cfg `robodbg=t0,t1`: per-substep state over a tick range, from both the
     // plain replay and the section search (they share processCommands).
     long long roboDbg0 = -1, roboDbg1 = -1;
@@ -931,6 +1139,12 @@ inline void restoreProgress() {
 inline long long g_bgBlocked = 0, g_resignBlocked = 0;
 inline int g_attempt = 0;
 inline size_t g_nextInput = 0;
+// The input cursor as an attempt's first tick on the active layer found it (processCommands), and
+// whether that tick has come yet (cleared by the attempt's reset). 0 unless something took the
+// plan's inputs before the attempt started -- what a slice's check flight has to rule out before a
+// parting from the copy is read as the cut's (level_slice.hpp onVerifyDeath).
+inline size_t g_nextInputAtStart = 0;
+inline bool g_attemptFed = false;
 inline long long g_frame = 0;
 inline int g_traceLines = 0;
 inline int g_finishedAttempts = 0;
@@ -1149,12 +1363,12 @@ constexpr long long kRngFixEE0 = 2531011, kRngFixEF8 = 0;
 // between the reseed and the end of the reset, the seed would no longer equal +0x32e0; that is
 // counted (g_rngDrawnInReset) rather than assumed not to happen.
 constexpr long long kRngFixE90 = 0;
-constexpr size_t kRandomSeedOff = 0x32e0;   // PlayLayer (GJBaseGameLayer::m_randomSeed)
+constexpr size_t kRandomSeedOff = gdoff::kLayerRandomSeed;   // GJBaseGameLayer::m_randomSeed
 inline long long g_rngDrawnInReset = 0;     // resets whose trigger seed was drawn before rngfix
 inline void rngFixAfterReset(void* layer) {
     if (!botDriving() || !g_rngFix || !layer) return;
     auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
-    auto& seed = *reinterpret_cast<long long*>(base + 0x6c2e90);
+    auto& seed = *reinterpret_cast<long long*>(base + gdoff::kSeedTriggerRva);
     auto& kept = *reinterpret_cast<long long*>(reinterpret_cast<char*>(layer) + kRandomSeedOff);
     if (seed != kept) ++g_rngDrawnInReset;
     seed = kRngFixE90;
@@ -1163,8 +1377,10 @@ inline void rngFixAfterReset(void* layer) {
 inline void rngFixApply() {
     if (!botDriving() || !(g_rngFix || g_rngSeedSet)) return;
     auto* base = reinterpret_cast<unsigned char*>(geode::base::get());
-    *reinterpret_cast<long long*>(base + 0x6c2ee0) = g_rngSeedSet ? g_rngSeedEE0 : kRngFixEE0;
-    *reinterpret_cast<long long*>(base + 0x6c2ef8) = g_rngSeedSet ? g_rngSeedEF8 : kRngFixEF8;
+    *reinterpret_cast<long long*>(base + gdoff::kSeedVarIndexRva) =
+        g_rngSeedSet ? g_rngSeedEE0 : kRngFixEE0;
+    *reinterpret_cast<long long*>(base + gdoff::kSeedVarTableRva) =
+        g_rngSeedSet ? g_rngSeedEF8 : kRngFixEF8;
 }
 inline long long g_areaT0 = 0, g_areaT1 = -1;
 inline std::vector<int> g_areaUids;
