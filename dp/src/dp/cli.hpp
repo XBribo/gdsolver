@@ -239,10 +239,11 @@ inline const GroupTimeline& groupLayersFor(const std::vector<std::string>& paths
 // Only inside one ladder, where the arguments, the input files and the level text are the same
 // by construction, and resetInvocationState has put every other global back where the first
 // attempt found it. The argument list and the moving-geometry timeline are still compared, as a
-// guard rather than as the key. cliMain empties it when the ladder ends: it holds a copy of the
-// level, recordings included, and has no use after that.
+// guard rather than as the key. The ordinary CLI empties it when the ladder ends. An in-process
+// job can keep it for identical calls (including fixup passes), releasing it at the job's end.
 struct LadderLevelCache {
     unsigned long long ladder = 0;   // the ladder it was built in; 0 = empty
+    uint64_t job = 0;   // an in-process job may also reuse identical preparation
     std::vector<std::string> args;   // that attempt's arguments without --capmap / --gridmap
     unsigned long long groupsGen = 0;
     Level level;
@@ -2137,25 +2138,31 @@ inline int cliMainOnce(int argc, char** argv) {
     if (!setPath.empty() && loadLevelSettings(setPath) && g_fixRadiusCollision)
         std::printf("levelsettings: fixRadiusCollision=1 - circular hazards "
                     "use centre distance (branch A) in this level\n");
-    // An attempt after a ladder's first takes the level that one built (LadderLevelCache).
+    // Also reuse identical preparations between this job's fixup passes. Fixups/replay inputs
+    // are consumed after loadLevel, and every world file is immutable for the job.
     Level L;
     {
         std::vector<std::string> la;
-        if (g_ladder) la = ladderArgs(argc, argv);
-        if (g_ladder && g_ladderLevel.ladder == g_ladder
+        const uint64_t job = g_levelCsv.empty() ? 0 : g_inputFiles.job();
+        if (g_ladder || job) la = ladderArgs(argc, argv);
+        const bool scopeMatch = job ? g_ladderLevel.job == job
+                                   : g_ladder && g_ladderLevel.ladder == g_ladder;
+        if (scopeMatch
             && g_ladderLevel.groupsGen == g_groupLayersGen && g_ladderLevel.args == la) {
+            if (job) ++g_inputFiles.levelHits;
             L = g_ladderLevel.level;
             g_ladderLevel.writes.put();
             std::fputs(g_ladderLevel.printed.c_str(), stdout);
         } else {
             std::string printed;
-            if (g_ladder) g_loadPrinted = &printed;
+            if (g_ladder || job) g_loadPrinted = &printed;
             L = loadLevel(argv[1], groupsPaths.empty() ? nullptr : &gt,
                           g_touch.empty() ? nullptr : &g_touch,
                           g_autoTrig.empty() ? nullptr : &g_autoTrig);
             g_loadPrinted = nullptr;
-            if (g_ladder) {
+            if (g_ladder || job) {
                 g_ladderLevel.ladder = g_ladder;
+                g_ladderLevel.job = job;
                 g_ladderLevel.args = std::move(la);
                 g_ladderLevel.groupsGen = g_groupLayersGen;
                 g_ladderLevel.level = L;
@@ -8724,7 +8731,7 @@ inline int cliMain(int argc, char** argv) {
     struct EndLadder {
         ~EndLadder() {
             g_ladder = 0;
-            g_ladderLevel = LadderLevelCache{};
+            if (!g_inputFiles.job()) g_ladderLevel = LadderLevelCache{};
             g_ladderBestT.store(-1);
             g_ladderStop.store(false);
         }

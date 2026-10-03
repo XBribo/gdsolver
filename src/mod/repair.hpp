@@ -38,6 +38,7 @@
 //   * lookahead DOUBLING. This loop runs the inverse -- the whole level, shortened to
 //     kHorizonShort under stall -- which covers the same ground from the other end.
 #include "mod/session.hpp"
+#include "solver/failed_plan.hpp"
 #include "solver/attempt_end.hpp"
 
 namespace p1 {
@@ -2191,10 +2192,10 @@ inline void addWorldArgs(std::vector<std::string>& a) {
 // same fileSig the call's `input sig` line carries), so identical contents are kept once
 // and any copy can be checked against the call that read it. Returns the copy's name
 // relative to DATA_DIR, or "" when there is nothing to copy.
-inline std::string snapFile(const std::string& path) {
+inline std::string snapFile(const std::string& path, const std::string& knownSig = "") {
     std::error_code ec;
     if (path.empty() || !std::filesystem::exists(path, ec)) return "";
-    std::string sig = fileSig(path);
+    std::string sig = knownSig.empty() ? fileSig(path) : knownSig;
     for (char& c : sig) if (c == '/') c = '_';
     const std::filesystem::path src(path);
     const std::string name = "snaps/" + src.stem().string() + "_" + sig + src.extension().string();
@@ -2219,6 +2220,46 @@ inline bool isFileArg(const std::string& s) {
     for (const char* f : kFileArgs)
         if (s == f) return true;
     return false;
+}
+
+// The job writes replay plans and fixups; all other listed inputs are published between jobs.
+inline bool immutableInput(const std::string& flag) {
+    return isFileArg(flag) && flag != "--fixups" && flag != "--replay";
+}
+
+inline solver::FailedPlans g_failedPlans;
+inline solver::PlanContext g_candidateContext;
+inline solver::PlanEdges g_candidateEdges;
+inline bool g_repeatRejected = false;
+
+// Record the complete click sequence, including the verified prefix and an empty plan.
+inline solver::PlanEdges planEdges(const std::vector<InputCmd>& plan) {
+    solver::PlanEdges edges;
+    for (const auto& c : plan) edges.emplace_back(c.step, c.down ? 1 : 0);
+    return edges;
+}
+
+// Include live settings not held in Config as well as the caller's complete argv.
+inline std::string planConfig() {
+    return effcfg::modCfg() + " maxplayy=" + num(g_maxPlayYLive)
+           + " coinmargin=" + num(g_coinMarginNow);
+}
+
+// A rejoin trace chooses a route; it is not physics. All model/world files and settings are.
+inline solver::PlanContext planContext(const std::vector<std::string>& args) {
+    solver::PlanContext c;
+    c.level = dpbridge::inputLevelRevision();
+    c.fp = (unsigned)_mm_getcsr() & ~0x3fu;   // control bits, not arithmetic status flags
+    c.config = planConfig();
+    c.args = args;   // includes runtime vetoes, seed payloads and every search policy
+    c.valid = c.level != 0;
+    for (size_t i = 0; i + 1 < args.size(); ++i)
+        if (isFileArg(args[i]) && args[i] != "--replay" && args[i] != "--rejoinwatch") {
+            const auto f = dpbridge::inputFileInfo(args[i + 1], immutableInput(args[i]));
+            c.files.emplace_back(args[i] + "=" + args[i + 1], f.revision);
+            if (!f.revision) c.valid = false;
+        }
+    return c;
 }
 
 // WHICH WORLD THE CALL JUST PLANNED IN. Written after a solve, once per call,
@@ -2371,7 +2412,8 @@ inline void logSolverArgs(const std::vector<std::string>& a) {
     std::string sig = "dpsolve: input sig";
     for (size_t i = 0; i + 1 < a.size(); ++i)
         if (isFileArg(a[i]))
-            sig += " " + a[i].substr(2) + "=" + fileSig(a[i + 1]);
+            sig += " " + a[i].substr(2) + "="
+                   + dpbridge::inputFileInfo(a[i + 1], immutableInput(a[i])).signature;
     writeResult(sig);
     // ...and, under cfg dpsnapshot, the bytes themselves (snapFile), for the same files. The
     // static ones cost one copy per level: a copy is named by its contents and kept once.
@@ -2379,7 +2421,8 @@ inline void logSolverArgs(const std::vector<std::string>& a) {
         std::string snap = "dpsolve: input snap";
         for (size_t i = 0; i + 1 < a.size(); ++i)
             if (isFileArg(a[i])) {
-                const std::string n = snapFile(a[i + 1]);
+                const auto info = dpbridge::inputFileInfo(a[i + 1], immutableInput(a[i]));
+                const std::string n = snapFile(a[i + 1], info.signature);
                 snap += " " + a[i].substr(2) + "=" + (n.empty() ? "-" : n);
             }
         writeResult(snap);
@@ -4812,7 +4855,8 @@ inline bool runLadder(long long dt) {
         if (at == rungs.end() || *at != pb) rungs.insert(at, pb);
     }
 
-    std::vector<InputCmd> tail;
+    std::vector<InputCmd> tail, chosenPlan;
+    size_t nPrefix = 0;
     long long chosenT = -1;
     int chosenBackoff = 0;
     bool solvedTail = false;
@@ -5254,6 +5298,27 @@ inline bool runLadder(long long dt) {
             }
         }
         if (!usable) continue;
+        // Test the FULL splice: the same tail on a different prefix is a different question.
+        std::vector<InputCmd> next;
+        for (const auto& c : g_plan) {
+            if (c.step >= t0) break;
+            next.push_back(c);
+        }
+        const size_t prefix = next.size();
+        next.insert(next.end(), cand.begin(), cand.end());
+        const auto context = planContext(a);
+        const auto edges = planEdges(next);
+        const long long failed = g_failedPlans.failedAt(context, edges);
+        if (failed >= 0) {
+            writeResult("dpsolve:   [repeat] identical full plan already died at t="
+                        + std::to_string(failed) + " under unchanged inputs - backing off");
+            g_repeatRejected = true;
+            continue;
+        }
+        chosenPlan = std::move(next);
+        nPrefix = prefix;
+        g_candidateContext = context;
+        g_candidateEdges = edges;
         tail = std::move(cand);
         chosenT = t0;
         chosenBackoff = bo;
@@ -5307,13 +5372,7 @@ inline bool runLadder(long long dt) {
     // the driver did) breaks a tail that was solved on the assumption the button is down, and
     // the fixed position it used was one tick early for every mode with input latency 1. The
     // tail emits its own release at whatever tick its mode calls for.
-    std::vector<InputCmd> next;
-    for (const InputCmd& c : g_plan) {
-        if (c.step >= chosenT) break;
-        next.push_back(c);
-    }
-    const size_t nPrefix = next.size();
-    next.insert(next.end(), tail.begin(), tail.end());
+    std::vector<InputCmd> next = std::move(chosenPlan);
     g_plan.swap(next);
     g_curBackoff = chosenBackoff;
     g_lastTailSolved = solvedTail;
@@ -5411,7 +5470,15 @@ inline void spawn(int kind, long long arg, const char* phase) {
     const int gen = g_generation.load();   // this session's generation, read on the main thread
     std::thread([kind, arg, gen]() {
         bool ok = false;
+        g_candidateContext = solver::PlanContext{};
+        g_candidateEdges.clear();
+        g_repeatRejected = false;
         try {
+            dpbridge::beginInputJob((unsigned long long)gen, g_csv);
+            struct InputJob {
+                // Even an exception must release the job's immutable-file pins.
+                ~InputJob() { dpbridge::endInputJob(); }
+            } inputJob;
             if (kind == JobFirstSolve) {
                 // A refuted checkpoint (cfg `dpcheck`) cancels this search; learn from it and
                 // solve again, as a ladder rung does. The argv is rebuilt each time: the first
@@ -5430,7 +5497,10 @@ inline void spawn(int kind, long long arg, const char* phase) {
                                        + workDpState() * (double)dpbridge::outcome().workStates;
                     logTrigWindow("head");
                     adoptCoinGates();
-                    if (dpbridge::outcome().verdict != dpbridge::OutcomeCancelled) break;
+                    if (dpbridge::outcome().verdict != dpbridge::OutcomeCancelled) {
+                        g_candidateContext = planContext(a0);
+                        break;
+                    }
                     // cfg dpcheckfirst: the flight that stopped this solve IS the first plan.
                     if (g_cfg.dpCheckFirst) {
                         CkDeath d;
@@ -5474,6 +5544,7 @@ inline void spawn(int kind, long long arg, const char* phase) {
                     loadInputsFile(g_planPath, g_plan);
                     std::error_code fe;
                     ok = std::filesystem::exists(g_planPath, fe);
+                    if (ok) g_candidateEdges = planEdges(g_plan);
                 } else {
                     ok = fromFlight;
                 }
@@ -5587,6 +5658,10 @@ inline void spawn(int kind, long long arg, const char* phase) {
         } catch (...) {
             ok = false;    // never let an exception cross back into the game's frame
         }
+        const auto cache = dpbridge::inputJobStats();
+        writeResult("dpsolve:   [inputcache] reads=" + std::to_string(cache.reads)
+                    + " hits=" + std::to_string(cache.hits)
+                    + " levelhits=" + std::to_string(cache.levelHits));
         g_haveNewPlan = ok;
         g_resultGeneration = gen;   // set before g_finished, same ordering convention as g_rc
         g_finished = true;
@@ -5986,6 +6061,10 @@ inline void start(GJBaseGameLayer* l) {
     g_secRung = false;
     g_autoWall = -1;
     g_autoWallRounds = 0;
+    g_failedPlans.clear();
+    g_candidateContext = solver::PlanContext{};
+    g_candidateEdges.clear();
+    g_repeatRejected = false;
     g_autoWallWork = 0.0;
     g_autoRoundWork = 0.0;
     g_secEpisodeWork = 0.0;
@@ -7245,6 +7324,12 @@ inline void onDeath(long long dt, float deathX,
     // Taken here rather than inside logFingerprint because that one returns early
     // when fingerprinting is off, and this is not a diagnostic.
     g_flownPlan = g_plan;
+    // Timeout, wedge and coin cuts are not proof that these input edges collide.
+    if (!noCollision && !wasWedged && !voidAttempt && !coinMiss && !postScored
+        && g_candidateContext.config == planConfig()
+        && g_candidateEdges == planEdges(g_flownPlan))
+        g_failedPlans.remember(g_candidateContext, g_candidateEdges, physDt);
+    g_candidateContext.valid = false;
     logFingerprint(dt, deathX);
     // cfg dprejoinwatch: keep the model's trace of the plan that just died -- the
     // newer of the first solve's and the last tail's -- before the next search overwrites it.
@@ -8311,6 +8396,9 @@ inline void poll() {
     if (!g_haveNewPlan) {
         if (hadFlight) g_cfg.inputs = g_plan;   // never leave a flight installed as the plan
         g_paused = false;      // never leave the game frozen because the solve failed
+        // A repeated, game-refuted answer needs another strategy, not another identical flight.
+        if (g_repeatRejected && g_cfg.dpSecAuto && !g_autoPinOut && !g_autoRecordThenRung
+            && autoFire("the ladder exhausted after rejecting game-refuted repeats")) return;
         // cfg dpsecauto: the ladder stopped at a pin that held (runLadder) -- the section solve
         // is the next rung. If none can be queued, the pin goes as it always did.
         if (g_autoPinOut) {
@@ -8345,6 +8433,7 @@ inline void poll() {
     std::sort(g_plan.begin(), g_plan.end(),
               [](const InputCmd& a, const InputCmd& c) { return a.step < c.step; });
     g_cfg.inputs = g_plan;
+    if (g_candidateContext.valid) g_candidateEdges = planEdges(g_plan);
     if (g_cfg.dpCheck && g_cfg.dpCheckObs) ckObsCompare(sec);
     g_paused = false;
     // The screen stays off here. These replays are the loop TESTING a candidate, not showing a
