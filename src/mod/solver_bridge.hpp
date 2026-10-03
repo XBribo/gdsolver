@@ -7,6 +7,7 @@
 #include "mod/dp_bridge.hpp"
 #include "solver/attempt_end.hpp"
 #include "solver/section_replay.hpp"
+#include "solver/section_diagnostic.hpp"
 #include "solver/input_continuation.hpp"
 #include "solver/collision_environment.hpp"
 #include "solver/effect_motion.hpp"

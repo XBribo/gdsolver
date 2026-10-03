@@ -12,6 +12,14 @@ inline void uiSessionBase(int levelId) {
     resetSessionState();
     resetSecsolveSession();
     g_cfg = Config{};
+    // Panel sessions inherit only the diagnostic toggle, never autorun/solver settings.
+    std::ifstream f(std::string(DATA_DIR) + "/autorun.cfg");
+    std::string line;
+    while (std::getline(f, line)) {
+        const auto eq = line.find('=');
+        if (eq != std::string::npos && line.substr(0, eq) == "secdriftwhere")
+            g_cfg.secDriftWhere = (line.substr(eq + 1) == "1");
+    }
     g_cfg.enabled = true;
     g_cfg.levelId = levelId;
     g_cfg.quitWhenDone = false; // a UI-started session does not quit the app

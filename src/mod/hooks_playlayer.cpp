@@ -646,6 +646,11 @@ class $modify(PlayLayer) {
             return;
         }
         if (secsolve::g_noKill) {
+            if (g_cfg.secDriftWhere && !secsolve::g_died) {
+                secsolve::g_diagDeathCaller = player == m_player1 ? 1 : player == m_player2 ? 2 : 0;
+                secsolve::g_diagKiller = object ? (int)object->m_uniqueID : -1;
+                secsolve::g_diagAnticheat = anticheat;
+            }
             if (player == m_player1 || player == m_player2) secsolve::g_died = true;
             return;
         }

@@ -8,7 +8,7 @@
 
 using namespace p1;
 
-// Borrow the production node's restore components.
+// Borrow the production node's components; the diagnostic owns the same components separately.
 struct SecFastRestoreView {
     const std::vector<uint8_t>& player;
     const psnap::EMState& effects;
@@ -542,6 +542,7 @@ class $modify(GJBaseGameLayer) {
     void collisionCheckObjects(PlayerObject* player,
                                gd::vector<GameObject*>* objects,
                                int objectCount, float dt) {
+        secsolve::diagnosticCollisionBatch(player, objects, objectCount);
         if (g_cfg.watchUid > 0 && g_started && !g_sessionOver && objects
             && player == m_player1
             && g_tick >= g_cfg.hbFrom
@@ -2063,11 +2064,31 @@ class $modify(GJBaseGameLayer) {
         solver::restoreInputContinuation(m_player2, in[1]);
     }
 
+    // Bounded restore evidence separates native loading from the bot's hold reconstruction.
+    void secLogInputs(int node, const char* phase, const secsolve::InputStates& in) {
+        for (size_t i = 0; i < in.size(); ++i) {
+            const auto& p = in[i];
+            const auto held = p.holdingButtons.find(1);
+            char b[384];
+            snprintf(b, sizeof(b), "secinputrestore: node=%d reference=%s phase=%s player=%zu "
+                     "present=%d buttons=%zu holding=%d jumpBuffered=%d wasJumpBuffered=%d "
+                     "stateJumpBuffered=%d stateRingJump=%d touchedPad=%d",
+                     node, node == 0 ? "section_head" : "intermediate_checkpoint", phase, i + 1,
+                     p.present, p.holdingButtons.size(),
+                     held != p.holdingButtons.end() && held->second,
+                     p.jumpBuffered, p.wasJumpBuffered, (int)p.stateJumpBuffered,
+                     p.stateRingJump, p.touchedPad);
+            writeResult(b);
+        }
+    }
+
     // heldAfter: whether the button was held at the moment of the restore. The checkpoint
     // was taken in that state, so a branch that advances to the next tick while still
     // holding must pass 1. Leaving it 0 means "release and press again", i.e. searching a
     // different input sequence from the plain replay.
-    void secRestoreFrom(PlayLayer* pl, CheckpointObject* cp, int heldAfter = 0) {
+    void secRestoreFrom(PlayLayer* pl, CheckpointObject* cp, int heldAfter = 0,
+                        secsolve::InputStates* loadedInputs = nullptr,
+                        secsolve::InputStates* armedInputs = nullptr) {
     const SecRestTimer restTimer;
         clearCheckpointsUnsectioned(pl);
         {
@@ -2088,6 +2109,7 @@ class $modify(GJBaseGameLayer) {
         if (!cp->m_gameState.m_isDualMode && pl->m_player2 && cp->m_player2Checkpoint)
             pl->m_player2->loadFromCheckpoint(cp->m_player2Checkpoint);
         g_restorePending = false;
+        if (loadedInputs) secCaptureInputs(*loadedInputs);
         // Reconstruct continuity directly. Native handleButton fires release events and
         // touch toggles even when called only to reset the bot's input bookkeeping.
         // resetLevel pushes a button command of its own on EVERY restore --
@@ -2118,6 +2140,7 @@ class $modify(GJBaseGameLayer) {
         for (auto* p : {m_player1, m_player2})
             if (p) p->m_holdingButtons[1] = heldAfter != 0;
         secsolve::g_held = heldAfter;
+        if (armedInputs) secCaptureInputs(*armedInputs);
         // Head replays must not inherit fields left by qualification or another branch.
         if (cp == g_ckpt && m_player1) {
             secRestoreDash(secsolve::g_ckptDash);
@@ -2144,6 +2167,11 @@ class $modify(GJBaseGameLayer) {
     // search.
     void secStep(int down, float) {
         secStepBegin(PlayLayer::get());
+        if (g_cfg.secDriftWhere) {
+            secsolve::g_diagDeathCaller = 0;
+            secsolve::g_diagKiller = -1;
+            secsolve::g_diagAnticheat = false;
+        }
         secsolve::g_feed = down;
         GJBaseGameLayer::update((float)secsolve::g_dt);
     }
@@ -2214,6 +2242,7 @@ class $modify(GJBaseGameLayer) {
         if (saved.state) psnap::restoreState(this, *saved.state);
         if (saved.touch) psnap::restoreTouch(m_player1, *saved.touch, this);
         if (saved.acts) psnap::restoreAct(*saved.acts);
+        secsolve::diagnosticStage("post_restore", nullptr, 0, 0, -1, 0, true);
         if (secsolve::g_trailClear) {
             for (PlayerObject* p : {m_player1, m_player2})
                 if (p && p->m_waveTrail && p->m_waveTrail->m_pointArray)
@@ -2230,6 +2259,7 @@ class $modify(GJBaseGameLayer) {
             this->preUpdateVisibility(0.f);
             this->updateVisibility(0.f);
         }
+        secsolve::diagnosticStage("input_ready", nullptr, 0, 0, -1, 0, true);
     }
 
     // Measure whether the production composite restore can replace a full checkpoint restore
@@ -3669,10 +3699,15 @@ class $modify(GJBaseGameLayer) {
         long long restores = 0, steps = 0, cpMade = 0, cpPeak = 0;
         long long spineChecks = 0, spineRescued = 0;
         long long headReplayChecks = 0, headReplayRescued = 0, headReplaySteps = 0;
+        bool inputRestoreReported[2]{};   // one head and one intermediate sample per section
         // Restore one replay origin with its held input and all recorded supplements.
         auto restoreReplayOrigin = [&](int ni, CheckpointObject* cp) {
             const int held = g_nodes[(size_t)ni].in;
-            secRestoreFrom(pl, cp, held); ++restores;
+            const size_t kind = ni == 0 ? 0 : 1;
+            const bool traceInput = g_cfg.secDriftWhere && !inputRestoreReported[kind];
+            secsolve::InputStates loaded, armed;
+            secRestoreFrom(pl, cp, held, traceInput ? &loaded : nullptr,
+                           traceInput ? &armed : nullptr); ++restores;
             restoreAux(ni);
             if (psnap::g_snapAct && (size_t)ni < acts.size())
                 psnap::restoreAct(acts[(size_t)ni]);
@@ -3688,7 +3723,21 @@ class $modify(GJBaseGameLayer) {
                 psnap::restore(m_player1, this, originPlayer->data());
             if (ni == 0) cpReport(1, "head", 0, secsolve::g_headPlain);
             else if (originPlayer) cpReport(4, "anchor", ni, *originPlayer);
+            if (traceInput) {
+                secLogInputs(ni, "saved", *checkpointInputs[(size_t)ni]);
+                secLogInputs(ni, "native_loaded", loaded);
+                secLogInputs(ni, "hold_rebuilt", armed);
+                secsolve::InputStates thawed;
+                secCaptureInputs(thawed);
+                secLogInputs(ni, "thawed", thawed);
+            }
             secRestoreInputs(*checkpointInputs[(size_t)ni]);
+            if (traceInput) {
+                secsolve::InputStates ready;
+                secCaptureInputs(ready);
+                secLogInputs(ni, "input_ready", ready);
+                inputRestoreReported[kind] = true;
+            }
         };
         // Distinguish a bad intermediate restore from a death reproduced from the head.
         auto noteHeadReplay = [&](const char* stage, int depth, int anchor,
@@ -3724,6 +3773,338 @@ class $modify(GJBaseGameLayer) {
         long long continuedLeaves = 0, skippedExitChecks = 0;
         long long unverLeaves = 0;       // ...and, in a rung, as not reproduced by the replay
         double maxVerifyDrift = 0.0;     // size of psnap's lie (max diff in the cross-check pass)
+
+        // Diagnostic observations share the existing replay passes; they never step or restore GD.
+        const bool diagnose = g_cfg.secDriftWhere && g_snapOn;
+        bool diagReported = false;
+        std::unordered_map<int, solver::SectionDiagnosticStep> diagSteps;
+        std::vector<GameObject*> diagGeometry;
+        std::unordered_map<int, GameObject*> diagObjects;
+        if (diagnose && m_objects) {
+            for (unsigned i = 0; i < m_objects->count(); ++i) {
+                auto* o = static_cast<GameObject*>(m_objects->objectAtIndex(i));
+                if (!o) continue;
+                diagObjects.emplace((int)o->m_uniqueID, o);
+                if (o->m_objectType == GameObjectType::Solid
+                    || o->m_objectType == GameObjectType::Hazard) diagGeometry.push_back(o);
+            }
+        }
+        // Capture physical positions, not mirror-transition drawing positions, plus bounded probes.
+        auto captureDiag = [&](bool deathCall) {
+            auto out = diagnosticStageState(this, true, true);
+            out.deathCall = deathCall;
+            out.caller = 0; out.killer = -1; out.anticheat = false;
+            if (deathCall) {
+                out.caller = g_diagDeathCaller;
+                out.killer = g_diagKiller;
+                out.anticheat = g_diagAnticheat;
+            }
+            PlayerObject* players[] = {m_player1, m_player2};
+            // Eight nearest solid/hazard centers within 96 px, plus contact and killer objects.
+            std::vector<std::pair<double, GameObject*>> nearest;
+            for (auto* o : diagGeometry) {
+                const double dx = o->getPositionX() - out.players[0].x;
+                const double dy = o->getPositionY() - out.players[0].y;
+                if (std::fabs(dx) > 96.0 || std::fabs(dy) > 96.0) continue;
+                const double distance = dx * dx + dy * dy;
+                auto at = std::lower_bound(nearest.begin(), nearest.end(), distance,
+                    [](const auto& entry, double d) { return entry.first < d; });
+                nearest.insert(at, {distance, o});
+                if (nearest.size() > 8) nearest.pop_back();
+            }
+            // Probe by stable uid; no game object pointer is written into the observations.
+            auto addObject = [&](GameObject* o) {
+                if (!o) return;
+                for (const auto& v : out.objects) if (v.uid == (int)o->m_uniqueID) return;
+                solver::SectionDiagnosticObject v;
+                v.uid = (int)o->m_uniqueID; v.id = (int)o->m_objectID;
+                v.x = o->getPositionX(); v.y = o->getPositionY();
+                v.rotation = o->getRotation(); v.scaleX = o->getScaleX(); v.scaleY = o->getScaleY();
+                // Observe the cache as it stands; the getter may refresh the measured state.
+                const auto rect = o->m_objectRect;
+                v.rectX = rect.origin.x; v.rectY = rect.origin.y;
+                v.rectW = rect.size.width; v.rectH = rect.size.height;
+                v.rectDirty = o->m_isObjectRectDirty;
+                v.positionX = o->m_positionX; v.positionY = o->m_positionY;
+                v.lastX = o->m_lastPosition.x; v.lastY = o->m_lastPosition.y;
+                v.moveTick = o->m_unk4C4;
+                v.disabled = o->m_isGroupDisabled;
+                if (auto* e = typeinfo_cast<EnhancedGameObject*>(o)) {
+                    v.activated1 = e->m_activatedByPlayer1; v.activated2 = e->m_activatedByPlayer2;
+                }
+                out.objects.push_back(v);
+            };
+            for (const auto& entry : nearest) addObject(entry.second);
+            for (auto* p : players) if (p) {
+                addObject(p->m_objectSnappedTo); addObject(p->m_collidedObject);
+            }
+            const auto killer = diagObjects.find(out.killer);
+            if (killer != diagObjects.end()) addObject(killer->second);
+            return out;
+        };
+        struct DiagnosticTrial {
+            int node = -1, origin = 0;
+            const char* field = nullptr;
+            const char* phase = nullptr;
+            solver::SectionDiagnosticStep fast, replay;
+            int object = -1;
+        };
+        // Each replay trial owns its first difference; a head retry discards the anchor trial.
+        auto compareDiag = [&](std::unique_ptr<DiagnosticTrial>& trial, int node, int origin,
+                               const solver::SectionDiagnosticStep* fast,
+                               const solver::SectionDiagnosticStep& replay) {
+            if (!diagnose || diagReported || trial || !fast) return;
+            const char* field = solver::sectionDiagnosticDifference(fast->before, replay.before,
+                                                                     g_verifyTol);
+            const char* phase = "before";
+            auto geometry = solver::sectionDiagnosticGeometryDifference(
+                fast->before.objects, replay.before.objects, g_verifyTol);
+            int object = -1;
+            if (!field && geometry.field) { field = geometry.field; object = geometry.uid; }
+            if (!field) {
+                field = solver::sectionDiagnosticDifference(fast->after, replay.after, g_verifyTol);
+                phase = "after";
+                geometry = solver::sectionDiagnosticGeometryDifference(
+                    fast->after.objects, replay.after.objects, g_verifyTol);
+                if (!field && geometry.field) { field = geometry.field; object = geometry.uid; }
+            }
+            if (!field) return;
+            trial = std::make_unique<DiagnosticTrial>(DiagnosticTrial{node, origin, field, phase,
+                                                                      *fast, replay, object});
+        };
+        // Emit both phases once, including raw death callbacks separately from m_isDead.
+        auto publishDiag = [&](const char* source, const std::unique_ptr<DiagnosticTrial>& trial) {
+            if (!trial || diagReported) return;
+            diagReported = true;
+            int historyFrom = trial->fast.depth;
+            for (const auto& entry : diagSteps) historyFrom = std::min(historyFrom, entry.second.depth);
+            char db[640];
+            snprintf(db, sizeof(db), "secdiff: source=%s field=%s phase=%s node=%d depth=%d "
+                     "tick=%lld input=%d origin=%d reference=%s historyFromDepth=%d retainedLayers=64 probes=8 "
+                     "object=%d evidence=%s",
+                     source, trial->field, trial->phase, trial->node, trial->fast.depth,
+                     (long long)(g_ckptTick + trial->fast.depth), trial->fast.input, trial->origin,
+                     trial->origin == 0 ? "section_head" : "intermediate_checkpoint", historyFrom,
+                     trial->object, trial->object >= 0 ? "supporting_geometry" : "gameplay_output");
+            writeResult(db);
+            // Keep output bounded to the chosen sample, not one log entry per expanded branch.
+            auto logCollisionList = [&](const char* side, const char* phase, size_t index,
+                                        const solver::SectionDiagnosticCollisionList& list) {
+                snprintf(db, sizeof(db), "secdiff_collision_list: side=%s phase=%s index=%zu player=%d "
+                         "bucket=%d,%d present=%d storage=%zu active=%d read=%zu countKnown=%d "
+                         "sortKnown=%d needsSort=%d orderHash=%llu filterHash=%llu shown=%zu",
+                         side, phase, index, list.player, list.x, list.y, list.present,
+                         list.storage, list.active, list.read, list.countKnown, list.sortKnown,
+                         list.needsSort, (unsigned long long)list.orderHash,
+                         (unsigned long long)list.filterHash, list.candidates.size());
+                writeResult(db);
+                for (size_t j = 0; j < list.candidates.size(); ++j) {
+                    const auto& c = list.candidates[j];
+                    snprintf(db, sizeof(db), "secdiff_collision_candidate: side=%s phase=%s list=%zu "
+                             "player=%d index=%zu uid=%d type=%d innerIndex=%d flags=%u",
+                             side, phase, index, list.player, j, c.uid, c.type, c.index, c.flags);
+                    writeResult(db);
+                }
+            };
+            auto logState = [&](const char* side, const char* phase,
+                                const solver::SectionDiagnosticState& state) {
+                snprintf(db, sizeof(db), "secdiff_state: side=%s phase=%s deathCall=%d caller=%d "
+                         "killer=%d anticheat=%d dual=%d extraDelta=%.9g moveEffects=%zu rotateEffects=%zu "
+                         "dynamicMoves=%zu dynamicRotations=%zu activated=%zu activatedHash=%llu",
+                         side, phase, state.deathCall, state.caller, state.killer, state.anticheat,
+                         state.dual, state.extraDelta, state.moves, state.rotations,
+                         state.dynamicMoves, state.dynamicRotations, state.activated,
+                         (unsigned long long)state.activatedHash);
+                writeResult(db);
+                snprintf(db, sizeof(db), "secdiff_speed_queue: side=%s phase=%s pendingSpeed=%.17g noEffects=%d",
+                         side, phase, state.pendingSpeed, state.pendingSpeedNoEffects);
+                writeResult(db);
+                snprintf(db, sizeof(db), "secdiff_trigger_history: side=%s phase=%s count=%zu hash=%llu",
+                         side, phase, state.triggeredIDCount, (unsigned long long)state.triggeredIDHash);
+                writeResult(db);
+                for (size_t i = 0; i < state.collisionLists.size(); ++i)
+                    logCollisionList(side, phase, i, state.collisionLists[i]);
+                snprintf(db, sizeof(db), "secdiff_groups: side=%s phase=%s disabled=%zu hash=%llu shown=%zu",
+                         side, phase, state.disabledGroupCount, (unsigned long long)state.disabledGroupHash,
+                         state.disabledGroups.size());
+                writeResult(db);
+                for (int group : state.disabledGroups) {
+                    snprintf(db, sizeof(db), "secdiff_disabled_group: side=%s phase=%s group=%d", side, phase, group);
+                    writeResult(db);
+                }
+                snprintf(db, sizeof(db), "secdiff_motion: side=%s phase=%s commands=%zu "
+                         "hash=%llu shown=%zu completed=%zu completedHash=%llu following=%zu followingHash=%llu",
+                         side, phase, state.motionCount, (unsigned long long)state.motionHash,
+                         state.motionCommands.size(), state.completedMoveCount,
+                         (unsigned long long)state.completedMoveHash, state.followingCount,
+                         (unsigned long long)state.followingHash);
+                writeResult(db);
+                for (const auto& c : state.motionCommands) {
+                    snprintf(db, sizeof(db), "secdiff_motion_command: side=%s phase=%s uid=%d type=%d "
+                             "group=%d center=%d trigger=%d control=%d flags=%u remapHash=%llu "
+                             "duration=%.17g time=%.17g offset=%.17g,%.17g delta=%.17g,%.17g "
+                             "oldDelta=%.17g,%.17g locked=%.17g,%.17g rotate=%.17g,%.17g "
+                             "follow=%.17g,%.17g delay=%.17g speed=%.17g maxSpeed=%.17g floatTime=%.17g",
+                             side, phase, c.uid, c.type, c.group, c.center, c.trigger, c.control,
+                             c.flags, (unsigned long long)c.remapHash,
+                             c.values[0], c.values[1], c.values[2], c.values[3], c.values[4], c.values[5],
+                             c.values[6], c.values[7], c.values[8], c.values[9], c.values[10], c.values[11],
+                             c.values[12], c.values[13], c.values[14], c.values[15], c.values[16], c.values[17]);
+                    writeResult(db);
+                }
+                snprintf(db, sizeof(db), "secdiff_input: side=%s phase=%s held=%d feed=%d "
+                         "queuedButtons=%zu shown=%zu",
+                         side, phase, state.held, state.feed, state.queuedButtons, state.buttons.size());
+                writeResult(db);
+                for (const auto& button : state.buttons) {
+                    snprintf(db, sizeof(db), "secdiff_button: side=%s phase=%s button=%d "
+                             "push=%d player2=%d step=%d timestamp=%.17g",
+                             side, phase, button.button, button.push, button.player2,
+                             button.step, button.timestamp);
+                    writeResult(db);
+                }
+                for (size_t i = 0; i < state.players.size(); ++i) {
+                    const auto& p = state.players[i];
+                    snprintf(db, sizeof(db), "secdiff_player: side=%s phase=%s player=%zu present=%d "
+                             "dead=%d x=%.9g y=%.9g vy=%.9g m_position=%.9g,%.9g mode=%d "
+                             "ground=%d flip=%d size=%.9g snapped=%d collided=%d collisionCounts=%d,%d,%d,%d",
+                             side, phase, i + 1, p.present, p.dead, p.x, p.y, p.vy,
+                             p.previousX, p.previousY, p.mode, p.grounded, p.flipped, p.size,
+                             p.snapped, p.collided, p.collisionCounts[0], p.collisionCounts[1],
+                             p.collisionCounts[2], p.collisionCounts[3]);
+                    writeResult(db);
+                    snprintf(db, sizeof(db), "secdiff_player_collision: side=%s phase=%s player=%zu "
+                             "lastPosition=%.9g,%.9g onSlope=%d wasOnSlope=%d unk_584=%.17g",
+                             side, phase, i + 1, p.lastX, p.lastY,
+                             p.onSlope, p.wasOnSlope, p.slopeCorrection);
+                    writeResult(db);
+                    snprintf(db, sizeof(db), "secdiff_follow_history: side=%s phase=%s player=%zu "
+                             "cursor=%d heights=%zu hash=%llu", side, phase, i + 1,
+                             p.followCursor, p.followHeights, (unsigned long long)p.followHash);
+                    writeResult(db);
+                    snprintf(db, sizeof(db), "secdiff_player_input: side=%s phase=%s player=%zu "
+                             "holding=%d jumpBuffered=%d wasJumpBuffered=%d stateJumpBuffered=%d stateRingJump=%d",
+                             side, phase, i + 1, p.holding, p.jumpBuffered,
+                             p.wasJumpBuffered, p.stateJumpBuffered, p.stateRingJump);
+                    writeResult(db);
+                    snprintf(db, sizeof(db), "secdiff_player_speed: side=%s phase=%s player=%zu "
+                             "playerSpeed=%.17g speedMultiplier=%.17g product=%.17g gravity=%.17g "
+                             "reverseSpeed=%.17g reverseAcceleration=%.17g goingLeft=%d sideways=%d",
+                             side, phase, i + 1, p.playerSpeed, p.speedMultiplier,
+                             p.playerSpeed * p.speedMultiplier, p.gravity,
+                             p.reverseSpeed, p.reverseAcceleration, p.goingLeft, p.sideways);
+                    writeResult(db);
+                    snprintf(db, sizeof(db), "secdiff_player_release: side=%s phase=%s player=%zu "
+                             "dashing=%d dashX=%.17g dashY=%.17g lastLandTime=%.17g touchedPad=%d justPlacedStreak=%d",
+                             side, phase, i + 1, p.dashing, p.dashX, p.dashY, p.lastLandTime,
+                             p.touchedPad, p.justPlacedStreak);
+                    writeResult(db);
+                    snprintf(db, sizeof(db), "secdiff_touching_rings: side=%s phase=%s player=%zu "
+                             "count=%zu orderedHash=%llu shown=%zu", side, phase, i + 1,
+                             p.touchingRingsCount, (unsigned long long)p.touchingRingsHash,
+                             p.touchingRings.size());
+                    writeResult(db);
+                    for (size_t j = 0; j < p.touchingRings.size(); ++j) {
+                        snprintf(db, sizeof(db), "secdiff_touching_ring: side=%s phase=%s "
+                                 "player=%zu index=%zu uid=%d", side, phase, i + 1, j,
+                                 p.touchingRings[j]);
+                        writeResult(db);
+                    }
+                    snprintf(db, sizeof(db), "secdiff_contacts: side=%s phase=%s player=%zu "
+                             "slope=%d spiderBand=%.9g,%.9g keyHash=%llu,%llu,%llu,%llu",
+                             side, phase, i + 1, p.slope, p.spiderLow, p.spiderHigh,
+                             (unsigned long long)p.collisionKeyHashes[0],
+                             (unsigned long long)p.collisionKeyHashes[1],
+                             (unsigned long long)p.collisionKeyHashes[2],
+                             (unsigned long long)p.collisionKeyHashes[3]);
+                    writeResult(db);
+                    for (size_t j = 0; j < 4; ++j) {
+                        for (auto key : p.collisionKeys[j]) {
+                            snprintf(db, sizeof(db), "secdiff_contact_key: side=%s phase=%s "
+                                     "player=%zu log=%zu key=%lld", side, phase, i + 1, j,
+                                     (long long)key);
+                            writeResult(db);
+                        }
+                    }
+                }
+                for (const auto& o : state.objects) {
+                    snprintf(db, sizeof(db), "secdiff_object: side=%s phase=%s uid=%d id=%d "
+                             "position=%.9g,%.9g rotation=%.9g scale=%.9g,%.9g "
+                             "cachedRect=%.9g,%.9g,%.9g,%.9g rectDirty=%d disabled=%d activated=%d,%d "
+                             "ledger=%.9g,%.9g lastPosition=%.9g,%.9g moveTick=%d",
+                             side, phase, o.uid, o.id, o.x, o.y, o.rotation, o.scaleX, o.scaleY,
+                             o.rectX, o.rectY, o.rectW, o.rectH, o.rectDirty,
+                             o.disabled, o.activated1, o.activated2,
+                             o.positionX, o.positionY, o.lastX, o.lastY, o.moveTick);
+                    writeResult(db);
+                }
+            };
+            logState("fast", "before", trial->fast.before);
+            logState("replay", "before", trial->replay.before);
+            logState("fast", "after", trial->fast.after);
+            logState("replay", "after", trial->replay.after);
+            for (bool contacts : {false, true}) {
+                size_t index = 0;
+                const auto* field = contacts ? solver::sectionDiagnosticContactsDifference(
+                    trial->fast, trial->replay, index, g_verifyTol)
+                    : solver::sectionDiagnosticBatchesDifference(trial->fast, trial->replay, index);
+                snprintf(db, sizeof(db), "secdiff_collision_first: kind=%s field=%s index=%zu "
+                         "fastDropped=%zu replayDropped=%zu", contacts ? "solid" : "batch",
+                         field ? field : "none", index,
+                         contacts ? trial->fast.collisionContactsDropped : trial->fast.collisionBatchesDropped,
+                         contacts ? trial->replay.collisionContactsDropped : trial->replay.collisionBatchesDropped);
+                writeResult(db);
+            }
+            // Actual batch order and solid resolution are bounded, independent of stage alignment.
+            auto logCollisionCalls = [&](const char* side, const solver::SectionDiagnosticStep& step) {
+                for (size_t i = 0; i < step.collisionBatches.size(); ++i)
+                    logCollisionList(side, "actual_batch", i, step.collisionBatches[i]);
+                for (size_t i = 0; i < step.collisionContacts.size(); ++i) {
+                    const auto& c = step.collisionContacts[i];
+                    snprintf(db, sizeof(db), "secdiff_collision_solid: side=%s index=%zu player=%d "
+                             "uid=%d type=%d flags=%u dt=%.9g skip=%d finished=%d result=%d "
+                             "before=%.9g,%.9g,%.9g after=%.9g,%.9g,%.9g "
+                             "cachedRect=%.9g,%.9g,%.9g,%.9g rectDirty=%d "
+                             "lastPosition=%.9g,%.9g onSlope=%d wasOnSlope=%d unk_584=%.17g",
+                             side, i, c.player, c.uid, c.type, c.flags, c.dt, c.skip, c.finished, c.result,
+                             c.x, c.y, c.vy, c.afterX, c.afterY, c.afterVy,
+                             c.rect[0], c.rect[1], c.rect[2], c.rect[3], c.rectDirty,
+                             c.lastX, c.lastY, c.onSlope, c.wasOnSlope, c.slopeCorrection);
+                    writeResult(db);
+                }
+            };
+            logCollisionCalls("fast", trial->fast);
+            logCollisionCalls("replay", trial->replay);
+            for (bool supporting : {false, true}) {
+                const auto first = solver::sectionDiagnosticStagesDifference(
+                    trial->fast, trial->replay, g_verifyTol, supporting);
+                snprintf(db, sizeof(db), "secdiff_stage_first: kind=%s field=%s fastEvent=%zu "
+                         "replayEvent=%zu fastDropped=%zu replayDropped=%zu",
+                         supporting ? "supporting" : "output", first.field ? first.field : "none",
+                         first.fast, first.replay, trial->fast.stagesDropped, trial->replay.stagesDropped);
+                writeResult(db);
+            }
+            // Restore-only events are labeled explicitly and excluded from call alignment.
+            auto logStages = [&](const char* side, const solver::SectionDiagnosticStep& step) {
+                for (size_t i = 0; i < step.stages.size(); ++i) {
+                    const auto& stage = step.stages[i];
+                    // updateTimeMod's scalar call argument is speed, not a timestep.
+                    const char* valueName = std::strncmp(stage.name, "updateTimeMod_", 14) == 0
+                        ? "speed" : "dt";
+                    snprintf(db, sizeof(db), "secdiff_stage: side=%s event=%zu name=%s duringStep=%d "
+                             "actor=%d argument=%d flags=%d result=%d %s=%.9g",
+                             side, i, stage.name, stage.duringStep, stage.actor,
+                             stage.argument, stage.flags, stage.result, valueName, stage.dt);
+                    writeResult(db);
+                    char phase[96];
+                    snprintf(phase, sizeof(phase), "%zu:%s", i, stage.name);
+                    logState(side, phase, stage.state);
+                }
+            };
+            logStages("fast", trial->fast);
+            logStages("replay", trial->replay);
+            diagSteps.clear();
+        };
 
         auto releaseCp = [&](int ni) {
             if (ni <= 0) return;                       // the section checkpoint is never released
@@ -4007,6 +4388,11 @@ class $modify(GJBaseGameLayer) {
         try {
         if (cpRefused) stopWhy = "no-cp";
         for (int depth = 1; depth <= forward.horizon && foundLeaf < 0 && !cpRefused; ++depth) {
+            // Bound diagnostic history even when periodic checks are disabled or far apart.
+            for (auto it = diagSteps.begin(); it != diagSteps.end();) {
+                if (it->second.depth <= depth - 64) it = diagSteps.erase(it);
+                else ++it;
+            }
             solver::SectionExitChecks exitChecks;
             nxt.clear();
             seen.clear();
@@ -4099,12 +4485,19 @@ class $modify(GJBaseGameLayer) {
                 }
                 for (int branch = 0; branch < 2; ++branch) {
                     g_died = false;          // pick up this step's death verdict
+                    std::unique_ptr<solver::SectionDiagnosticStep> fastDiag;
+                    if (diagnose && !diagReported) {
+                        fastDiag = std::make_unique<solver::SectionDiagnosticStep>();
+                        fastDiag->depth = depth; fastDiag->input = branch;
+                    }
+                    DiagnosticScope fastTrace(nullptr, this);
                     if (g_snapOn) {
                         const auto snapT0 = std::chrono::steady_clock::now();   // print only
                         // Deaths are swallowed, so no wake is needed. Only the periodic
                         // phase pull-back remains, as a safety valve.
                         if (g_rephase > 0 && restores > 0
                             && restores % g_rephase == 0) rephase();
+                        fastTrace.arm(fastDiag.get(), this);
                         secRestoreFast({snaps[(size_t)ni], pulses[(size_t)ni],
                             states[(size_t)ni].get(), touches[(size_t)ni].get(),
                             (size_t)ni < acts.size() ? &acts[(size_t)ni] : nullptr,
@@ -4187,6 +4580,10 @@ class $modify(GJBaseGameLayer) {
                                          && branch == spinePlanHeld(depth);
                     g_stepSpine = isSpine;
                     g_stepDepth = depth;
+                    if (fastDiag) {
+                        fastDiag->before = captureDiag(false);
+                    }
+                    fastTrace.beginStep();
                     {
                         const auto stepT0 = std::chrono::steady_clock::now();   // print only
                         postmortem::g_secPhase = 20;
@@ -4217,7 +4614,9 @@ class $modify(GJBaseGameLayer) {
                         g_secStepMs += std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - stepT0).count();
                     }
+                    fastTrace.finish();
                     g_stepSpine = false;
+                    if (fastDiag) fastDiag->after = captureDiag(g_died);
                     auto* p = m_player1;
                     // A false death disappears before the periodic replay ever sees it.
                     // Try the nearest anchor first, but confirm its death from the section
@@ -4229,7 +4628,9 @@ class $modify(GJBaseGameLayer) {
                         std::vector<uint8_t> seq;
                         std::vector<int> path;
                         size_t replayed = 0;
+                        std::unique_ptr<DiagnosticTrial> trialDiag;
                         auto replay = [&](int from) {
+                            trialDiag.reset();
                             solver::sectionReplayPath(g_nodes, ni, from, path);
                             seq.clear();
                             for (int i : path) seq.push_back(g_nodes[(size_t)i].in);
@@ -4238,13 +4639,32 @@ class $modify(GJBaseGameLayer) {
                             replayed = 0;
                             for (size_t s = 0; s < seq.size(); ++s) {
                                 g_died = false;
+                                const int stepNode = s < path.size() ? path[s] : -1;
+                                const auto observed = diagSteps.find(stepNode);
+                                const auto* fast = s == path.size() ? fastDiag.get()
+                                    : (observed == diagSteps.end() ? nullptr : &observed->second);
+                                const bool observe = diagnose && !diagReported && !trialDiag && fast;
+                                std::unique_ptr<solver::SectionDiagnosticStep> replayDiag;
+                                if (observe) {
+                                    replayDiag = std::make_unique<solver::SectionDiagnosticStep>();
+                                    replayDiag->depth = depth - (int)(seq.size() - 1 - s);
+                                    replayDiag->input = seq[s]; replayDiag->before = captureDiag(false);
+                                }
+                                DiagnosticScope replayTrace(replayDiag.get(), this);
+                                replayTrace.beginStep();
                                 secStep(seq[s], dt); ++steps; ++replayed;
+                                replayTrace.finish();
+                                if (observe) {
+                                    replayDiag->after = captureDiag(g_died);
+                                    compareDiag(trialDiag, stepNode, from, fast, *replayDiag);
+                                }
                                 if (origin > 0 && from == 0) ++headReplaySteps;
                                 if (!m_player1 || m_player1->m_isDead || g_died) return false;
                             }
                             return true;
                         };
                         const auto result = solver::checkSectionReplay(origin, true, replay);
+                        publishDiag("protected_death", trialDiag);
                         noteHeadReplay("expand", depth, origin, result, replayed, seq.size());
                         ++spineChecks;
                         if (result.alive) ++spineRescued;
@@ -4417,6 +4837,7 @@ class $modify(GJBaseGameLayer) {
                         foundX = verifyX;
                         p = m_player1;
                         px = verifyX; py = verifyY; pv = verifyVy;
+                        fastDiag.reset();   // a leaf replay replaced this child's original observation
                         // The trial node has no descendants or retained checkpoint yet.
                         // Remove it before the common insertion so every array keeps one
                         // entry per node and only the replay-corrected state is recorded.
@@ -4554,6 +4975,8 @@ class $modify(GJBaseGameLayer) {
                         }
                     }
                     nxt.push_back((int)g_nodes.size() - 1);
+                    if (fastDiag && !diagReported)
+                        diagSteps.emplace(nxt.back(), std::move(*fastDiag));
                     if (isSpine) g_spineNext = nxt.back();
                     cpPeak = std::max(cpPeak, (long long)(cur.size() + nxt.size()));
                 }
@@ -4865,13 +5288,6 @@ class $modify(GJBaseGameLayer) {
                         if (a > 0 && g_anchors.count(a)) anc[k] = a;
                     }
                 }
-                // cfg secdriftwhere: for the node that drifted most in this pass, the first
-                // step at which the replay left the node's own ancestors, and the state on
-                // both sides there (psnapDrift says how far a branch ended up, not where).
-                struct DriftAt { int node = -1, depth = -1; double dy = 0.0, yR = 0.0,
-                                 yP = 0.0, vyR = 0.0, vyP = 0.0, xR = 0.0; int mode = -1,
-                                 up = -1; float size = 0.f; };
-                DriftAt worstDrift;
                 std::vector<int> path;
                 for (size_t k = 0; k < nxt.size(); ++k) {
                     // Long head replays yield between candidates, never halfway through one.
@@ -4879,6 +5295,7 @@ class $modify(GJBaseGameLayer) {
                     const int ni = nxt[k];
                     const int a = g_anchor ? anc[k] : -1;
                     const int origin = a > 0 ? a : 0;
+                    std::unique_ptr<DiagnosticTrial> trialDiag;
                     auto originCheck = [&](int origin) {
                         if (!psnap::g_snapAct || origin < 0 || (size_t)origin >= acts.size())
                             return;
@@ -4892,42 +5309,44 @@ class $modify(GJBaseGameLayer) {
                     // would start in a world where everything used before its origin is fresh
                     // again -- and since a9adab3 the node takes its flags from this replay. Put
                     // back the origin's own flags first, as the expansion path does.
-                    DriftAt here;
                     size_t replayed = 0;
                     auto replay = [&](int from) {
-                        here = {};   // discard observations from a failed anchor trial
                         solver::sectionReplayPath(g_nodes, ni, from, path);
                         seq.clear();
                         for (int i : path) seq.push_back(g_nodes[(size_t)i].in);
+                        trialDiag.reset();   // report only the final replay, not a failed anchor trial
                         restoreReplayOrigin(from, from > 0 ? g_anchors.at(from) : g_ckpt);
                         originCheck(from);
                         if (from > 0) ++vAnchored;
                         replayed = 0;
                         for (size_t s = 0; s < seq.size(); ++s) {
                             g_died = false;
-                            secStep((int)seq[s], dt); ++steps; ++replayed;
-                            if (origin > 0 && from == 0) ++headReplaySteps;
-                            if (!m_player1 || m_player1->m_isDead || g_died) return false;
-                            if (g_cfg.secDriftWhere && here.node < 0) {
-                                const auto& an = g_nodes[(size_t)path[s]];
-                                const double yR = m_player1->getPositionY();
-                                if (std::fabs(yR - (double)an.y) > 0.5) {
-                                    here.node = path[s];
-                                    here.depth = depth - (int)(seq.size() - 1 - s);
-                                    here.yR = yR; here.yP = an.y;
-                                    here.vyR = m_player1->m_yVelocity; here.vyP = an.vy;
-                                    here.xR = m_player1->getPositionX();
-                                    here.mode = (int)modeIdx(m_player1);
-                                    here.up = m_player1->m_isUpsideDown ? 1 : 0;
-                                    here.size = m_player1->m_vehicleSize;
-                                }
+                            const auto observed = diagSteps.find(path[s]);
+                            const auto* fast = observed == diagSteps.end() ? nullptr : &observed->second;
+                            const bool observe = diagnose && !diagReported && !trialDiag && fast;
+                            std::unique_ptr<solver::SectionDiagnosticStep> replayDiag;
+                            if (observe) {
+                                replayDiag = std::make_unique<solver::SectionDiagnosticStep>();
+                                replayDiag->depth = depth - (int)(seq.size() - 1 - s);
+                                replayDiag->input = seq[s]; replayDiag->before = captureDiag(false);
                             }
+                            DiagnosticScope replayTrace(replayDiag.get(), this);
+                            replayTrace.beginStep();
+                            secStep((int)seq[s], dt); ++steps; ++replayed;
+                            replayTrace.finish();
+                            if (origin > 0 && from == 0) ++headReplaySteps;
+                            if (observe) {
+                                replayDiag->after = captureDiag(g_died);
+                                compareDiag(trialDiag, path[s], from, fast, *replayDiag);
+                            }
+                            if (!m_player1 || m_player1->m_isDead || g_died) return false;
                         }
                         return true;
                     };
                     // Check both death paths: a spine can disappear here as well as during
                     // expansion. Ordinary dead branches retain the cheap anchored verdict.
                     const auto result = solver::checkSectionReplay(origin, ni == g_spineNext, replay);
+                    publishDiag("periodic", trialDiag);
                     noteHeadReplay("check", depth, origin, result, replayed, seq.size());
                     if (!result.alive) {
                         ++vDead;
@@ -4947,10 +5366,6 @@ class $modify(GJBaseGameLayer) {
                     const double dv = std::fabs(rv - (double)g_nodes[(size_t)ni].vy);
                     const double dmax = std::max(dx, std::max(dy, dv));
                     vMaxDy = std::max(vMaxDy, dmax);
-                    if (here.node >= 0 && dmax > worstDrift.dy) {
-                        worstDrift = here;
-                        worstDrift.dy = dmax;
-                    }
                     if (dx > g_verifyTol || dy > g_verifyTol || dv > g_verifyTol) ++vFixed;
                     if (!g_snapOn) {
                         CheckpointObject* cp = markCheckpointAtPhys(pl);
@@ -4972,6 +5387,11 @@ class $modify(GJBaseGameLayer) {
                     // A corrected snapshot must not be overwritten by stale dash/boost fields
                     // on the next expansion or when this node becomes a replay origin.
                     captureAux(ni);
+                    // A corrected node starts the next observation window from its real state.
+                    if (diagnose && !diagReported) {
+                        auto observed = diagSteps.find(ni);
+                        if (observed != diagSteps.end()) observed->second.after = captureDiag(false);
+                    }
                     // Retake from the real state. Skipping this means the match passed but
                     // the continuation grows from the old snapshot.
                     if (keepSnaps) {
@@ -5034,18 +5454,6 @@ class $modify(GJBaseGameLayer) {
                          depth, nxt.size(), vDead, vFixed, vMaxDy, ok.size(),
                          vAnchored);
                 writeResult(vb);
-                if (g_cfg.secDriftWhere && worstDrift.node >= 0) {
-                    char db[320];
-                    snprintf(db, sizeof(db),
-                             "secdrift: d=%d worst=%.3f firstAt d=%d t=%lld x=%.2f "
-                             "yReal=%.3f yPsnap=%.3f vyReal=%.3f vyPsnap=%.3f mode=%d up=%d "
-                             "size=%.2f",
-                             depth, worstDrift.dy, worstDrift.depth,
-                             (long long)(g_ckptTick + 1 + worstDrift.depth), worstDrift.xR,
-                             worstDrift.yR, worstDrift.yP, worstDrift.vyR, worstDrift.vyP,
-                             worstDrift.mode, worstDrift.up, worstDrift.size);
-                    writeResult(db);
-                }
                 nxt.swap(ok);
                 if (boundaryCheck) {
                     const bool extended = forward.extend(verifiedExits > 0);
@@ -5680,6 +6088,8 @@ class $modify(GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         solver::CommandStateScope commandState(g_tick);
         ++g_pcCalls;   // sole direct indicator that physics runs (goes to the heartbeat)
+        secsolve::diagnosticStage("processCommands_in", nullptr, 0,
+                                 (int)isHalfTick | ((int)isLastTick << 1), -1, dt);
         // Tick counter: this substep executes as number g_tick
         // Input injection: call handleButton directly before the target tick's substep
         // runs (exact injection in tick space, independent of the queue's
@@ -5746,6 +6156,8 @@ class $modify(GJBaseGameLayer) {
         }
         ev("processCommands", dt, isHalfTick, isLastTick);
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+        secsolve::diagnosticStage("processCommands_out", nullptr, 0,
+                                 (int)isHalfTick | ((int)isLastTick << 1), -1, dt);
         // Only the active PlayLayer advances the session bookkeeping. A scene swap takes
         // effect next frame, so within the same frame the old layer's remaining updates
         // still run and would dirty g_tick / the input cursor
@@ -7028,7 +7440,11 @@ class $modify(GJBaseGameLayer) {
         // and a per-half press would need the dual input split, which no probe
         // here varies.
         if (button == 1 && isPlayer1) g_btnDown = down;
+        secsolve::diagnosticStage("handleButton_in", nullptr, button,
+                                 (int)down | ((int)isPlayer1 << 1));
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        secsolve::diagnosticStage("handleButton_out", nullptr, button,
+                                 (int)down | ((int)isPlayer1 << 1));
     }
 
     int checkCollisions(PlayerObject* player, float dt, bool ignoreDamage) {
@@ -7037,7 +7453,10 @@ class $modify(GJBaseGameLayer) {
         // and the first test right after releasing noclip misdetects and dies instantly.
         // Pass-through is done via the no-op on the collidedWithObject side
         if (isP1) ev("checkCollisions", dt);
-        return GJBaseGameLayer::checkCollisions(player, dt, ignoreDamage);
+        secsolve::diagnosticStage("checkCollisions_in", player, 0, ignoreDamage, -1, dt);
+        const int r = GJBaseGameLayer::checkCollisions(player, dt, ignoreDamage);
+        secsolve::diagnosticStage("checkCollisions_out", player, 0, ignoreDamage, r, dt);
+        return r;
     }
 
     // A section solve makes checkpoints by the tens of thousands (markCheckpoint) and stores them
