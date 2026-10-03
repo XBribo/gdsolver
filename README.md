@@ -44,10 +44,11 @@ the other two none).
 These are other people's levels, solved by a bot. A solution is a TAS, not a
 completion: while the mod drives nothing is recorded, and its replays are marked as
 bot input (see [Safety](#safety--community-notes)). They are also custom levels,
-and unlike the official levels they are not guaranteed to solve: of 300 rated
-levels drawn at random, 258 cleared ([docs/CUSTOM_LEVELS.md](docs/CUSTOM_LEVELS.md)).
+and unlike the official levels they are not guaranteed to solve: of 100 rated
+levels drawn at random, 67 cleared, and of the 29 of those saved in 2.2, 11
+([docs/CUSTOM_LEVELS.md](docs/CUSTOM_LEVELS.md)).
 
-Give it a level and it finds an input sequence that clears it. It does not
+Give it a level and it looks for an input sequence that clears it. It does not
 re-implement the game's physics: an approximate, measured-where-it-matters model
 drives a **reachability DP** (which `(y, velocity)` states are reachable at every
 physics tick), and the game itself — running inside a **Geode mod** — is the
@@ -176,9 +177,10 @@ Around that loop:
 
 **Custom levels — most older ones solve; the newest gimmicks often do not yet.**
 Nothing in the loop is specific to the official levels, and any level can be
-picked. On the release build, 300 rated levels chosen at random were each given
-up to 20 minutes, and 258 cleared cold (86 %). Levels built only from parts that
-existed before 2.0 mostly solve as they are — 206 of the 215 that use nothing from
+picked. On the release build, 100 rated levels drawn at random, and 200 more
+drawn only from levels saved in 1.8 or earlier, were each given up to 20 minutes.
+Of the 100, 67 cleared cold. Levels built only from parts that existed before 2.0
+mostly solve as they are — 206 of the 215 across both draws that use nothing from
 2.0 on, and the model disagreed with the game about a fifth as often per tick on
 them as on the rest. Levels that lean on the 2.1 and 2.2 gimmicks often do not
 solve yet: of the levels saved in those versions, 35 of 49 and 11 of 29 cleared.

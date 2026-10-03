@@ -35,7 +35,12 @@ are the same as everywhere: while the mod drives, nothing is recorded.
 
 300 rated levels were drawn at random from the level server and solved cold with
 the release build — the same loop as the official ones, each level given up to
-20 minutes. Grouped by the game version the level was last saved in:
+20 minutes. The 300 are three draws of 100: one from rated levels of every
+version, which cleared 67, and two from levels saved in 1.8 or earlier (the
+second only from 1.8 levels with slopes and no dual), which cleared 95 and 96.
+The older levels are over-represented on purpose, so the total is not a rate for
+custom levels in general; every level saved in 2.0 or later below comes from the
+first draw. Grouped by the game version the level was last saved in:
 
 | saved in | parts it can contain | levels | cleared | the rest | rounds (median, cleared) |
 |---|---|--:|--:|---|--:|
@@ -45,7 +50,7 @@ the release build — the same loop as the official ones, each level given up to
 | 2.0 | robot, teleports, move and toggle triggers | 9 | 8 | 1 ran out of time | 6 |
 | 2.1 | spider, dash rings, many triggers | 49 | 35 | 14 ran out of time | 11 |
 | 2.2 | swing, area effects, many more triggers | 29 | 11 | 16 ran out of time, 2 gave up at a wall | 11 |
-| all | | 300 | 258 (86 %) | | |
+| all | | 300 | 258 | | |
 
 The version a level was saved in is only a guess at what it uses: a level saved in
 2.1 may hold nothing newer than 1.8. Grouped instead by the newest object a level
