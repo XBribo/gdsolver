@@ -619,6 +619,8 @@ struct Config {
     // 61-148 fixups recorded there per run against 9, and game deaths with p1 exact and p2 160 px
     // away.
     int dpCapLadder = 125;
+    // cfg `dpwavestraight`: Wave-only route preference, shared by DP and section searches.
+    bool dpWaveStraight = true;
     // cfg `dpplainbeside`: 1, the ladder's plain search starts with the ladder, in a second copy of
     // the solver core on a thread of its own, and the ladder takes its result where it would have
     // searched it (dp_bridge.hpp plainBeside). The call's answer is the same; only its time moves.

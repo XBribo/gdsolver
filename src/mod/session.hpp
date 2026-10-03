@@ -12,6 +12,7 @@ inline void uiSessionBase(int levelId) {
     resetSessionState();
     resetSecsolveSession();
     g_cfg = Config{};
+    g_cfg.dpWaveStraight = Mod::get()->getSettingValue<bool>("solve-wave-straight");
     // Panel sessions inherit only the diagnostic toggle, never autorun/solver settings.
     std::ifstream f(std::string(DATA_DIR) + "/autorun.cfg");
     std::string line;
@@ -567,6 +568,7 @@ inline bool loadDpCfg(const std::string& key, const std::string& val) {
     else if (key == "dpcheckfirst") g_cfg.dpCheckFirst = (val == "1");
     else if (key == "dpcontenthorizon") cfgNum(key, val, g_cfg.dpContentHorizon);
     else if (key == "dpcapladder") cfgNum(key, val, g_cfg.dpCapLadder);
+    else if (key == "dpwavestraight") g_cfg.dpWaveStraight = (val != "0");
     else if (key == "dpplainbeside") cfgNum(key, val, g_cfg.dpPlainBeside);
     else if (key == "dpinputgrid") cfgNum(key, val, g_cfg.dpInputGrid);
     else if (key == "dpphaseprof") g_cfg.dpPhaseProf = (val == "1");
@@ -707,6 +709,8 @@ namespace effcfg { inline std::string modCfg(); }
 inline std::string g_cfgDefaults;
 
 inline void loadConfig() {
+    // Autorun inherits the UI preference unless its cfg explicitly overrides it.
+    g_cfg.dpWaveStraight = Mod::get()->getSettingValue<bool>("solve-wave-straight");
     std::ifstream f(std::string(DATA_DIR) + "/autorun.cfg");
     if (!f.is_open()) return;
     if (g_cfgDefaults.empty()) g_cfgDefaults = effcfg::modCfg();

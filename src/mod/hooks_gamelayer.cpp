@@ -3344,6 +3344,12 @@ class $modify(GJBaseGameLayer) {
         g_nodes.push_back({-1, (uint8_t)(g_headHeld ? 1 : 0), 0, 0.f, 0.f, 0.f, 0,
                            (uint8_t)(m_player1 && m_player1->m_vehicleSize < 0.9f ? 1 : 0),
                            (uint8_t)(secDualP2() ? 1 : 0), secDualY2()});
+        // The two bodies share one input, so either active Wave enables the route cost.
+        auto waveHere = [&]() {
+            return m_player1 && dp::waveActive((uint8_t)modeIdx(m_player1),
+                m_gameState.m_isDualMode, m_player2 ? (uint8_t)modeIdx(m_player2) : 0);
+        };
+        g_nodes.back().wave = waveHere();
         g_dash.assign(1, secsolve::DashState{});  // section head (input unused)
         g_vy.assign(1, m_player1 ? m_player1->m_yVelocity : 0.0);
         g_accel.assign(1, m_player1 ? m_player1->m_accelerationOrSpeed : 0.0);
@@ -4451,6 +4457,11 @@ class $modify(GJBaseGameLayer) {
                     if (k <= mid && mid - k > 0) cur.push_back(byY[mid - k]);
                 }
             }
+            // Keep the spatial frontier intact; low-turn parents and their hold branch run first.
+            if (g_cfg.dpWaveStraight)
+                std::stable_sort(cur.begin(), cur.end(), [&](int a, int b) {
+                    return g_nodes[(size_t)a].waveTurns < g_nodes[(size_t)b].waveTurns;
+                });
             // cfg seccoins: ...and at a layer that can hold the answer, the parents that have taken
             // more coins go first (stable, so the order above holds among equals). Without it the
             // first leaf alive is taken whatever it holds, and a coin the window's route passes
@@ -4483,7 +4494,11 @@ class $modify(GJBaseGameLayer) {
                 } else if ((size_t)ni >= snaps.size() || snaps[(size_t)ni].empty()) {
                     continue;
                 }
-                for (int branch = 0; branch < 2; ++branch) {
+                for (int bi = 0; bi < 2; ++bi) {
+                    const auto& parent = g_nodes[(size_t)ni];
+                    const int branch = g_cfg.dpWaveStraight && parent.wave ? (parent.in ^ bi) : bi;
+                    const uint32_t waveTurns = g_cfg.dpWaveStraight
+                        ? dp::waveTurnCost(parent.waveTurns, parent.in, branch, parent.wave) : 0;
                     g_died = false;          // pick up this step's death verdict
                     std::unique_ptr<solver::SectionDiagnosticStep> fastDiag;
                     if (diagnose && !diagReported) {
@@ -4792,7 +4807,8 @@ class $modify(GJBaseGameLayer) {
                                            (float)py, (float)pv, (float)px,
                                            (uint16_t)secsolve::cntNow(this),
                                            (uint8_t)(p->m_vehicleSize < 0.9f ? 1 : 0),
-                                           (uint8_t)(secDualP2() ? 1 : 0), secDualY2()});
+                                           (uint8_t)(secDualP2() ? 1 : 0), secDualY2(),
+                                           waveHere(), waveTurns});
                         g_dash.emplace_back();
                         secCaptureDash(g_dash.back());
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);
@@ -4907,7 +4923,8 @@ class $modify(GJBaseGameLayer) {
                                            (float)py, (float)pv, (float)px,
                                            (uint16_t)cntHere,
                                            (uint8_t)(p->m_vehicleSize < 0.9f ? 1 : 0),
-                                           (uint8_t)(secDualP2() ? 1 : 0), secDualY2()});
+                                           (uint8_t)(secDualP2() ? 1 : 0), secDualY2(),
+                                           waveHere(), waveTurns});
                         g_dash.emplace_back();
                         secCaptureDash(g_dash.back());
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);
@@ -4949,7 +4966,8 @@ class $modify(GJBaseGameLayer) {
                                            (float)py, (float)pv, (float)px,
                                            (uint16_t)cntHere,
                                            (uint8_t)(p->m_vehicleSize < 0.9f ? 1 : 0),
-                                           (uint8_t)(secDualP2() ? 1 : 0), secDualY2()});
+                                           (uint8_t)(secDualP2() ? 1 : 0), secDualY2(),
+                                           waveHere(), waveTurns});
                         g_dash.emplace_back();
                         secCaptureDash(g_dash.back());
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);

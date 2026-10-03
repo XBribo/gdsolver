@@ -1,5 +1,6 @@
 #pragma once
 #include "dp/level_loader.hpp"
+#include "dp/wave_policy.hpp"
 
 namespace dp {
 
@@ -1104,6 +1105,9 @@ struct State {
     uint8_t flipT2 = 255, modeT2 = 255;
     float rot2 = 0.f, rotStep2 = 0.f;
     float dashSlope2 = 0.f;
+    // Search-only route cost, not physical identity. The fixed prefix has the same cost
+    // for every continuation, so an anchor starts at zero rather than needing a seed.
+    uint32_t waveTurns = 0;
 };
 
 // THIS ASSERT IS A QUESTION, NOT A BUDGET. If you added a field and the build
@@ -1192,8 +1196,9 @@ struct State {
 // and it seeds p1's, as boost2's note says of its own field. Not printed in --seeddump yet.
 // [2026-10-02] seatT2 (--dualseatt) landed in the padding after freeHalf: still 520. It accumulates
 // and is not seeded, as seatT is not.
+// [2026-10-04] 520 -> 528: waveTurns is search-only cost; an anchor's common prefix is omitted.
 constexpr size_t kStateBytes =
-    (520u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
+    (528u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
           + (sizeof(TouchMask) - sizeof(uint32_t))
           + 2u * (sizeof(GravLatch) - sizeof(Bits<128>)) + 7u) / 8u * 8u;
 static_assert(sizeof(State) == kStateBytes,
@@ -1220,5 +1225,11 @@ enum : uint32_t { kNone = 0xffffffffu };
 // deliberately small: the regression runs six levels at once, and six solves
 // each grabbing every core is slower than six solves taking a quarter of one.
 inline int g_threads = 4;
+inline bool g_waveStraight = true;
+
+// Preserve both velocity extremes; only an equal-velocity representative may lose on turns.
+inline bool fewerWaveTurns(const State& s, const State& old) {
+    return g_waveStraight && s.vy == old.vy && s.waveTurns < old.waveTurns;
+}
 
 }  // namespace dp

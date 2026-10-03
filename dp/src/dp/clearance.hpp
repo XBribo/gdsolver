@@ -186,11 +186,6 @@ inline bool tightHere(const std::vector<const Obj*>& near, double px, double py,
     return false;
 }
 
-// Lower is roomier. Ties keep the incumbent, so with the score off (every
-// `tight` still 0) this is exactly "the first accepted ordinal wins" -- the rule
-// that is there today, which is how the flag-off path stays bit-identical.
-inline bool roomierRoute(uint16_t cand, uint16_t held) { return cand < held; }
-
 // One live child, as the probe sees it.
 struct ClearSample {
     SearchKey key;

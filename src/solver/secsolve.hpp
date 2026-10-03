@@ -1,4 +1,5 @@
 #pragma once
+#include "dp/wave_policy.hpp"
 // ============================================================================
 // Section-limited GD solver (cfg `secsolve=1`)
 //
@@ -943,6 +944,8 @@ struct Node {
     uint8_t mini;    // player 1 mini? (a family of the cap under cfg secsizefam)
     uint8_t dual;    // in a dual section? (then y2 is player 2's y; see g_p2Key)
     float y2;
+    bool wave = false;           // either active body; not part of the physical key
+    uint32_t waveTurns = 0;      // turns since the section head (the prefix is constant)
 };
 inline std::vector<Node> g_nodes;
 // THE CHECKPOINT DOES NOT CARRY EVERY PLAYER MEMBER (cfg `seccpplayer`, on). A load puts back

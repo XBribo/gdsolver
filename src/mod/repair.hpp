@@ -2458,6 +2458,7 @@ inline std::vector<std::string> baseArgs(const std::string& out,
                                "--shipyq", num(tiered ? kTierYq : kYq),
                                "--shipvq", num(tiered ? kTierVq : kVq),
                                "--threads", kThreads};
+    a.push_back(g_cfg.dpWaveStraight ? "--wave-straight" : "--no-wave-straight");
     if (g_cfg.dpPhaseProf) a.push_back("--phaseprof");   // print only (see timedSolve)
     // --groupfire: searches only, which is what the flag says to the solver -- it changes how a
     // search SHARES a placement between states, which a replay (one state, its own fire ticks)

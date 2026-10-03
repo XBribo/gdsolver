@@ -330,6 +330,7 @@ inline std::string modCfg() {
     put(s, "dpcheckfirst", g_cfg.dpCheckFirst);
     put(s, "dpcontenthorizon", g_cfg.dpContentHorizon);
     put(s, "dpcapladder", g_cfg.dpCapLadder);
+    put(s, "dpwavestraight", g_cfg.dpWaveStraight);
     put(s, "dpplainbeside", g_cfg.dpPlainBeside);
     put(s, "dpinputgrid", g_cfg.dpInputGrid);
     put(s, "dpphaseprof", g_cfg.dpPhaseProf);

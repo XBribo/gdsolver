@@ -1019,6 +1019,8 @@ inline int cliMainOnce(int argc, char** argv) {
         // Instrumentation only (dp/clearance.hpp). Reads the children after they
         // are stepped and keyed; never feeds anything back into the search.
         if (!std::strcmp(argv[i], "--clearprobe")) g_clearProbe = true;
+        if (!std::strcmp(argv[i], "--wave-straight")) g_waveStraight = true;
+        if (!std::strcmp(argv[i], "--no-wave-straight")) g_waveStraight = false;
         // --refwatch <trace.csv>: follow that trajectory through the search and
         // name the gate that drops it (refwatch.hpp).
         if (!std::strcmp(argv[i], "--refwatch") && i + 1 < argc) {
@@ -3834,6 +3836,11 @@ inline int cliMainOnce(int argc, char** argv) {
                 if (c > most) { most = c; best = i; }
             }
         }
+        if (g_waveStraight)
+            for (size_t i = 0; i < v.size(); ++i) {
+                if (coinOn && v[i].coins != v[best].coins) continue;
+                if (v[i].waveTurns < v[best].waveTurns) best = i;
+            }
         return v[best];
     };
     // ---- WHAT A COIN NEEDS COUNTED BEFORE IT CAN BE HAD --------------------
@@ -4670,12 +4677,14 @@ inline int cliMainOnce(int argc, char** argv) {
         std::vector<KeyRec> recs;
         uint32_t goalOrd = kNone;
         uint16_t goalTight = 0xffff;
+        uint32_t goalWaveTurns = 0;
         // Clear representatives together with the group's exact-key table.
         void clear() {
             SearchKeyMap<uint32_t>::clear();
             recs.clear();
             goalOrd = kNone;
             goalTight = 0xffff;
+            goalWaveTurns = 0;
         }
     };
     std::vector<ShardMap> shards;
@@ -5375,6 +5384,9 @@ inline int cliMainOnce(int argc, char** argv) {
             const int wgFrame = (int)s.frame;               // --walkgates (below)
             const uint8_t wgPrev = s.action;
             State c = stepBoth(s, (uint8_t)curIn, K, rdead);
+            if (g_waveStraight)
+                c.waveTurns = waveTurnCost(s.waveTurns, s.action, curIn,
+                                          waveActive(s.mode, s.dual, s.mode2));
             c.action = (uint8_t)curIn;
             s = c;
             // --seeddump <t>: the state's ACCUMULATED fields at one tick.
@@ -5935,9 +5947,8 @@ inline int cliMainOnce(int argc, char** argv) {
                 // NEXT iteration), so every other state that got past goalX is
                 // emitted too and only loses to this latch. Measured on lv16:
                 // 2,000 of them, whose lineages stay distinct for 3,345 ticks.
-                // Keep the roomiest instead of the first; with the score off
-                // they all read 0 and the incumbent always wins, which is the
-                // old latch exactly.
+                // With --wave-straight, fewer turns rank first and clearance breaks ties.
+                // Otherwise keep the original roomiest-route rule.
                 // --coins: the end of the level is not the goal on its own.
                 // A lineage that reached it without the full set is not a
                 // solution, and saying so HERE rather than filtering afterwards
@@ -5945,7 +5956,8 @@ inline int cliMainOnce(int argc, char** argv) {
                 // reporting the first thing that got to the end.
                 if (s.frame == 0 && (double)s.xAbs >= goalX
                     && (!coinOn || s.coins == (uint8_t)coinAll)
-                    && (!solved || roomierRoute(s.tight, goalState.tight))) {
+                    && (!solved || preferWaveRoute(s.waveTurns, s.tight, goalState.waveTurns,
+                                                   goalState.tight, g_waveStraight))) {
                     solved = true;
                     goalState = s;
                 }
@@ -5966,6 +5978,10 @@ inline int cliMainOnce(int argc, char** argv) {
                     nxt.push_back(State{});
                     sl.lo = (int)nxt.size() - 1;
                 }
+                finish(nxt[(size_t)sl.lo]);
+            } else if (fewerWaveTurns(s, nxt[(size_t)sl.hi])) {
+                finish(nxt[(size_t)sl.hi]);
+            } else if (sl.lo != sl.hi && fewerWaveTurns(s, nxt[(size_t)sl.lo])) {
                 finish(nxt[(size_t)sl.lo]);
             }
         };
@@ -6427,6 +6443,11 @@ inline int cliMainOnce(int argc, char** argv) {
             // hashed to the same cell -- which is the whole bug the rHover
             // note in keyOf describes.
             kid.s.action = (uint8_t)input;
+            // Only the cost reads the anchor's raw hold. Do not rewrite `action`: other
+            // bodies can have pending delayed input, including in a mixed Wave dual.
+            if (g_waveStraight)
+                kid.s.waveTurns = waveTurnCost(s.waveTurns, K.t == t0 + 1 ? s.held : s.action, input,
+                                              waveActive(s.mode, s.dual, s.mode2));
             if (g_minPulse > 1)
                 kid.s.edgeAge = (input != (int)s.action)
                                     ? 0 : (uint8_t)std::min(254, (int)s.edgeAge + 1);
@@ -6917,18 +6938,27 @@ inline int cliMainOnce(int argc, char** argv) {
                             r.loIdx = i;
                             r.loVy = vy;
                             accepted = true;
+                        } else if (fewerWaveTurns(kids[i].s, kids[r.hiIdx].s)) {
+                            r.hiIdx = i;
+                            if (r.bOrd == kNone) r.loIdx = i;
+                            accepted = true;
+                        } else if (r.bOrd != kNone
+                                   && fewerWaveTurns(kids[i].s, kids[r.loIdx].s)) {
+                            r.loIdx = i;
+                            accepted = true;
                         }
                     }
-                    // Same change as the serial path: keep the roomiest goal
-                    // state this shard saw rather than its first. `goalTight`
-                    // starts at 0xffff, so with the score off the first one wins
-                    // and nothing after it can tie-break past it -- the old
-                    // "smallest accepted ordinal" rule, unchanged.
-                    if (accepted && !solved && (double)kids[i].s.xAbs >= goalX
+                    // Same ordering as serial emit: Wave turns first when enabled,
+                    // then clearance. Exact ties keep the first accepted ordinal.
+                    if (accepted && (!solved || g_waveStraight) && kids[i].s.frame == 0
+                        && (!coinOn || kids[i].s.coins == (uint8_t)coinAll)
+                        && (double)kids[i].s.xAbs >= goalX
                         && (sm.goalOrd == kNone
-                            || roomierRoute(kids[i].s.tight, sm.goalTight))) {
+                            || preferWaveRoute(kids[i].s.waveTurns, kids[i].s.tight,
+                                               sm.goalWaveTurns, sm.goalTight, g_waveStraight))) {
                         sm.goalOrd = i;
                         sm.goalTight = kids[i].s.tight;
+                        sm.goalWaveTurns = kids[i].s.waveTurns;
                     }
                 }
             });
@@ -6956,23 +6986,25 @@ inline int cliMainOnce(int argc, char** argv) {
                 nxt.back().parent = (uint32_t)(arena.size() - 1);
                 nxt.back().action = action;
             }
-            if (!solved) {
-                // Across shards, the same rule as within one: roomiest first,
-                // the smaller ordinal breaking ties. With the score off every
-                // tight is 0, no candidate is ever "roomier", and this reduces
-                // to min(goalOrd) -- the rule it replaced, bit for bit.
+            if (!solved || g_waveStraight) {
+                // Across shards, use the same route cost and ordinal tie-break as emit.
                 uint32_t g = kNone;
                 uint16_t gt = 0xffff;
+                uint32_t gw = 0;
                 for (size_t si = 0; si < nsh; ++si) {
                     const uint32_t o = shards[si].goalOrd;
                     if (o == kNone) continue;
                     const uint16_t ot = shards[si].goalTight;
-                    if (g == kNone || ot < gt || (ot == gt && o < g)) {
+                    const uint32_t ow = shards[si].goalWaveTurns;
+                    if (g == kNone || preferWaveRoute(ow, ot, gw, gt, g_waveStraight)
+                        || (ot == gt && (!g_waveStraight || ow == gw) && o < g)) {
                         g = o;
                         gt = ot;
+                        gw = ow;
                     }
                 }
-                if (g != kNone) {
+                if (g != kNone && (!solved || preferWaveRoute(gw, gt, goalState.waveTurns,
+                                                             goalState.tight, g_waveStraight))) {
                     const State& from = cur[gidx[g >> 1]];
                     const uint8_t action = (uint8_t)(g & 1);
                     arena.push_back(
@@ -7242,6 +7274,7 @@ inline int cliMainOnce(int argc, char** argv) {
                         if (std::memcmp(a.fireB, b.fireB, sizeof(a.fireB)) != 0) diff += " fireB";
                         if (a.trigT != b.trigT) diff += " trigT";
                         if (a.tight != b.tight) diff += " tight";
+                        if (a.waveTurns != b.waveTurns) diff += " waveTurns";
                         if (a.rot != b.rot || a.rotNeg != b.rotNeg || a.rotStep != b.rotStep
                             || a.rotBoost != b.rotBoost)
                             diff += " rot";
@@ -7251,6 +7284,7 @@ inline int cliMainOnce(int argc, char** argv) {
                         std::memcpy(a.fireB, b.fireB, sizeof(a.fireB));
                         a.trigT = b.trigT;
                         a.tight = b.tight;
+                        a.waveTurns = b.waveTurns;
                         // ...and the sprite angle (rot / rotNeg / rotStep), which the key
                         // leaves out too; named when it is the difference.
                         const bool rotDiff = a.rot != b.rot || a.rotNeg != b.rotNeg
@@ -7397,6 +7431,9 @@ inline int cliMainOnce(int argc, char** argv) {
                        // the many that are merely inside its window. 0 without
                        // the flag, so every existing partition is unchanged.
                        ^ ((uint64_t)s.coins << 40)
+                       // Both Wave button levels retain a cap share, including the turn branch.
+                       ^ ((g_waveStraight && waveActive(s.mode, s.dual, s.mode2) && s.action)
+                              ? 0xD6E8FEB86659FD93ull : 0)
                        // ...and the FLIGHT BAND. Every ship state is otherwise
                        // one class, so the water-fill samples the whole layer at
                        // one stride -- and a route that has to thread many
@@ -7455,6 +7492,16 @@ inline int cliMainOnce(int argc, char** argv) {
                 const std::vector<uint32_t>& v = byCls[ord[n]];
                 const size_t fair = left / (ord.size() - n);
                 const size_t take = std::min(v.size(), fair);
+                const bool wave = g_waveStraight && std::any_of(v.begin(), v.end(),
+                    [&](uint32_t j) { return waveActive(nxt[j].mode, nxt[j].dual, nxt[j].mode2); });
+                // Only choose within each existing stride window, preserving cap coverage.
+                auto sample = [&](const std::vector<uint32_t>& pool, double i, double stride) {
+                    const size_t first = (size_t)i;
+                    const size_t end = std::min(pool.size(), (size_t)(i + stride));
+                    const size_t pick = wave ? waveSample(first, end, first,
+                        [&](size_t j) { return nxt[pool[j]].waveTurns; }) : first;
+                    return pool[pick];
+                };
                 if (take == v.size()) {
                     keepIdx.insert(keepIdx.end(), v.begin(), v.end());
                 } else if (g_capEnvelope && take >= 3) {
@@ -7477,11 +7524,11 @@ inline int cliMainOnce(int argc, char** argv) {
                         if (k != lo && k != hi) rest.push_back(v[k]);
                     const double stride = (double)rest.size() / (double)(take - 2);
                     for (double i = 0; (size_t)i < rest.size(); i += stride)
-                        keepIdx.push_back(rest[(size_t)i]);
+                        keepIdx.push_back(sample(rest, i, stride));
                 } else if (take > 0) {
                     const double stride = (double)v.size() / (double)take;
                     for (double i = 0; (size_t)i < v.size() && take > 0; i += stride)
-                        keepIdx.push_back(v[(size_t)i]);
+                        keepIdx.push_back(sample(v, i, stride));
                 }
                 left -= std::min(left, take);
             }
@@ -8312,6 +8359,9 @@ inline int cliMainOnce(int argc, char** argv) {
             const double rPrevY = (double)s.y;
             const int rFrame0 = (int)s.frame;
             State c = stepBoth(s, lvl[i], K, rdead);
+            if (g_waveStraight)
+                c.waveTurns = waveTurnCost(s.waveTurns, s.action, lvl[i],
+                                          waveActive(s.mode, s.dual, s.mode2));
             // ...and turn, the way the search's kid does at :3108. Same gate
             // (`!dead && !g_rotTrig.empty()`), same arguments, and it has to run
             // BEFORE the row is written or the trace records a position in a

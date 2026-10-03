@@ -30,6 +30,12 @@
 			"description": "The search takes a shortcut as soon as it will do instead of waiting for its full ladder. Usually faster, but the same level can take a different route and time from one solve to the next, and it is no more certain to be solved. Every plan is still checked by the game itself. Takes effect at the next Solve.",
 			"default": false
 		},
+		"solve-wave-straight": {
+			"type": "bool",
+			"name": "Solve: prefer straight Wave routes",
+			"description": "Prefer fewer Wave direction changes while retaining spatial coverage. Other modes keep their existing input preference. This is a heuristic, not a guarantee of the globally fewest turns. Takes effect at the next Solve.",
+			"default": true
+		},
 		"key-overlay": {
 			"type": "keybind",
 			"name": "Hide the overlay",

@@ -352,6 +352,7 @@ inline void resetInvocationState() {
 
     // state.hpp
     g_threads = 4;
+    g_waveStraight = true;
 
     // thread_pool.hpp
     g_aliveCap = 16000;

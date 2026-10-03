@@ -219,6 +219,7 @@ inline std::string defaultsProfile() {
     put(s, "g_shiftDbgDone", g_shiftDbgDone);
     put(s, "g_snapOut", g_snapOut);
     put(s, "g_threads", g_threads);
+    put(s, "g_waveStraight", g_waveStraight);
     put(s, "g_aliveCap", g_aliveCap);
     put(s, "g_memStat", g_memStat);
     put(s, "g_phaseProf", g_phaseProf);
