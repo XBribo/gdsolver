@@ -8,6 +8,20 @@
 
 using namespace p1;
 
+// Borrow the production node's restore components.
+struct SecFastRestoreView {
+    const std::vector<uint8_t>& player;
+    const psnap::EMState& effects;
+    GJGameState* state;
+    const psnap::Touch* touch;
+    const std::vector<uint8_t>* acts;
+    const std::vector<uint8_t>* world;
+    int held;
+    const secsolve::DashState& dash;
+    double vy, accel;
+    bool pad;
+};
+
 // The rest of the player at each entry snapshot, same index as g_snaps (cfg snapplayer): what
 // psnap's byte copy cannot carry -- the containers (the slope map, the touched rings and pads) and
 // the pointers to the objects the player stands on, rides or dashes from -- carried by C++
@@ -871,6 +885,10 @@ class $modify(GJBaseGameLayer) {
                         if (g_cfg.oobTest && m_player1)
                             reinterpret_cast<char*>(m_player1)[kOobLatchOff] = 1;
                         secCaptureDash(secsolve::g_ckptDash);
+                        secsolve::g_ckptAccel = m_player1
+                            ? m_player1->m_accelerationOrSpeed : 0.0;
+                        secsolve::g_ckptPad = m_player1 && m_player1->m_touchedPad;
+                        secCaptureInputs(secsolve::g_ckptInputs);
                         // ...and player 2's, for a section search's head (cfg secheaddash)
                         if (m_player2 && m_player2 != m_player1)
                             secCaptureDash(secsolve::g_ckptDash2, m_player2);
@@ -1306,7 +1324,7 @@ class $modify(GJBaseGameLayer) {
                         + " oobAtCkpt=" + std::to_string((int)g_ckptOobLatch)
                         + " oobGDLeft=" + std::to_string(wasLatch)
                         + " dashGDLeft=" + std::to_string(wasDash)
-                        + " dashAtCkpt=" + std::to_string((int)secsolve::g_ckptDash.on));
+                        + " dashAtCkpt=" + std::to_string((int)secsolve::g_ckptDash[0].on));
                     {
                         char vb[224];
                         snprintf(vb, sizeof(vb),
@@ -1882,7 +1900,8 @@ class $modify(GJBaseGameLayer) {
     // avoids the "hold a huge number of full object states" that caused the old
     // implementation's OOM. Replaying the prefix costs about 0.007ms per tick, cheap
     // compared with a restore (2.02ms).
-    void secRestore(PlayLayer* pl) { secRestoreFrom(pl, g_ckpt); }
+    // The bot shadow must agree with the restored hold, or the next tick invents an edge.
+    void secRestore(PlayLayer* pl) { secRestoreFrom(pl, g_ckpt, g_headHeld); }
 
     // Rebuild a held button without an edge.
     //
@@ -1906,54 +1925,75 @@ class $modify(GJBaseGameLayer) {
     // ahead of time does not help either -- loadFromCheckpoint overwrites the
     // field from the UI before it reads it. So it is written back here.
     void secCaptureDash(secsolve::DashState& d, PlayerObject* who = nullptr) {
-        auto* p = who ? who : m_player1;
-        if (!p) { d = secsolve::DashState{}; return; }
-        d.on = p->m_isDashing;
-        d.ring = reinterpret_cast<GameObject*>(p->m_dashRing);
-        d.x = p->m_dashX;
-        d.y = p->m_dashY;
-        d.angle = p->m_dashAngle;
-        d.startTime = p->m_dashStartTime;
-        d.lastGround = p->m_lastGroundObject;
-        d.maybeLastGround = p->m_maybeLastGroundObject;
-        d.preLastGround = p->m_preLastGroundObject;
-        d.collided = p->m_collidedObject;
-        d.collideLeft = p->m_collidingWithLeft;
-        d.collideRight = p->m_collidingWithRight;
-        d.slope = p->m_currentSlope;
-        d.slope2 = p->m_currentSlope2;
-        d.potentialSlope = p->m_currentPotentialSlope;
-        d.snappedTo = p->m_objectSnappedTo;
-        d.lastPortal = p->m_lastActivatedPortal;
-        d.jumpBuf = (int8_t)(p->m_jumpBuffered ? 1 : 0);
+        PlayerObject* players[] = {who ? who : m_player1, who ? nullptr : m_player2};
+        for (size_t i = 0; i < d.size(); ++i) {
+            auto& out = d[i];
+            auto* p = players[i];
+            if (!p) { out = {}; continue; }
+            out.present = true;
+            out.dead = p->m_isDead;
+            out.vy = p->m_yVelocity;
+            out.accel = p->m_accelerationOrSpeed;
+            out.pad = p->m_touchedPad;
+            out.oobLatch = (unsigned char)reinterpret_cast<const char*>(p)[kOobLatchOff];
+            solver::captureInputContinuation(p, out.input);
+            out.on = p->m_isDashing;
+            out.ring = reinterpret_cast<GameObject*>(p->m_dashRing);
+            out.x = p->m_dashX;
+            out.y = p->m_dashY;
+            out.angle = p->m_dashAngle;
+            out.startTime = p->m_dashStartTime;
+            out.lastGround = p->m_lastGroundObject;
+            out.maybeLastGround = p->m_maybeLastGroundObject;
+            out.preLastGround = p->m_preLastGroundObject;
+            out.collided = p->m_collidedObject;
+            out.collideLeft = p->m_collidingWithLeft;
+            out.collideRight = p->m_collidingWithRight;
+            out.slope = p->m_currentSlope;
+            out.slope2 = p->m_currentSlope2;
+            out.potentialSlope = p->m_currentPotentialSlope;
+            out.snappedTo = p->m_objectSnappedTo;
+            out.lastPortal = p->m_lastActivatedPortal;
+        }
     }
+    // Restore both bodies directly: handleButton would fire real release/toggle events.
     void secRestoreDash(const secsolve::DashState& d, PlayerObject* who = nullptr) {
-        auto* p = who ? who : m_player1;
-        if (!p) return;
-        p->m_isDashing = d.on;
-        p->m_dashRing = reinterpret_cast<DashRingObject*>(d.ring);
-        p->m_dashX = d.x;
-        p->m_dashY = d.y;
-        p->m_dashAngle = d.angle;
-        p->m_dashStartTime = d.startTime;
-        p->m_lastGroundObject = d.lastGround;
-        p->m_maybeLastGroundObject = d.maybeLastGround;
-        p->m_preLastGroundObject = d.preLastGround;
-        p->m_collidedObject = d.collided;
-        p->m_collidingWithLeft = d.collideLeft;
-        p->m_collidingWithRight = d.collideRight;
-        p->m_currentSlope = d.slope;
-        p->m_currentSlope2 = d.slope2;
-        p->m_currentPotentialSlope = d.potentialSlope;
-        p->m_objectSnappedTo = d.snappedTo;
-        p->m_lastActivatedPortal = d.lastPortal;
+        PlayerObject* players[] = {who ? who : m_player1, who ? nullptr : m_player2};
+        for (size_t i = 0; i < d.size(); ++i) {
+            auto* p = players[i];
+            const auto& in = d[i];
+            if (!p || !in.present) continue;
+            p->m_isDead = in.dead;
+            p->m_yVelocity = in.vy;
+            p->m_accelerationOrSpeed = in.accel;
+            p->m_touchedPad = in.pad;
+            reinterpret_cast<char*>(p)[kOobLatchOff] = (char)in.oobLatch;
+            solver::restoreInputContinuation(p, in.input);
+            p->m_isDashing = in.on;
+            p->m_dashRing = reinterpret_cast<DashRingObject*>(in.ring);
+            p->m_dashX = in.x;
+            p->m_dashY = in.y;
+            p->m_dashAngle = in.angle;
+            p->m_dashStartTime = in.startTime;
+            p->m_lastGroundObject = in.lastGround;
+            p->m_maybeLastGroundObject = in.maybeLastGround;
+            p->m_preLastGroundObject = in.preLastGround;
+            p->m_collidedObject = in.collided;
+            p->m_collidingWithLeft = in.collideLeft;
+            p->m_collidingWithRight = in.collideRight;
+            p->m_currentSlope = in.slope;
+            p->m_currentSlope2 = in.slope2;
+            p->m_currentPotentialSlope = in.potentialSlope;
+            p->m_objectSnappedTo = in.snappedTo;
+            p->m_lastActivatedPortal = in.lastPortal;
+        }
     }
     // cfg secjbkeep: the point's own m_jumpBuffered, written after secArmHold has raised it (see
     // secsolve::g_jbKeep). Only the section search's own restores call this.
     void secRestoreJb(const secsolve::DashState& d, PlayerObject* who = nullptr) {
         auto* p = who ? who : m_player1;
-        if (!secsolve::g_jbKeep || !p || d.jumpBuf < 0) return;
-        p->m_jumpBuffered = d.jumpBuf != 0;
+        if (!secsolve::g_jbKeep || !p || !d[0].present) return;
+        p->m_jumpBuffered = d[0].input.jumpBuffered;
     }
 
     // Player 2's share of the per-node extras (cfg secp2extras, secsolve::g_dash2 and the rest):
@@ -1991,8 +2031,7 @@ class $modify(GJBaseGameLayer) {
         q->m_touchedPad = secsolve::g_pad2[ni] != 0;
     }
 
-    // m_holdingButtons alone is not enough to restore a held button.
-    // m_jumpBuffered must be set too (cfg `secjumpbuf=0` turns this off; default ON).
+    // Search restores the captured input continuation, not an assumed pending jump.
     //
     // History (2026-08-13, the lv22 rotated-section wall at t=12,029 / x=16,165):
     // the input sequence the section solver bought died in plain replay. The checkpoint
@@ -2011,15 +2050,16 @@ class $modify(GJBaseGameLayer) {
     //                               split depth=-1 (the split disappeared)
     // The worry that a false solution slips through is covered by verify: that check only
     // passes when "search transition = plain replay". It is switchable only for A/B.
-    void secArmHold() {
-        auto arm = [](PlayerObject* p) {
-            if (!p) return;
-            p->m_holdingButtons[1] = true;
-            if (secsolve::g_jumpBuf) p->m_jumpBuffered = true;
-        };
-        arm(m_player1);
-        arm(m_player2);
-        secsolve::g_held = 1;
+    // Capture both players, including the inactive body's own button table.
+    void secCaptureInputs(secsolve::InputStates& out) {
+        solver::captureInputContinuation(m_player1, out[0]);
+        solver::captureInputContinuation(m_player2, out[1]);
+    }
+
+    // Reapply the actual checkpoint input without manufacturing a new edge.
+    void secRestoreInputs(const secsolve::InputStates& in) {
+        solver::restoreInputContinuation(m_player1, in[0]);
+        solver::restoreInputContinuation(m_player2, in[1]);
     }
 
     // heldAfter: whether the button was held at the moment of the restore. The checkpoint
@@ -2042,11 +2082,13 @@ class $modify(GJBaseGameLayer) {
             g_secResetMs += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - r0).count();
         }
+        // Native 2.2081 loadFromCheckpoint skips p2 when the saved dual flag is off.
+        // Use its player checkpoint before applying exact/input supplements, not psnap's mask.
+        if (!cp->m_gameState.m_isDualMode && pl->m_player2 && cp->m_player2Checkpoint)
+            pl->m_player2->loadFromCheckpoint(cp->m_player2Checkpoint);
         g_restorePending = false;
-        // The button state after a restore is not necessarily "released". Assuming so and
-        // setting g_held=0 means that, while actually still held, no difference shows up,
-        // handleButton is not called, and the wave flies the wrong way. Release explicitly
-        // first, then put it into a known state.
+        // Reconstruct continuity directly. Native handleButton fires release events and
+        // touch toggles even when called only to reset the bot's input bookkeeping.
         // resetLevel pushes a button command of its own on EVERY restore --
         // {button=1, push=<is the UI holding?>, ts=0} -- and a bot's UI holds
         // nothing, so what it pushes is a RELEASE. It is consumed on the first
@@ -2072,26 +2114,20 @@ class $modify(GJBaseGameLayer) {
         // a bot's UI holding nothing), and because draining it cannot make a
         // section restore less faithful. Not kept as an explanation.
         pl->m_queuedButtons.clear();
-        g_injecting = true;
-        this->handleButton(false, 1, true);
-        g_injecting = false;
-        secsolve::g_held = 0;
-        if (heldAfter) secArmHold();
-        // cfg secheaddash: back at the head, each body's dash as the plain flight had it (the
-        // load never carries one); the head's DashState is then taken from this
-        if (secsolve::g_headDash && cp == g_ckpt) {
+        for (auto* p : {m_player1, m_player2})
+            if (p) p->m_holdingButtons[1] = heldAfter != 0;
+        secsolve::g_held = heldAfter;
+        // Head replays must not inherit fields left by qualification or another branch.
+        if (cp == g_ckpt && m_player1) {
             secRestoreDash(secsolve::g_ckptDash);
-            if (auto* q = secP2()) secRestoreDash(secsolve::g_ckptDash2, q);
+            m_player1->m_yVelocity = g_ckptVy;
+            m_player1->m_accelerationOrSpeed = secsolve::g_ckptAccel;
+            m_player1->m_touchedPad = secsolve::g_ckptPad;
+            reinterpret_cast<char*>(m_player1)[kOobLatchOff] = (char)g_ckptOobLatch;
         }
-        // cfg secjbkeep: back at the head, each body's m_jumpBuffered as the plain flight had it
-        if (secsolve::g_jbKeep && cp == g_ckpt) {
-            if (m_player1 && secsolve::g_headJb[0] >= 0)
-                m_player1->m_jumpBuffered = secsolve::g_headJb[0] != 0;
-            if (m_player2 && m_player2 != m_player1 && secsolve::g_headJb[1] >= 0)
-                m_player2->m_jumpBuffered = secsolve::g_headJb[1] != 0;
-        }
-        // cfg secforcesize: back at the head, at the size asked for. (Where the search then puts
-        // the plain flight's player over the load, it forces the size again after it.)
+        // Native 2.2081 omits +0x986, and PlayLayer overwrites +0x985 from UI input.
+        // Qualification and head replays must retain what the bot actually captured.
+        if (cp == g_ckpt) secRestoreInputs(secsolve::g_ckptInputs);
         if (secsolve::g_forceP1Size >= 0 && cp == g_ckpt && m_player1
             && (m_player1->m_vehicleSize < 0.9f) != (secsolve::g_forceP1Size == 1))
             m_player1->togglePlayerScale(secsolve::g_forceP1Size == 1, true);
@@ -2106,6 +2142,7 @@ class $modify(GJBaseGameLayer) {
     // broken". The input granularity also becomes 4 ticks, changing the meaning of the
     // search.
     void secStep(int down, float) {
+        secStepBegin(PlayLayer::get());
         secsolve::g_feed = down;
         GJBaseGameLayer::update((float)secsolve::g_dt);
     }
@@ -2152,11 +2189,49 @@ class $modify(GJBaseGameLayer) {
             }
         }
         CheckpointObject* cp = pl->markCheckpoint();
+        // createCheckpoint (2.2081 RVA 0x3b4fc0) omits inactive p2 entirely.
+        // Its native owner releases this retained checkpoint with the other body.
+        if (cp && m_player2 && !cp->m_player2Checkpoint) {
+            auto* saved = PlayerCheckpoint::create();
+            saved->retain();
+            cp->m_player2Checkpoint = saved;
+            m_player2->saveToCheckpoint(saved);
+        }
         for (int i = 0; i < 2; ++i)
             if (moved[i]) ps[i]->setPosition(drawn[i]);
         return cp;
     }
 
+    // Shared production restore; input restoration never calls gameplay button callbacks.
+    void secRestoreFast(const SecFastRestoreView& saved) {
+        psnap::restoreGroups(this, saved.effects);
+        if (secsolve::g_worldOn && saved.world)
+            psnap::restoreWorld(this, secsolve::g_movSet, *saved.world);
+        if (saved.touch) psnap::restoreCollisionEnvironment(this, *saved.touch);
+        psnap::restore(m_player1, this, saved.player.data());
+        psnap::restoreEM(this, saved.effects);
+        if (saved.state) psnap::restoreState(this, *saved.state);
+        if (saved.touch) psnap::restoreTouch(m_player1, *saved.touch, this);
+        if (saved.acts) psnap::restoreAct(*saved.acts);
+        if (secsolve::g_trailClear) {
+            for (PlayerObject* p : {m_player1, m_player2})
+                if (p && p->m_waveTrail && p->m_waveTrail->m_pointArray)
+                    p->m_waveTrail->m_pointArray->removeAllObjects();
+        }
+        secRestoreDash(saved.dash);
+        secsolve::g_held = saved.held;
+        if (m_player1) {
+            m_player1->m_yVelocity = saved.vy;
+            m_player1->m_accelerationOrSpeed = saved.accel;
+            m_player1->m_touchedPad = saved.pad;
+        }
+        if (secsolve::g_visRefresh) {
+            this->preUpdateVisibility(0.f);
+            this->updateVisibility(0.f);
+        }
+    }
+
+    // Measure whether the production composite restore can replace a full checkpoint restore
     // ---- cfg cpflight: loop flights from a checkpoint (mod/cp_flight.hpp) ----
 
     // The game events our own checkpoints raise, dropped (see cpflight::g_inTake).
@@ -2430,14 +2505,11 @@ class $modify(GJBaseGameLayer) {
     //
     // The measurement is exactly "is it equivalent as a branching primitive":
     //   A: full checkpoint restore -> run N ticks                       (current branch)
-    //   B: level left as is, restore only the player -> run N ticks      (proposed branch)
-    // B is repeated R times because that means restoring from a level state that has
-    // drifted further and further ahead; if nothing in the section moves, it should match
-    // A regardless of the count. In a section where it matches, one branch goes from
-    // 2.02ms/0.95MB to a single memcpy.
+    //   B: pollute the branch, restore the composite snapshot -> run N ticks
+    // Check different pollution depths, per-tick restore chains and rewind/wake cases.
     //
     // Never judge by survival or the terminal x (got fooled by that once today).
-    // Compare y/vy every tick and report the first tick that splits.
+    // Compare both players' x/y/vy and readable continuation state every tick.
     void runSnapCompare(PlayLayer* pl) {
         snapSweep(pl, secsolve::g_snapCmp, true);
         endSession("psnap");
@@ -2784,305 +2856,189 @@ class $modify(GJBaseGameLayer) {
     bool snapSweep(PlayLayer* pl, int N, bool verbose) {
         using namespace secsolve;
         const float dt = g_cfg.fastdt;
-        char b[256];
-        if (verbose) {
-            snprintf(b, sizeof(b),
-                     "psnap: sizeof(PlayerObject)=%zu scalars=%zu copyBytes=%zu",
-                     sizeof(PlayerObject), psnap::scalarCount(),
-                     psnap::maskedBytes());
-            writeResult(b);
-        }
-        // The held state at the section head (the value of pattern "keep")
-        int held0 = 0;
-        for (const auto& in : g_cfg.inputs)
-            if (in.step <= g_ckptTick) held0 = in.down ? 1 : 0;
-
-        // Input patterns. The every-tick toggle must be included. The layered BFS branches
-        // both ways every tick, so psnap is unusable unless hold boundaries pass -- that is
-        // exactly where the old warp historically broke (bit-identical only on non-hold
-        // ticks).
-        struct Pat { const char* name; int period; int base; };
-        // period 0 = constant (keep emitting base) / period k = toggle every k ticks
-        const Pat PATS[] = {
-            {"keep",    0, held0}, {"hold", 0, 1}, {"release", 0, 0},
-            {"alt1",    1, 0},     {"alt2", 2, 0}, {"alt4",    4, 0},
-            {"alt8",    8, 0},     {"alt16", 16, 0},
-        };
-        auto inputAt = [](const Pat& p, int i) -> int {
-            if (p.period <= 0) return p.base;
-            return ((i / p.period) & 1) ^ p.base;
-        };
-        // How many ticks to run the world ahead before restoring. The real search expands
-        // 100,000 times per section, so branching with psnap alone lets the world get that
-        // far ahead. "How far it may drift" decides the period K at which a checkpoint is
-        // re-inserted.
-        const int DRIFTS_FULL[] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 512, 2000, 10000};
-        const int DRIFTS_QUICK[] = {0, 1, 8, 64, 512, 5000};
-        const int* DRIFTS = verbose ? DRIFTS_FULL : DRIFTS_QUICK;
-        const size_t NDRIFT = verbose ? sizeof(DRIFTS_FULL) / sizeof(int)
-                                      : sizeof(DRIFTS_QUICK) / sizeof(int);
-        bool allOk = true;
-
-        const bool wasActive = g_active;
+        const bool wasActive = g_active, wasNoKill = g_noKill;
         g_active = true;
-        std::vector<double> refY, refV;
-        std::vector<uint8_t> refFlags;   // mode|grounded<<4|mini<<5|flip<<6
-        std::vector<uint8_t> snapBytes;
-        double sx = 0.0, sy = 0.0;
+        g_noKill = true;
+        struct Pat { const char* name; int period, base; };
+        const Pat patterns[] = {{"keep", 0, g_headHeld}, {"hold", 0, 1}, {"release", 0, 0},
+            {"alt1", 1, 0}, {"alt2", 2, 0}, {"alt4", 4, 0}, {"alt8", 8, 0}, {"alt16", 16, 0}};
+        const int driftsFull[] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 512, 2000, 10000};
+        const int driftsQuick[] = {0, 1, 8, 64, 512, 5000};
+        const int* drifts = verbose ? driftsFull : driftsQuick;
+        const size_t driftCount = verbose ? std::size(driftsFull) : std::size(driftsQuick);
+        auto inputAt = [](const Pat& p, int i) {
+            return p.period <= 0 ? p.base : ((i / p.period) & 1) ^ p.base;
+        };
+        struct Snapshot {
+            std::vector<uint8_t> player, acts, world;
+            psnap::EMState effects;
+            GJGameState state;
+            psnap::Touch touch;
+            DashState aux;
+            int held = 0;
+        };
+        auto capture = [&](Snapshot& out) {
+            psnap::capture(m_player1, this, out.player);
+            psnap::captureEM(this, out.effects);
+            psnap::captureState(this, out.state);
+            psnap::captureTouch(m_player1, out.touch, this);
+            psnap::captureAct(out.acts);
+            if (g_worldOn) psnap::captureWorld(g_movSet, out.world);
+            secCaptureDash(out.aux);
+            out.held = g_held;
+        };
+        auto restore = [&](Snapshot& in) {
+            g_died = false;
+            secRestoreFast({in.player, in.effects, &in.state, &in.touch, &in.acts,
+                g_worldOn ? &in.world : nullptr, in.held, in.aux,
+                in.aux[0].vy, in.aux[0].accel, in.aux[0].pad});
+        };
+        struct Observation {
+            std::array<cocos2d::CCPoint, 2> positions{};
+            std::array<double, 2> velocities{};
+            std::array<uint8_t, 2> flags{};
+            std::array<bool, 2> present{};
+            bool dead = false;
+        };
+        auto observe = [&]() {
+            Observation out;
+            PlayerObject* players[] = {m_player1, m_player2};
+            for (size_t i = 0; i < 2; ++i) if (auto* p = players[i]) {
+                out.present[i] = true;
+                out.positions[i] = psnap::physPosition(p, this);
+                out.velocities[i] = p->m_yVelocity;
+                out.flags[i] = (uint8_t)((int)modeIdx(p) | (p->m_isOnGround << 4)
+                    | ((p->m_vehicleSize < 0.9f) << 5) | (p->m_isUpsideDown << 6));
+                out.dead |= p->m_isDead && (i == 0 || m_gameState.m_isDualMode);
+            }
+            out.dead |= g_died;
+            return out;
+        };
+        auto matches = [](const Observation& a, const Observation& b) {
+            if (a.dead || b.dead || a.present != b.present || a.flags != b.flags) return false;
+            for (size_t i = 0; i < 2; ++i) if (a.present[i]) {
+                if (std::fabs(a.positions[i].x - b.positions[i].x) > 1e-4
+                    || std::fabs(a.positions[i].y - b.positions[i].y) > 1e-4
+                    || std::fabs(a.velocities[i] - b.velocities[i]) > 1e-4) return false;
+            }
+            return true;
+        };
+        auto step = [&](int input) {
+            g_died = false;
+            secStep(input, dt);
+            return m_player1 && !g_died && !m_player1->m_isDead
+                && (!m_gameState.m_isDualMode || !m_player2 || !m_player2->m_isDead);
+        };
+        secRestore(pl);
+        const auto initial = psnap::physPosition(m_player1, this);
         int freeze = 0;
-        auto flagsOf = [&](PlayerObject* p) -> uint8_t {
-            return (uint8_t)((int)modeIdx(p)
-                             | ((p->m_isOnGround ? 1 : 0) << 4)
-                             | ((p->m_vehicleSize < 0.9f ? 1 : 0) << 5)
-                             | ((p->m_isUpsideDown ? 1 : 0) << 6));
-        };
-        const Pat* pat = &PATS[0];
-
-        // ---- A: reference run from a full checkpoint restore. Take the snapshot right
-        // after the checkpoint ----
-        //
-        // Take the reference over a length that survives. Running it until death puts the
-        // level into the "attempt over" state, after which restoring the player's bytes
-        // advances no physics at all (the first version stepped on this, and dy became the
-        // reference's fall distance itself = 152px. It looks like the player side is
-        // broken, but it had simply stopped). If it dies, cut it shorter.
-        auto refPass = [&](int n) -> int {
+        for (; freeze < 8; ++freeze) {
+            if (!step(g_headHeld)) break;
+            const auto at = psnap::physPosition(m_player1, this);
+            if (at.x != initial.x || at.y != initial.y) break;
+        }
+        psnap::buildActWindow(this, initial.x - 300.0,
+                             initial.x + 4.0 * (double)g_horizon + 300.0);
+        auto head = [&]() {
             secRestore(pl);
-            if (freeze == 0) {
-                const double xf = m_player1 ? m_player1->getPositionX() : 0.0;
-                for (int i = 0; i < 8; ++i) {
-                    secStep(inputAt(*pat, 0), dt);
-                    if (m_player1 && m_player1->getPositionX() != xf) break;
-                    ++freeze;
+            for (int f = 0; f < freeze; ++f) if (!step(g_headHeld)) return false;
+            secRestoreInputs(g_ckptInputs);
+            return freeze < 8 && m_player1;
+        };
+        bool allOk = true;
+        size_t tested = 0;
+        char log[320];
+        for (const Pat& pattern : patterns) {
+            Snapshot base;
+            std::vector<Observation> reference;
+            auto refPass = [&](int n) {
+                reference.clear();
+                if (!head()) return false;
+                capture(base);
+                reference.push_back(observe());
+                for (int i = 0; i < n; ++i) {
+                    if (!step(inputAt(pattern, i))) break;
+                    reference.push_back(observe());
                 }
-                secRestore(pl);
-            }
-            for (int i = 0; i < freeze; ++i) secStep(inputAt(*pat, 0), dt);
-            if (!m_player1) return -2;
-            psnap::capture(m_player1, this, snapBytes);
-            sx = m_player1->getPositionX();
-            sy = m_player1->getPositionY();
-            refY.assign((size_t)n, 0.0);
-            refV.assign((size_t)n, 0.0);
-            refFlags.assign((size_t)n, 0);
-            for (int i = 0; i < n; ++i) {
-                secStep(inputAt(*pat, i), dt);
-                if (!m_player1) return -2;
-                refY[(size_t)i] = m_player1->getPositionY();
-                refV[(size_t)i] = (double)m_player1->m_yVelocity;
-                refFlags[(size_t)i] = flagsOf(m_player1);
-                if (m_player1->m_isDead) return i;
-            }
-            return -1;
-        };
-
-        // After a restore, rebuild the button state with the same steps as the checkpoint
-        // path. `m_holdingButtons` is on the PRESERVE side (not injected), so skipping this
-        // means comparing "a ship that is pressing" with "a ship that is not" (the first
-        // version split by -109px because of that).
-        auto rearmButton = [&]() {
-            g_injecting = true;
-            this->handleButton(false, 1, true);
-            g_injecting = false;
-            g_held = 0;
-        };
-
-        for (const Pat& P : PATS) {
-            pat = &P;
+                return true;
+            };
+            if (!refPass(N)) { allOk = false; break; }
             int n = N;
-            int refDied = refPass(n);
-            if (refDied >= 0) {
-                n = refDied - 2;
-                if (n < 4) {
-                    snprintf(b, sizeof(b),
-                             "psnap: pat=%s SKIP - the reference dies after "
-                             "%d tick", P.name, refDied);
-                    writeResult(b);
+            if ((int)reference.size() != N + 1) {
+                n = (int)reference.size() - 3;
+                if (n < 4 || !refPass(n) || (int)reference.size() != n + 1) {
+                    snprintf(log, sizeof(log), "psnap: pat=%s SKIP - reference too short", pattern.name);
+                    writeResult(log);
                     continue;
                 }
-                refDied = refPass(n);
             }
-            if (refDied != -1) {
-                snprintf(b, sizeof(b), "psnap: pat=%s SKIP - unstable reference",
-                         P.name);
-                writeResult(b);
-                continue;
-            }
-
-            for (size_t di = 0; di < NDRIFT; ++di) {
-                const int D = DRIFTS[di];
-                // Every time, return the world to the checkpoint first, then advance exactly
-                // D ticks. Otherwise "drift=0" is actually a state shifted by the reference
-                // run (n ticks), and tolerance to small drifts cannot be measured (the first
-                // version was like that).
-                secRestore(pl);
-                for (int i = 0; i < freeze; ++i) secStep(inputAt(P, 0), dt);
-                // Advance only the world by D ticks. The player is restored and pinned
-                // every tick so it does not die; only the world's phase drifts (= what
-                // happens when branching with psnap continuously without inserting a
-                // checkpoint).
-                for (int d = 0; d < D; ++d) {
-                    psnap::restore(m_player1, this, snapBytes.data());
-                    rearmButton();
-                    secStep(inputAt(P, 0), dt);
-                    if (!m_player1 || m_player1->m_isDead) break;
+            auto report = [&](const char* kind, int amount, int firstBad) {
+                ++tested;
+                if (firstBad >= 0) allOk = false;
+                if (verbose || firstBad >= 0) {
+                    snprintf(log, sizeof(log), "psnap: pat=%s %s=%d n=%d firstDiff=%d "
+                             "compare=P1+P2 restore=production completeProof=0",
+                             pattern.name, kind, amount, n, firstBad);
+                    writeResult(log);
                 }
-                const auto t0 = std::chrono::steady_clock::now();
-                psnap::restore(m_player1, this, snapBytes.data());
-                const double us = std::chrono::duration<double, std::micro>(
-                    std::chrono::steady_clock::now() - t0).count();
-                rearmButton();
-                int firstBad = -1, died = -1, flagBad = -1;
-                double maxDy = 0.0, maxDv = 0.0;
+            };
+            for (size_t di = 0; di < driftCount; ++di) {
+                if (!head()) { allOk = false; break; }
+                for (int d = 0; d < drifts[di]; ++d)
+                    if (!step(inputAt(pattern, d))) break;
+                restore(base);
+                int firstBad = matches(reference[0], observe()) ? -1 : 0;
                 for (int i = 0; i < n; ++i) {
-                    secStep(inputAt(P, i), dt);
-                    if (!m_player1) break;
-                    if (m_player1->m_isDead) { died = i; break; }
-                    const double dy = m_player1->getPositionY() - refY[(size_t)i];
-                    const double dv = (double)m_player1->m_yVelocity - refV[(size_t)i];
-                    if (std::fabs(dy) > std::fabs(maxDy)) maxDy = dy;
-                    if (std::fabs(dv) > std::fabs(maxDv)) maxDv = dv;
-                    if (firstBad < 0 && (std::fabs(dy) > 1e-4 || std::fabs(dv) > 1e-4))
-                        firstBad = i;
-                    if (flagBad < 0 && flagsOf(m_player1) != refFlags[(size_t)i])
-                        flagBad = i;
+                    if (!step(inputAt(pattern, i)) || !matches(reference[(size_t)i + 1], observe())) {
+                        if (firstBad < 0) firstBad = i + 1;
+                        break;
+                    }
                 }
-                const bool bad = (firstBad >= 0 || flagBad >= 0 || died >= 0);
-                if (verbose || bad) {
-                    snprintf(b, sizeof(b),
-                             "psnap: pat=%-7s drift=%-5d n=%-4d restoreUs=%5.1f "
-                             "firstDiff=%-4d flagDiff=%-4d maxDy=%9.4f "
-                             "maxDvy=%8.4f died=%d",
-                             P.name, D, n, us, firstBad, flagBad, maxDy, maxDv,
-                             died);
-                    writeResult(b);
-                }
-                if (bad) {
-                    allOk = false;
-                    break;   // this pattern split; larger drifts are not examined
-                }
+                report("drift", drifts[di], firstBad);
+                if (firstBad >= 0) break;
             }
-            // ---- C: chain test. Measures the same usage as the search ----
-            //
-            // The sweep above only looks at "take one at the section head and restore it
-            // repeatedly". The search captures at every node and restores at every node,
-            // so if capture/restore drops even a drop of state, it accumulates with depth.
-            // Indeed, even in a section where the whole sweep passed, the exit state the
-            // search produced was 21px off from the plain replay. Here a capture->restore
-            // is inserted every tick and compared with the plain run.
-            for (int withRearm = 0; withRearm < 2; ++withRearm) {
-                secRestore(pl);
-                for (int i = 0; i < freeze; ++i) secStep(inputAt(P, 0), dt);
-                std::vector<uint8_t> s;
-                int firstBad = -1, died = -1;
-                double maxDy = 0.0, maxDv = 0.0;
+            // Search restores a new composite node every tick, not just the section head.
+            if (head()) {
+                int firstBad = -1;
                 for (int i = 0; i < n; ++i) {
-                    if (!m_player1) break;
-                    psnap::capture(m_player1, this, s);
-                    psnap::restore(m_player1, this, s.data());
-                    if (withRearm) rearmButton();
-                    secStep(inputAt(P, i), dt);
-                    if (!m_player1) break;
-                    if (m_player1->m_isDead) { died = i; break; }
-                    const double dy = m_player1->getPositionY() - refY[(size_t)i];
-                    const double dv = (double)m_player1->m_yVelocity - refV[(size_t)i];
-                    if (std::fabs(dy) > std::fabs(maxDy)) maxDy = dy;
-                    if (std::fabs(dv) > std::fabs(maxDv)) maxDv = dv;
-                    if (firstBad < 0 && (std::fabs(dy) > 1e-4 || std::fabs(dv) > 1e-4))
-                        firstBad = i;
+                    Snapshot node;
+                    capture(node);
+                    restore(node);
+                    if (!step(inputAt(pattern, i)) || !matches(reference[(size_t)i + 1], observe())) {
+                        firstBad = i + 1;
+                        break;
+                    }
                 }
-                const bool bad = (firstBad >= 0 || died >= 0);
-                if (verbose || bad) {
-                    snprintf(b, sizeof(b),
-                             "psnap: pat=%-7s CHAIN rearm=%d n=%-4d "
-                             "firstDiff=%-4d maxDy=%9.4f maxDvy=%8.4f died=%d",
-                             P.name, withRearm, n, firstBad, maxDy, maxDv, died);
-                    writeResult(b);
-                }
-                if (bad) allOk = false;
-            }
-            // ---- D: rewind test. An operation only the search performs ----
-            //
-            // In both the sweep (restore the same one) and the chain (capture and restore
-            // every tick), the player only moves forward. The search returns to a parent =
-            // moves x backward. GD switches the active object sections by the player's x,
-            // so rewinding x without resetting the level can leave the active state
-            // inconsistent. If it splits here, then that is what CheckpointObject spends
-            // 0.95MB holding.
-            for (int k : {1, 2, 4, 8, 16, 32, 64, 128}) {
+                report("CHAIN", n, firstBad);
+            } else allOk = false;
+            for (bool wake : {false, true}) for (int k : {1, 2, 4, 8, 16, 32, 64, 128}) {
                 if (k >= n) break;
-                secRestore(pl);
-                for (int i = 0; i < freeze; ++i) secStep(inputAt(P, 0), dt);
-                std::vector<uint8_t> back;
-                bool ok = true;
+                if (!head()) { allOk = false; break; }
+                Snapshot back;
+                bool alive = true;
                 for (int i = 0; i < n; ++i) {
-                    if (i == n - k && m_player1) psnap::capture(m_player1, this, back);
-                    secStep(inputAt(P, i), dt);
-                    if (!m_player1 || m_player1->m_isDead) { ok = false; break; }
+                    if (i == n - k) capture(back);
+                    if (!step(inputAt(pattern, i))) { alive = false; break; }
                 }
-                if (!ok || back.empty()) continue;
-                // Here the world is at tick n and so is the player. Rewind x by k ticks.
-                psnap::restore(m_player1, this, back.data());
-                rearmButton();
-                for (int j = n - k; j < n; ++j) secStep(inputAt(P, j), dt);
-                if (!m_player1) break;
-                const double dy = m_player1->getPositionY() - refY[(size_t)n - 1];
-                const double dv = (double)m_player1->m_yVelocity - refV[(size_t)n - 1];
-                const bool bad = (std::fabs(dy) > 1e-4 || std::fabs(dv) > 1e-4
-                                  || m_player1->m_isDead);
-                if (verbose || bad) {
-                    snprintf(b, sizeof(b),
-                             "psnap: pat=%-7s REWIND k=%-4d n=%-4d dy=%9.4f "
-                             "dvy=%8.4f dead=%d",
-                             P.name, k, n, dy, dv, m_player1->m_isDead ? 1 : 0);
-                    writeResult(b);
+                if (!alive || back.player.empty()) { allOk = false; break; }
+                if (wake && !head()) { allOk = false; break; }
+                restore(back);
+                int firstBad = matches(reference[(size_t)n - k], observe()) ? -1 : n - k;
+                for (int i = n - k; i < n; ++i) {
+                    if (!step(inputAt(pattern, i)) || !matches(reference[(size_t)i + 1], observe())) {
+                        if (firstBad < 0) firstBad = i + 1;
+                        break;
+                    }
                 }
-                if (bad) { allOk = false; break; }
+                report(wake ? "WAKE" : "REWIND", k, firstBad);
+                if (firstBad >= 0) break;
             }
-            // ---- E: wake test. The only case where the world ends up "behind" the
-            // player ----
-            //
-            // When a branch dies the level stops, so it is woken again with a checkpoint
-            // (needWake). That checkpoint restore returns the world to the section head,
-            // yet the player placed next is the state at depth d. So only the world lags by
-            // d ticks. The drift sweep only looks at the world being ahead, so this
-            // direction had never been measured.
-            for (int k : {1, 4, 16, 64}) {
-                if (k >= n) break;
-                secRestore(pl);
-                for (int i = 0; i < freeze; ++i) secStep(inputAt(P, 0), dt);
-                std::vector<uint8_t> deep;
-                bool ok = true;
-                for (int i = 0; i < n - k; ++i) {
-                    secStep(inputAt(P, i), dt);
-                    if (!m_player1 || m_player1->m_isDead) { ok = false; break; }
-                }
-                if (!ok) continue;
-                psnap::capture(m_player1, this, deep);
-                // This reproduces needWake: return only the world to the section head
-                secRestore(pl);
-                for (int i = 0; i < freeze; ++i) secStep(inputAt(P, 0), dt);
-                psnap::restore(m_player1, this, deep.data());
-                rearmButton();
-                for (int j = n - k; j < n; ++j) secStep(inputAt(P, j), dt);
-                if (!m_player1) break;
-                const double dy = m_player1->getPositionY() - refY[(size_t)n - 1];
-                const double dv = (double)m_player1->m_yVelocity - refV[(size_t)n - 1];
-                const bool bad = (std::fabs(dy) > 1e-4 || std::fabs(dv) > 1e-4
-                                  || m_player1->m_isDead);
-                if (verbose || bad) {
-                    snprintf(b, sizeof(b),
-                             "psnap: pat=%-7s WAKE   k=%-4d n=%-4d dy=%9.4f "
-                             "dvy=%8.4f dead=%d",
-                             P.name, k, n, dy, dv, m_player1->m_isDead ? 1 : 0);
-                    writeResult(b);
-                }
-                if (bad) { allOk = false; break; }
-            }
-            if (!allOk && !verbose) break;   // verdict only: settled at the first split
+            if (!allOk && !verbose) break;
         }
         g_active = wasActive;
-        return allOk;
+        g_noKill = wasNoKill;
+        if (tested == 0) writeResult("psnap: NO COVERAGE -- this is not a pass");
+        return allOk && tested > 0;
     }
 
     // Restore fidelity check (cfg `secverify=1`). Restore to the section checkpoint, then
@@ -3255,11 +3211,10 @@ class $modify(GJBaseGameLayer) {
             // (opt-in via `secsnap=3`).
             //
             // However, if `secverifyevery` is set, psnap is used even in moving sections
-            // (user suggestion 2026-08-07). Even without nailing the fidelity, matching the
-            // frontier every V layers by "replaying the input sequence from the section
-            // checkpoint" rejects false branches there. psnap's errors only go one way
-            // (missing deaths), so matching against the ground truth suffices. Replaying
-            // the one solution at the end to confirm is done always.
+            // (user suggestion 2026-08-07). Matching the frontier every V layers rejects
+            // false survivors. A fast restore can also lose a surviving branch: the spine
+            // is replay-checked before accepting such a death. The final solution is always
+            // replayed from the section head as well.
             int moved = -1;
             int movPortals = 0;
             if (g_snapOn && gated) {
@@ -3294,9 +3249,11 @@ class $modify(GJBaseGameLayer) {
             char qb[256];
             snprintf(qb, sizeof(qb),
                      "secsolve: snap qualify %s (%.0f ms, movingObjects=%d, "
-                     "movingPortals=%d, verifyEvery=%d) - branching with %s",
-                     g_snapOn ? "PASS" : "FAIL", qms, moved, movPortals,
+                     "movingPortals=%d, verifyEvery=%d, selfcheck=%s) - branching with %s",
+                     !gated ? (g_snapOn ? "UNCHECKED" : "DISABLED")
+                            : (g_snapOn ? "PASS" : "FAIL"), qms, moved, movPortals,
                      g_verifyEvery,
+                     gated ? "ran" : "skipped_periodic_crosscheck",
                      !g_snapOn ? "CheckpointObject"
                                : (moved > 0 ? "psnap + a checked correction"
                                             : "psnap (3KB/1.4us)"));
@@ -3360,6 +3317,35 @@ class $modify(GJBaseGameLayer) {
         g_vy.assign(1, m_player1 ? m_player1->m_yVelocity : 0.0);
         g_accel.assign(1, m_player1 ? m_player1->m_accelerationOrSpeed : 0.0);
         g_pad.assign(1, m_player1 && m_player1->m_touchedPad ? 1 : 0);
+        // Only live nodes and replay anchors own button containers; released nodes keep a pointer.
+        std::vector<std::unique_ptr<secsolve::InputStates>> checkpointInputs(1);
+        auto captureCheckpointInputs = [&](int ni) {
+            if (!checkpointInputs[(size_t)ni])
+                checkpointInputs[(size_t)ni] = std::make_unique<secsolve::InputStates>();
+            secCaptureInputs(*checkpointInputs[(size_t)ni]);
+        };
+        // Keep the extra restore fields from the same state as the player's snapshot.
+        auto captureAux = [&](int ni) {
+            secCaptureDash(g_dash[(size_t)ni]);
+            g_vy[(size_t)ni] = m_player1 ? m_player1->m_yVelocity : 0.0;
+            g_accel[(size_t)ni] = m_player1 ? m_player1->m_accelerationOrSpeed : 0.0;
+            g_pad[(size_t)ni] = m_player1 && m_player1->m_touchedPad ? 1 : 0;
+            if (auto* q = secP2(); q && (size_t)ni < secsolve::g_dash2.size()) {
+                secCaptureDash(secsolve::g_dash2[(size_t)ni], q);
+                secsolve::g_vy2[(size_t)ni] = q->m_yVelocity;
+                secsolve::g_accel2[(size_t)ni] = q->m_accelerationOrSpeed;
+                secsolve::g_pad2[(size_t)ni] = q->m_touchedPad ? 1 : 0;
+            }
+            captureCheckpointInputs(ni);
+        };
+        // Every checkpoint replay needs the same supplements as a normal expansion.
+        auto restoreAux = [&](int ni) {
+            secRestoreDash(g_dash[(size_t)ni]);
+            if (!m_player1) return;
+            m_player1->m_yVelocity = g_vy[(size_t)ni];
+            m_player1->m_accelerationOrSpeed = g_accel[(size_t)ni];
+            m_player1->m_touchedPad = g_pad[(size_t)ni] != 0;
+        };
         secsolve::g_dash2.clear();
         secsolve::g_vy2.clear();
         secsolve::g_accel2.clear();
@@ -3402,8 +3388,14 @@ class $modify(GJBaseGameLayer) {
         // ourselves)
         secRestoreFrom(pl, g_ckpt, g_headHeld);
         for (int f = 0; f < freeze; ++f) secStep(g_headHeld, dt);
-        secCaptureDash(g_dash[0]);
-        if (auto* q = secP2()) secCaptureDash(secsolve::g_dash2[0], q);
+        captureAux(0);
+        if (m_player1) {
+            const cocos2d::CCPoint at = psnap::physPosition(m_player1, this);
+            g_nodes[0].x = at.x;
+            g_nodes[0].y = at.y;
+            g_nodes[0].vy = (float)m_player1->m_yVelocity;
+            g_nodes[0].dash = m_player1->m_isDashing ? 1 : 0;
+        }
         // Baseline for the counter delta (Node::cnt). Taken once in the section-head world.
         secsolve::g_cntBase = secsolve::countSum(this);
 
@@ -3479,6 +3471,9 @@ class $modify(GJBaseGameLayer) {
         // The stacking check (`secoverlay`) takes the same snapshots on the checkpoint
         // path too.
         const bool keepSnaps = g_snapOn || g_overlay != 0;
+        psnap::g_collisionCaptures = psnap::g_collisionObjects = 0;
+        psnap::g_collisionMax = 0;
+        psnap::g_emCommandsMax = psnap::g_emCompletedMax = 0;
         if (keepSnaps) {
             secRestoreFrom(pl, g_ckpt, g_headHeld);
             for (int i = 0; i < freeze; ++i) secStep(g_headHeld, dt);
@@ -3671,6 +3666,43 @@ class $modify(GJBaseGameLayer) {
         // 3*cap are held, so this is where to look for a return of the OOM (the old
         // implementation's failure was a mix-up of exactly this).
         long long restores = 0, steps = 0, cpMade = 0, cpPeak = 0;
+        long long spineChecks = 0, spineRescued = 0;
+        long long headReplayChecks = 0, headReplayRescued = 0, headReplaySteps = 0;
+        // Restore one replay origin with its held input and all recorded supplements.
+        auto restoreReplayOrigin = [&](int ni, CheckpointObject* cp) {
+            const int held = g_nodes[(size_t)ni].in;
+            secRestoreFrom(pl, cp, held); ++restores;
+            restoreAux(ni);
+            if (psnap::g_snapAct && (size_t)ni < acts.size())
+                psnap::restoreAct(acts[(size_t)ni]);
+            for (int f = 0; f < freeze; ++f) {
+                secStep(held, dt); ++steps;
+            }
+            cpTakeLoad();
+            const std::vector<uint8_t>* originPlayer = nullptr;
+            if (ni == 0 && !snaps.empty()) originPlayer = &snaps[0];
+            else if (auto it = anchorSnaps.find(ni); it != anchorSnaps.end())
+                originPlayer = &it->second;
+            if (secsolve::g_cpPlayer && originPlayer && !originPlayer->empty())
+                psnap::restore(m_player1, this, originPlayer->data());
+            if (ni == 0) cpReport(1, "head", 0, secsolve::g_headPlain);
+            else if (originPlayer) cpReport(4, "anchor", ni, *originPlayer);
+            secRestoreInputs(*checkpointInputs[(size_t)ni]);
+        };
+        // Distinguish a bad intermediate restore from a death reproduced from the head.
+        auto noteHeadReplay = [&](const char* stage, int depth, int anchor,
+                                  const solver::SectionReplayResult& result,
+                                  size_t replayed, size_t total) {
+            if (!result.headRetried) return;
+            ++headReplayChecks;
+            if (result.alive) ++headReplayRescued;
+            char hb[192];
+            snprintf(hb, sizeof(hb),
+                     "secanchor: stage=%s d=%d t=%lld anchor=%d head=%s ticks=%zu/%zu",
+                     stage, depth, (long long)(g_ckptTick + depth), anchor,
+                     result.alive ? "ALIVE" : "DEAD", replayed, total);
+            writeResult(hb);
+        };
         int foundLeaf = -1;
         double foundX = 0.0;
         int foundDepth = 0;
@@ -3693,6 +3725,8 @@ class $modify(GJBaseGameLayer) {
 
         auto releaseCp = [&](int ni) {
             if (ni <= 0) return;                       // the section checkpoint is never released
+            // An anchor may outlive its frontier node, but not the next anchor generation.
+            if (!g_anchors.count(ni)) checkpointInputs[(size_t)ni].reset();
             if (keepSnaps) {
                 // Assignment or clear() does not give memory back. Containers only set size
                 // to 0 and keep the allocated buffer, so swap with an empty temporary and
@@ -3771,53 +3805,60 @@ class $modify(GJBaseGameLayer) {
             std::reverse(path.begin(), path.end());
             leafSeqN = seq.size(); leafSeqCap = seq.capacity();
             leafPathN = path.size(); leafPathCap = path.capacity();
-            secRestoreFrom(pl, g_ckpt, g_headHeld);
-            for (int f = 0; f < freeze; ++f) secStep(g_headHeld, dt);
-            cpTakeLoad();
-            if (secsolve::g_cpPlayer && keepSnaps && !snaps.empty() && !snaps[0].empty())
-                psnap::restore(m_player1, this, snaps[0].data());
-            cpReport(1, "leaf", (long long)seq.size(), secsolve::g_headPlain);
-            bool dead = false;
-            for (size_t i = 0; i < seq.size(); ++i) {
-                g_died = false;
-                secStepBegin(pl);
-                secStep((int)seq[i], dt); ++steps;
-                if (!m_player1 || m_player1->m_isDead || g_died) {
-                    dead = true; g_leafDeadAt = (int)i + 1; break;
-                }
-                if (splitAt < 0) {
-                    const auto& nd = g_nodes[(size_t)path[i]];
-                    // The physics position, as the node recorded it (psnap::physPosition).
-                    const cocos2d::CCPoint at = psnap::physPosition(m_player1, this);
-                    const double rx = at.x;
-                    const double ry = at.y;
-                    const double rv = (double)m_player1->m_yVelocity;
-                    if (std::fabs(rx - (double)nd.x) > 0.02
-                        || std::fabs(ry - (double)nd.y) > 0.02
-                        || std::fabs(rv - (double)nd.vy) > 0.02) {
-                        splitAt = (int)i + 1;
-                        splitNodeX = nd.x; splitRepX = rx;
-                        splitNodeY = nd.y; splitRepY = ry;
-                        splitNodeVy = nd.vy; splitRepVy = rv;
+            // Replaying again after a failed grace trial avoids trusting another checkpoint
+            // restore at the exit, and never saves the last trial's dead/advanced state.
+            auto replayLeaf = [&]() {
+                g_leafVerified = false;
+                g_leafDeadAt = -1;
+                splitAt = -1;
+                verifyX = verifyY = verifyVy = 0.0;
+                restoreReplayOrigin(0, g_ckpt);
+                for (size_t i = 0; i < seq.size(); ++i) {
+                    g_died = false;
+                    secStep((int)seq[i], dt); ++steps;
+                    if (!m_player1 || m_player1->m_isDead || g_died) {
+                        g_leafDeadAt = (int)i + 1;
+                        return false;
+                    }
+                    if (splitAt < 0) {
+                        const auto& nd = g_nodes[(size_t)path[i]];
+                        // The physics position, as the node recorded it (psnap::physPosition).
+                        const cocos2d::CCPoint at = psnap::physPosition(m_player1, this);
+                        const double rx = at.x;
+                        const double ry = at.y;
+                        const double rv = (double)m_player1->m_yVelocity;
+                        if (std::fabs(rx - (double)nd.x) > 0.02
+                            || std::fabs(ry - (double)nd.y) > 0.02
+                            || std::fabs(rv - (double)nd.vy) > 0.02) {
+                            splitAt = (int)i + 1;
+                            splitNodeX = nd.x; splitRepX = rx;
+                            splitNodeY = nd.y; splitRepY = ry;
+                            splitNodeVy = nd.vy; splitRepVy = rv;
+                        }
                     }
                 }
-            }
-            if (dead || !m_player1) return 1;
-            {
+                if (!m_player1) return false;
                 // Judged where the physics stands: during a mirror transition the node is at
                 // its drawing place (psnap::physPosition).
                 const cocos2d::CCPoint at = psnap::physPosition(m_player1, this);
                 verifyX = at.x;
                 verifyY = at.y;
-            }
-            verifyVy = (double)m_player1->m_yVelocity;
-            if (!reachedGoal(verifyX, verifyY, (int)seq.size())) return 1;
-            g_leafVerified = true;
+                verifyVy = (double)m_player1->m_yVelocity;
+                if (!reachedGoal(verifyX, verifyY, (int)seq.size())) return false;
+                g_leafVerified = true;
+                return true;
+            };
+            if (!replayLeaf()) return 1;
             if (g_grace <= 0) return 0;
             // Exit survivability (see the note on g_grace). Two runs are not enough -- the
             // spider can teleport even in the air if a surface is in range, so "never
             // press" and "always hold" both dying is no proof that "input can do nothing".
             static const int kGracePeriods[] = {0, -1, 2, 3, 4, 6, 8, 12, 20, 40};
+            // All grace patterns start at this verified exit, not a previous pattern's boost
+            // or a forced release that changes a sustained hold into a second press.
+            captureAux(leaf);
+            if (psnap::g_snapAct && (size_t)leaf < acts.size())
+                psnap::captureAct(acts[(size_t)leaf]);
             CheckpointObject* lcp = markCheckpointAtPhys(pl);
             if (!lcp) return 0;
             lcp->retain();
@@ -3830,9 +3871,7 @@ class $modify(GJBaseGameLayer) {
                  pi < sizeof(kGracePeriods) / sizeof(int) && graceOk == 0; ++pi) {
                 const int per = kGracePeriods[pi];
                 if (pi) {
-                    secRestoreFrom(pl, lcp, 0); ++restores;
-                    for (int f = 0; f < freeze; ++f) secStep(0, dt);
-                    cpTakeLoad();
+                    restoreReplayOrigin(leaf, lcp);
                     if (!lcpSnap.empty()) psnap::restore(m_player1, this, lcpSnap.data());
                     cpReport(2, "exit", (long long)pi, lcpOrigin);
                 }
@@ -3864,8 +3903,7 @@ class $modify(GJBaseGameLayer) {
                 int life = 0, lifeAt = -1;
                 for (size_t pi = 0; pi < sizeof(kGracePeriods) / sizeof(int); ++pi) {
                     const int per = kGracePeriods[pi];
-                    secRestoreFrom(pl, lcp, 0); ++restores;
-                    for (int f = 0; f < freeze; ++f) secStep(0, dt);
+                    restoreReplayOrigin(leaf, lcp);
                     if (!lcpSnap.empty()) psnap::restore(m_player1, this, lcpSnap.data());
                     int i = 0;
                     for (; i < g_leafLife; ++i) {
@@ -4063,61 +4101,12 @@ class $modify(GJBaseGameLayer) {
                         // phase pull-back remains, as a safety valve.
                         if (g_rephase > 0 && restores > 0
                             && restores % g_rephase == 0) rephase();
-                        // Restore the world first. Restoring the player triggers no
-                        // collision test, but restoring the world goes through setPosition,
-                        // so section re-registration runs. Keep the order fixed.
-                        postmortem::g_secPhase = 10;
-                        if (g_worldOn && (size_t)ni < worlds.size())
-                            psnap::restoreWorld(this, g_movSet, worlds[(size_t)ni]);
-                        postmortem::g_secPhase = 11;
-                        psnap::restore(m_player1, this, snaps[(size_t)ni].data());
-                        postmortem::g_secPhase = 12;
-                        psnap::restoreEM(this, pulses[(size_t)ni]);
-                        postmortem::g_secPhase = 13;
-                        if (states[(size_t)ni]) psnap::restoreState(this, *states[(size_t)ni]);
-                        postmortem::g_secPhase = 14;
-                        if (touches[(size_t)ni])
-                            psnap::restoreTouch(m_player1, *touches[(size_t)ni], this);
-                        postmortem::g_secPhase = 15;
-                        if ((size_t)ni < acts.size()) psnap::restoreAct(acts[(size_t)ni]);
-                        postmortem::g_secPhase = 16;
-                        // The wave trail is not in the snapshot (see g_trailClear)
-                        if (secsolve::g_trailClear) {
-                            for (PlayerObject* p : {m_player1, m_player2})
-                                if (p && p->m_waveTrail && p->m_waveTrail->m_pointArray)
-                                    p->m_waveTrail->m_pointArray->removeAllObjects();
-                        }
-                        // Buttons are not injected (`m_holdingButtons` is PRESERVE). Put
-                        // them into a known state by the same steps as the checkpoint path,
-                        // then feed the branch input.
-                        g_injecting = true;
-                        this->handleButton(false, 1, true);
-                        g_injecting = false;
-                        g_held = 0;
-                        // A branch that keeps holding re-holds without an edge (see the
-                        // note on secArmHold)
-                        if (g_nodes[(size_t)ni].in) secArmHold();
-                        // Dash is not carried either (the mask does not copy pointers, so
-                        // `m_dashRing` is lost). See the note on DashState.
-                        if ((size_t)ni < g_dash.size()) {
-                            secRestoreDash(g_dash[(size_t)ni]);
-                            secRestoreJb(g_dash[(size_t)ni]);
-                        }
-                        // The boost accumulator is not in the psnap mask either
-                        // (see g_accel). Same field, same reason, both paths.
-                        if (m_player1 && (size_t)ni < g_accel.size()) {
-                            m_player1->m_accelerationOrSpeed = g_accel[(size_t)ni];
-                            m_player1->m_touchedPad = g_pad[(size_t)ni] != 0;
-                        }
-                        // ...both bodies (see g_dash2).
-                        secRestoreP2((size_t)ni, false);
-                        // Rebuild the candidate list. On the checkpoint path this happens by
-                        // itself through the 2 frozen steps, but the psnap path has no
-                        // freeze.
-                        if (secsolve::g_visRefresh) {
-                            this->preUpdateVisibility(0.f);
-                            this->updateVisibility(0.f);
-                        }
+                        secRestoreFast({snaps[(size_t)ni], pulses[(size_t)ni],
+                            states[(size_t)ni].get(), touches[(size_t)ni].get(),
+                            (size_t)ni < acts.size() ? &acts[(size_t)ni] : nullptr,
+                            (size_t)ni < worlds.size() ? &worlds[(size_t)ni] : nullptr,
+                            g_nodes[(size_t)ni].in, g_dash[(size_t)ni], g_vy[(size_t)ni],
+                            g_accel[(size_t)ni], g_pad[(size_t)ni] != 0});
                         ++restores;
                         g_secSnapMs += std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - snapT0).count();
@@ -4125,10 +4114,6 @@ class $modify(GJBaseGameLayer) {
                         secRestoreFrom(pl, base, g_nodes[(size_t)ni].in);
                         ++restores;
                         // Dash is not in the checkpoint. Restore it here
-                        if ((size_t)ni < g_dash.size()) {
-                            secRestoreDash(g_dash[(size_t)ni]);
-                            secRestoreJb(g_dash[(size_t)ni]);
-                        }
                         // ...and the exact y velocity, which the restore puts
                         // back on the 0.001 grid (hole 3, measured:
                         // 1.9815 comes back 1.982). One restore loses half a
@@ -4137,31 +4122,26 @@ class $modify(GJBaseGameLayer) {
                         // difference between "restore once and run 300 ticks
                         // bit-identically" -- which this snapshot does -- and
                         // a search from the same head dying at depth 233.
-                        if ((size_t)ni < g_vy.size() && m_player1)
-                            m_player1->m_yVelocity = g_vy[(size_t)ni];
                         // ...and the boost accumulator and its pad flag, which
                         // the restore does not carry at all (see g_accel). Put
                         // back with the same cfg switch off by default? No --
                         // unconditionally, like the dash: a node whose boost
                         // budget is a leftover from whichever node was stepped
                         // last is not that node.
-                        if (m_player1 && (size_t)ni < g_accel.size()) {
-                            m_player1->m_accelerationOrSpeed = g_accel[(size_t)ni];
-                            m_player1->m_touchedPad = g_pad[(size_t)ni] != 0;
-                        }
-                        // ...both bodies (see g_dash2).
-                        secRestoreP2((size_t)ni, true);
+                        restoreAux(ni);
                         // Idle the frozen ticks with "the input that node was holding"
                         // (physics does not advance so the state is unchanged, but button
                         // continuity is kept)
                         for (int f = 0; f < snapFreeze; ++f) {
                             secStep(g_nodes[(size_t)ni].in, dt); ++steps;
                         }
+                        secRestoreInputs(*checkpointInputs[(size_t)ni]);
                         // Stacking check. Should be the identity -- the same node's state is
                         // merely restored again with psnap after the checkpoint restore. If
                         // the output moves, psnap is the side that breaks things.
                         if (g_overlay && (size_t)ni < snaps.size()
                             && !snaps[(size_t)ni].empty()) {
+                            if (g_overlay & 2) psnap::restoreGroups(this, pulses[(size_t)ni]);
                             if (g_overlay & 1)
                                 psnap::restore(m_player1, this,
                                                snaps[(size_t)ni].data());
@@ -4199,8 +4179,9 @@ class $modify(GJBaseGameLayer) {
                     }
                     // Label the spine's own substep so `robodbg` prints one line
                     // per layer instead of one per node (a layer is ~100 wide).
-                    g_stepSpine = g_spineOn && ni == g_spine
-                                  && branch == spinePlanHeld(depth);
+                    const bool isSpine = g_spineOn && ni == g_spine
+                                         && branch == spinePlanHeld(depth);
+                    g_stepSpine = isSpine;
                     g_stepDepth = depth;
                     {
                         const auto stepT0 = std::chrono::steady_clock::now();   // print only
@@ -4234,6 +4215,45 @@ class $modify(GJBaseGameLayer) {
                     }
                     g_stepSpine = false;
                     auto* p = m_player1;
+                    // A false death disappears before the periodic replay ever sees it.
+                    // Try the nearest anchor first, but confirm its death from the section
+                    // head before losing the existing plan's continuation.
+                    if (g_snapOn && isSpine && (!p || g_died || p->m_isDead)) {
+                        int origin = ni;
+                        while (origin > 0 && !g_anchors.count(origin))
+                            origin = g_nodes[(size_t)origin].parent;
+                        std::vector<uint8_t> seq;
+                        std::vector<int> path;
+                        size_t replayed = 0;
+                        auto replay = [&](int from) {
+                            solver::sectionReplayPath(g_nodes, ni, from, path);
+                            seq.clear();
+                            for (int i : path) seq.push_back(g_nodes[(size_t)i].in);
+                            seq.push_back((uint8_t)branch);
+                            restoreReplayOrigin(from, from > 0 ? g_anchors.at(from) : g_ckpt);
+                            replayed = 0;
+                            for (size_t s = 0; s < seq.size(); ++s) {
+                                g_died = false;
+                                secStep(seq[s], dt); ++steps; ++replayed;
+                                if (origin > 0 && from == 0) ++headReplaySteps;
+                                if (!m_player1 || m_player1->m_isDead || g_died) return false;
+                            }
+                            return true;
+                        };
+                        const auto result = solver::checkSectionReplay(origin, true, replay);
+                        noteHeadReplay("expand", depth, origin, result, replayed, seq.size());
+                        ++spineChecks;
+                        if (result.alive) ++spineRescued;
+                        char sb[192];
+                        snprintf(sb, sizeof(sb),
+                                 "secspine: d=%d t=%lld replay=%s origin=%d headRetry=%d "
+                                 "ticks=%zu/%zu",
+                                 depth, (long long)(g_ckptTick + depth),
+                                 result.alive ? "RESCUED" : "DEAD", result.origin,
+                                 result.headRetried ? 1 : 0, replayed, seq.size());
+                        writeResult(sb);
+                        p = m_player1;
+                    }
                     // Death is seen via the flag set by destroyPlayer. Nothing is actually
                     // killed, so m_isDead is not set (on the checkpoint path it is set as
                     // before). Branches that escaped upward out of bounds are discarded
@@ -4354,6 +4374,8 @@ class $modify(GJBaseGameLayer) {
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);
                         g_accel.push_back(p ? p->m_accelerationOrSpeed : 0.0);
                         g_pad.push_back(p && p->m_touchedPad ? 1 : 0);
+                        checkpointInputs.emplace_back();
+                        captureCheckpointInputs((int)g_nodes.size() - 1);
                         secPushP2();
                         coinBits.push_back(bitsHere);
                         g_cps.push_back(nullptr);
@@ -4370,9 +4392,10 @@ class $modify(GJBaseGameLayer) {
                         // leaf the plain replay reproduces is an answer; an unverified one is
                         // passed over like a dead-end exit and the search goes on. (The one-way
                         // handoff stops on it as before -- there it is a report, not a splice.)
-                        // It matters under psnap branching, whose one error is a missed death.
+                        // It matters under psnap branching, where a survivor can be false too.
                         if (st == 1 && g_secRung) {
                             ++unverLeaves;
+                            checkpointInputs[(size_t)cand].reset();
                             needWake = true;
                             continue;
                         }
@@ -4436,8 +4459,6 @@ class $modify(GJBaseGameLayer) {
                     // this tick. Exempt from the dedupe -- see the note at
                     // g_spineOn for why a window the solution crosses can
                     // otherwise come back EXHAUSTED.
-                    const bool isSpine =
-                        g_spineOn && ni == g_spine && branch == spinePlanHeld(depth);
                     if (!seen.insert(k).second && !isSpine) { ++layDup; continue; }
                     // No cap discard here. Two children per parent, so the collected count
                     // is naturally bounded by 2*|cur|. Pruning happens once the layer is
@@ -4454,6 +4475,8 @@ class $modify(GJBaseGameLayer) {
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);
                         g_accel.push_back(p ? p->m_accelerationOrSpeed : 0.0);
                         g_pad.push_back(p && p->m_touchedPad ? 1 : 0);
+                        checkpointInputs.emplace_back();
+                        captureCheckpointInputs((int)g_nodes.size() - 1);
                         secPushP2();
                         coinBits.push_back(bitsHere);
                         g_cps.push_back(nullptr);
@@ -4497,6 +4520,8 @@ class $modify(GJBaseGameLayer) {
                         secPushP2();
                         coinBits.push_back(bitsHere);
                         actSigs.push_back(0);
+                        checkpointInputs.emplace_back();
+                        captureCheckpointInputs((int)g_nodes.size() - 1);
                         g_cps.push_back(cp);
                         // For the stacking check. Taken at the same instant as the checkpoint
                         if (g_overlay) {
@@ -4792,8 +4817,8 @@ class $modify(GJBaseGameLayer) {
             if (spineHeld >= 0) nxt.push_back(spineHeld);
             // ---- Detect and repair (cfg `secverifyevery`) --------------------
             // Match the frontier nodes by replaying their input sequence from the section
-            // checkpoint. psnap's errors only go in the direction of missing deaths, so
-            // dropping them here leaves a frontier that is reachable on the real game only.
+            // checkpoint. False survivors are dropped here; the spine's false deaths are
+            // checked during expansion, before the branch can disappear from the frontier.
             // Surviving nodes have their snapshots retaken from the real state after the
             // replay (if they had drifted, that fixes them there).
             postmortem::g_secPhase = 55;
@@ -4805,12 +4830,13 @@ class $modify(GJBaseGameLayer) {
                 int vDead = 0, vFixed = 0, vAnchored = 0;
                 double vMaxDy = 0.0;
                 std::vector<uint8_t> seq;
-                // Replay from the checkpoint of the previous cross-check point. This only
-                // moves the replay origin closer; the input sequence replayed is unchanged
-                // (equivalence is decided by the input sequence). Only branches without an
-                // ancestor checkpoint replay from the section head.
+                // Replay from the previous cross-check checkpoint to keep checks short. A
+                // protected route's anchored death is checked again from the head: moving
+                // the origin is only equivalent when the checkpoint restores faithfully.
                 std::vector<int> anc((size_t)nxt.size(), -1);
                 std::unordered_map<int, CheckpointObject*> newAnchors;
+                // Cancellation at a yield must release anchors not yet published globally.
+                std::vector<geode::Ref<CheckpointObject>> anchorKeepAlive;
                 std::unordered_map<int, std::vector<uint8_t>> newAnchorSnaps;
                 if (g_anchor) {
                     for (size_t k = 0; k < nxt.size(); ++k) {
@@ -4829,17 +4855,11 @@ class $modify(GJBaseGameLayer) {
                 DriftAt worstDrift;
                 std::vector<int> path;
                 for (size_t k = 0; k < nxt.size(); ++k) {
+                    // Long head replays yield between candidates, never halfway through one.
+                    if (g_sliceMs > 0 && sliceExpired()) co_await std::suspend_always{};
                     const int ni = nxt[k];
                     const int a = g_anchor ? anc[k] : -1;
-                    seq.clear();
-                    path.clear();
-                    for (int i = ni; i > 0 && i != a; i = g_nodes[(size_t)i].parent) {
-                        seq.push_back(g_nodes[(size_t)i].in);
-                        path.push_back(i);
-                    }
-                    std::reverse(seq.begin(), seq.end());
-                    std::reverse(path.begin(), path.end());
-                    DriftAt here;
+                    const int origin = a > 0 ? a : 0;
                     auto originCheck = [&](int origin) {
                         if (!psnap::g_snapAct || origin < 0 || (size_t)origin >= acts.size())
                             return;
@@ -4853,62 +4873,49 @@ class $modify(GJBaseGameLayer) {
                     // would start in a world where everything used before its origin is fresh
                     // again -- and since a9adab3 the node takes its flags from this replay. Put
                     // back the origin's own flags first, as the expansion path does.
-                    if (a > 0) {
-                        secRestoreFrom(pl, g_anchors[a], g_nodes[(size_t)a].in);
-                        if (psnap::g_snapAct && (size_t)a < acts.size())
-                            psnap::restoreAct(acts[(size_t)a]);
-                        originCheck(a);
-                        ++restores; ++vAnchored;
-                        // cfg secjbkeep: the origin's own m_jumpBuffered, both bodies, in the
-                        // place the expansion path writes it (before the frozen ticks)
-                        if ((size_t)a < g_dash.size()) secRestoreJb(g_dash[(size_t)a]);
-                        if (auto* q = secP2(); q && (size_t)a < secsolve::g_dash2.size())
-                            secRestoreJb(secsolve::g_dash2[(size_t)a], q);
-                        for (int f = 0; f < freeze; ++f) {
-                            secStep(g_nodes[(size_t)a].in, dt); ++steps;
-                        }
-                        cpTakeLoad();
-                        // ...and the origin's own player (g_cpPlayer).
-                        const auto it = anchorSnaps.find(a);
-                        if (secsolve::g_cpPlayer && it != anchorSnaps.end() && !it->second.empty())
-                            psnap::restore(m_player1, this, it->second.data());
-                        if (it != anchorSnaps.end())
-                            cpReport(4, "checkanchor", (long long)depth, it->second);
-                    } else {
-                        secRestoreFrom(pl, g_ckpt, g_headHeld); ++restores;
-                        if (psnap::g_snapAct && !acts.empty()) psnap::restoreAct(acts[0]);
-                        originCheck(0);
-                        for (int f = 0; f < freeze; ++f) {
-                            secStep(g_headHeld, dt); ++steps;
-                        }
-                        cpTakeLoad();
-                        if (secsolve::g_cpPlayer && !snaps.empty() && !snaps[0].empty())
-                            psnap::restore(m_player1, this, snaps[0].data());
-                        cpReport(3, "checkhead", (long long)depth, secsolve::g_headPlain);
-                    }
-                    bool dead = false;
-                    for (size_t s = 0; s < seq.size(); ++s) {
-                        g_died = false;
-                        secStep((int)seq[s], dt); ++steps;
-                        if (!m_player1 || m_player1->m_isDead || g_died) {
-                            dead = true; break;
-                        }
-                        if (g_cfg.secDriftWhere && here.node < 0) {
-                            const auto& an = g_nodes[(size_t)path[s]];
-                            const double yR = m_player1->getPositionY();
-                            if (std::fabs(yR - (double)an.y) > 0.5) {
-                                here.node = path[s];
-                                here.depth = depth - (int)(seq.size() - 1 - s);
-                                here.yR = yR; here.yP = an.y;
-                                here.vyR = m_player1->m_yVelocity; here.vyP = an.vy;
-                                here.xR = m_player1->getPositionX();
-                                here.mode = (int)modeIdx(m_player1);
-                                here.up = m_player1->m_isUpsideDown ? 1 : 0;
-                                here.size = m_player1->m_vehicleSize;
+                    DriftAt here;
+                    size_t replayed = 0;
+                    auto replay = [&](int from) {
+                        here = {};   // discard observations from a failed anchor trial
+                        solver::sectionReplayPath(g_nodes, ni, from, path);
+                        seq.clear();
+                        for (int i : path) seq.push_back(g_nodes[(size_t)i].in);
+                        restoreReplayOrigin(from, from > 0 ? g_anchors.at(from) : g_ckpt);
+                        originCheck(from);
+                        if (from > 0) ++vAnchored;
+                        replayed = 0;
+                        for (size_t s = 0; s < seq.size(); ++s) {
+                            g_died = false;
+                            secStep((int)seq[s], dt); ++steps; ++replayed;
+                            if (origin > 0 && from == 0) ++headReplaySteps;
+                            if (!m_player1 || m_player1->m_isDead || g_died) return false;
+                            if (g_cfg.secDriftWhere && here.node < 0) {
+                                const auto& an = g_nodes[(size_t)path[s]];
+                                const double yR = m_player1->getPositionY();
+                                if (std::fabs(yR - (double)an.y) > 0.5) {
+                                    here.node = path[s];
+                                    here.depth = depth - (int)(seq.size() - 1 - s);
+                                    here.yR = yR; here.yP = an.y;
+                                    here.vyR = m_player1->m_yVelocity; here.vyP = an.vy;
+                                    here.xR = m_player1->getPositionX();
+                                    here.mode = (int)modeIdx(m_player1);
+                                    here.up = m_player1->m_isUpsideDown ? 1 : 0;
+                                    here.size = m_player1->m_vehicleSize;
+                                }
                             }
                         }
+                        return true;
+                    };
+                    // Check both death paths: a spine can disappear here as well as during
+                    // expansion. Ordinary dead branches retain the cheap anchored verdict.
+                    const auto result = solver::checkSectionReplay(origin, ni == g_spineNext, replay);
+                    noteHeadReplay("check", depth, origin, result, replayed, seq.size());
+                    if (!result.alive) {
+                        ++vDead;
+                        if (ni == g_spineNext) g_spineNext = -1;
+                        releaseCp(ni);
+                        continue;
                     }
-                    if (dead) { ++vDead; releaseCp(ni); continue; }
                     auto* vp = m_player1;
                     // x as well: a drift in x alone (on a custom level, the mirror transition) passed a
                     // y/vy-only check untouched and the node kept its wrong x.
@@ -4929,6 +4936,11 @@ class $modify(GJBaseGameLayer) {
                     g_nodes[(size_t)ni].x = (float)rx;
                     g_nodes[(size_t)ni].y = (float)ry;
                     g_nodes[(size_t)ni].vy = (float)rv;
+                    g_nodes[(size_t)ni].dash = vp->m_isDashing ? 1 : 0;
+                    g_nodes[(size_t)ni].cnt = (uint16_t)secsolve::cntNow(this);
+                    // A corrected snapshot must not be overwritten by stale dash/boost fields
+                    // on the next expansion or when this node becomes a replay origin.
+                    captureAux(ni);
                     // Retake from the real state. Skipping this means the match passed but
                     // the continuation grows from the old snapshot.
                     psnap::capture(vp, this, snaps[(size_t)ni]);
@@ -4950,7 +4962,7 @@ class $modify(GJBaseGameLayer) {
                     // make it here.
                     if (g_anchor) {
                         if (CheckpointObject* ac = markCheckpointAtPhys(pl)) {
-                            ac->retain();
+                            anchorKeepAlive.emplace_back(ac);
                             newAnchors[ni] = ac;
                             if (secsolve::g_cpPlayer || psnap::g_cpCheck)
                                 newAnchorSnaps[ni] = snaps[(size_t)ni];
@@ -4968,7 +4980,11 @@ class $modify(GJBaseGameLayer) {
                     if (!newAnchors.count(an) && (size_t)an < acts.size()
                         && (size_t)an < snaps.size() && snaps[(size_t)an].empty())
                         std::vector<uint8_t>().swap(acts[(size_t)an]);
+                    if (!newAnchors.count(an) && (size_t)an < checkpointInputs.size()
+                        && std::find(ok.begin(), ok.end(), an) == ok.end())
+                        checkpointInputs[(size_t)an].reset();
                 }
+                for (auto& kv : newAnchors) if (kv.second) kv.second->retain();
                 g_anchors.swap(newAnchors);
                 anchorSnaps.swap(newAnchorSnaps);
                 // A measurement of how much psnap lied. The prior gates (sweep, moving
@@ -5264,6 +5280,19 @@ class $modify(GJBaseGameLayer) {
                  g_targetY, g_targetYDir, g_targetDepth, graceOk, graceDeadAt,
                  doomedLeaves, killAboveY, maxVerifyDrift, stopWhy);
         writeResult(b);
+        if (spineChecks > 0) {
+            char sb[128];
+            snprintf(sb, sizeof(sb), "secspine: checked=%lld rescued=%lld confirmedDead=%lld",
+                     spineChecks, spineRescued, spineChecks - spineRescued);
+            writeResult(sb);
+        }
+        if (headReplayChecks > 0) {
+            char hb[144];
+            snprintf(hb, sizeof(hb), "secanchor: headChecks=%lld rescued=%lld headDead=%lld "
+                     "steps=%lld", headReplayChecks, headReplayRescued,
+                     headReplayChecks - headReplayRescued, headReplaySteps);
+            writeResult(hb);
+        }
         // What the object-activation carry cost (psnap::captureAct): objects in reach = bytes
         // per node, the nodes that hold a copy, and the time spent saving and restoring them.
         if (g_snapOn) {
@@ -5278,6 +5307,18 @@ class $modify(GJBaseGameLayer) {
                      psnap::g_actCapUs, psnap::g_actRestUs, psnap::actSeenCount(1),
                      psnap::actSeenCount(2), actSigSeen.size(), psnap::g_actDecos.size(),
                      psnap::actDecosUsed(), psnap::actDecosEver());
+            writeResult(ab);
+            snprintf(ab, sizeof(ab), "secsnapcollision: captures=%lld objectsAvg=%.1f "
+                     "objectsMax=%zu bytesMax=%zu",
+                     psnap::g_collisionCaptures,
+                     psnap::g_collisionCaptures > 0
+                         ? (double)psnap::g_collisionObjects / psnap::g_collisionCaptures : 0.0,
+                     psnap::g_collisionMax,
+                     psnap::g_collisionMax * sizeof(solver::CollisionObjectState<GameObject>));
+            writeResult(ab);
+            snprintf(ab, sizeof(ab), "secsnapmotion: commandsMax=%zu commandBytesMax=%zu completedMax=%zu",
+                     psnap::g_emCommandsMax, psnap::g_emCommandsMax * sizeof(GroupCommandObject2),
+                     psnap::g_emCompletedMax);
             writeResult(ab);
             snprintf(ab, sizeof(ab), "secorigin: checks=%lld used=%lld lost=%lld", originChecks,
                      originUsed, originLost);
@@ -5338,7 +5379,8 @@ class $modify(GJBaseGameLayer) {
             for (const auto& v : acts) actBytes += v.capacity();
             const double elemsMB =
                 (double)(states.capacity() * sizeof(states[0]) + touches.capacity() * sizeof(touches[0])
-                         + pulses.capacity() * sizeof(psnap::EMSnap)
+                         + checkpointInputs.capacity() * sizeof(checkpointInputs[0])
+                         + pulses.capacity() * sizeof(psnap::EMState)
                          + (snaps.capacity() + acts.capacity() + worlds.capacity())
                                * sizeof(std::vector<uint8_t>)) / (1024.0 * 1024.0);
             size_t curMB = 0, peakMB = 0;

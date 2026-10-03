@@ -181,6 +181,7 @@ class $modify(PlayerObject) {
         writeResult(b);
     }
 
+    // Observe collision bookkeeping around the original call without changing its verdict.
     void postCollision(float dt, bool betweenSteps) {
         auto* l = GJBaseGameLayer::get();
         const bool isP1 = l && this == l->m_player1;

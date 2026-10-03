@@ -203,10 +203,8 @@ inline double g_dt = 1.0 / 240.0;
 // ticks early" -- which is a misdiagnosis of a knob that exists precisely
 // because the answer is not derivable.
 inline int g_off = 0;
-// cfg `secpsnap=N`: measure over N ticks whether a player-only snapshot restore
-// can replace a full checkpoint restore (no search). `secpsnapreps=R` sets the
-// repetition count. In sections where this passes, one branch goes from
-// 2.02ms/0.95MB to a single memcpy.
+// cfg `secpsnap=N`: measure over N ticks whether the production composite snapshot
+// can replace a full checkpoint restore (no search), including pollution and chain tests.
 inline int g_snapCmp = 0;
 inline int g_snapReps = 3;
 // cfg `secsnap`: choice of branch primitive. 0=checkpoint only / 1=force psnap /
@@ -240,7 +238,9 @@ inline std::vector<GameObject*> g_movSet;   // decided once at the section start
 // cfg `secworld=N`: compare the world object-by-object after checkpoint restore
 // vs after psnap restore
 inline int g_worldDiff = 0;
-// WHAT THIS SEARCH CANNOT SEE [2026-08-27, measured on a custom level]
+// HISTORICAL SNAPSHOT OMISSION [2026-08-27, measured on a custom level]
+// The composite snapshot now carries both players' out-of-bounds latch; continuous
+// replay verification remains necessary for any other unsaved accumulating state.
 // A branch is one restore plus one step, so any death GD only reaches by
 // ACCUMULATING state over consecutive ticks -- the out-of-bounds latch that
 // wants two of them, a one-shot trigger the restore puts back -- is reset
@@ -264,7 +264,7 @@ inline int g_worldDiff = 0;
 // checkpoint; only sections with deaths split", so the clean fix is to NOT LET
 // THE DEATH HAPPEN AT ALL. Collision remains, so portals and triggers fire
 // normally (same as cfg nodeath).
-inline bool g_noKill = false;   // set only by the search proper (not by the sweep)
+inline bool g_noKill = false;   // search swallows but observes deaths
 // cfg `secnokill`: a knob EXCLUSIVELY FOR ISOLATION, to align the handling of
 // death across both paths.
 // -1 = auto (swallow only under psnap, default) / 0 = always really kill /
@@ -523,8 +523,10 @@ inline bool g_died = false;     // did a death verdict come in the previous step
 inline bool& g_active = g_secSearching;
 inline int g_feed = 0;               // button state given at this tick (0/1)
 inline int g_held = 0;               // currently pressing? (for handleButton deltas)
-// Can be turned off with cfg `secjumpbuf=0` (default ON): when restoring a held
-// press, also set m_jumpBuffered. WITHOUT THIS A HELD BRANCH BECOMES A
+// Can be turned off with cfg `secjumpbuf=0` (default ON): legacy checkpoint rearm
+// sets m_jumpBuffered. Search checkpoints overwrite this with their saved input.
+// Fast snapshots preserve their saved buffers after rearm.
+// On the checkpoint path, WITHOUT THIS A HELD BRANCH BECOMES A
 // DIFFERENT THING FROM THE PLAIN REPLAY — history and measurements are in the
 // note on secArmHold in phase1.cpp. It is made switchable for A/B testing.
 inline bool g_jumpBuf = true;
@@ -538,6 +540,22 @@ inline bool g_jumpBuf = true;
 // -- the spine died on that tick. With the node's own value the spine lives on.
 inline bool g_jbKeep = true;
 inline int8_t g_headJb[2] = {-1, -1};   // m_jumpBuffered of p1 / p2 in the plain flight, -1 = none
+
+using InputStates = std::array<solver::InputContinuation<PlayerObject>, 2>;
+// Taken with the section head, before checkpoint qualification can change its buffers.
+inline InputStates g_ckptInputs;
+static_assert(offsetof(PlayerObject, m_jumpBuffered) == 0x985);
+static_assert(offsetof(PlayerObject, m_stateRingJump) == 0x986);
+static_assert(offsetof(PlayerObject, m_stateJumpBuffered) == 0x989);
+static_assert(offsetof(PlayerObject, m_holdingButtons) == 0xbb8);
+// Native wave updateJump reads these; releaseButton/stopDashing mutate the latter pair.
+static_assert(offsetof(PlayerObject, m_speedMultiplier) == 0x7b8);
+static_assert(offsetof(PlayerObject, m_playerSpeed) == 0x9f4);
+static_assert(offsetof(PlayerObject, m_justPlacedStreak) == 0x5a0);
+static_assert(offsetof(PlayerObject, m_lastLandTime) == 0xa10);
+// GJBaseGameLayer::update consumes this pending speed before updating the player.
+static_assert(offsetof(GJBaseGameLayer, m_gameState) + offsetof(GJGameState, m_timeModRelated) == 0x4e8);
+static_assert(offsetof(GJBaseGameLayer, m_gameState) + offsetof(GJGameState, m_timeModRelated2) == 0x4ec);
 
 // Dash (dash ring type 37/38) state.
 //
@@ -553,7 +571,13 @@ inline int8_t g_headJb[2] = {-1, -1};   // m_jumpBuffered of p1 / p2 in the plai
 // valid to the end. The ground object, slopes, stair snap and the last portal
 // passed each change the next tick's behaviour, so dropping them makes psnap
 // drift silently (measured 150.7px).
-struct DashState {
+struct PlayerAuxState {
+    bool present = false;
+    bool dead = false;
+    double vy = 0, accel = 0;
+    bool pad = false;
+    unsigned char oobLatch = 0;
+    solver::InputContinuation<PlayerObject> input;
     bool on = false;
     GameObject* ring = nullptr;
     double x = 0, y = 0, angle = 0, startTime = 0;
@@ -569,8 +593,8 @@ struct DashState {
     GameObject* potentialSlope = nullptr;
     GameObject* snappedTo = nullptr;
     GameObject* lastPortal = nullptr;
-    int8_t jumpBuf = -1;   // m_jumpBuffered at the capture (cfg secjbkeep), -1 = not taken
 };
+using DashState = std::array<PlayerAuxState, 2>;
 
 // 1 node = "the input sequence from the section start". Walking the parents
 // recovers the sequence. y/vy/x are used for the sort when narrowing a layer to
@@ -671,6 +695,9 @@ inline std::vector<uint8_t> g_pad2;
 // -0.272, -0.570, ...) while the run from the head holds y=241.7341 at
 // vy=0.000.
 inline DashState g_ckptDash;
+// The section head's boost state must be captured before any qualification replay.
+inline double g_ckptAccel = 0.0;
+inline bool g_ckptPad = false;
 // cfg `secheaddash` (on by default since 2026-10; 0 = off): the section search's head takes its
 // dash from the plain flight (g_ckptDash, and g_ckptDash2 for player 2) instead of from what the
 // head's checkpoint load left, which never has one. Without it a head inside a dash put every node
@@ -706,10 +733,9 @@ inline std::vector<SecDeadBand> g_secBands;
 
 // ---- counter observation (see the note on Node::cnt) ------------------------
 // Sum of GJEffectManager's item counters + THE NUMBER OF DISABLED OBJECTS. The
-// baseline for the delta (g_cntBase) is taken at the section start. psnap does
-// not carry this map (OPAQUE in po_members.inc), but a section where counters
-// move also has moving geometry, so it falls back to the checkpoint anyway
-// (verify-and-repair guards it).
+// baseline for the delta (g_cntBase) is taken at the section start. GD's native
+// effect snapshot carries the map; the production key still uses this sum,
+// not a full per-item or per-timer identity.
 //
 // Why disabled was added (2026-08-12, late night): the contraption at lv22
 // x=12,100 is "when the spider lands hanging on the ceiling, the touch Toggle
@@ -846,6 +872,7 @@ inline void reset() {
     g_rungCoin = -1;
     g_feed = 0;
     g_held = 0;
+    g_ckptInputs = {};
     g_nodes.clear();
     g_dash.clear();
     g_dash2.clear();
