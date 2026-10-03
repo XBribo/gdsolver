@@ -1357,7 +1357,8 @@ class $modify(GJBaseGameLayer) {
         // Both this and the poll below can reset the level, and a reset in the middle of a
         // section search replaces the world that search is expanding into -- so both wait for
         // it. Nothing is lost by waiting: a search ends its own session.
-        if (g_stallResetPending && !secsolve::inFlight() && !dpsolve::g_running.load()) {
+        if (g_stallResetPending && !g_secRetryPending
+            && !secsolve::inFlight() && !dpsolve::g_running.load()) {
             g_stallResetPending = false;
             if (auto* pl = PlayLayer::get()) {
                 writeResult("stall: resetLevel at the frame boundary");
@@ -3719,7 +3720,8 @@ class $modify(GJBaseGameLayer) {
         double splitNodeX = 0, splitRepX = 0, splitNodeY = 0, splitRepY = 0;
         double splitNodeVy = 0, splitRepVy = 0;
         int graceOk = -1, graceDeadAt = -1;
-        long long doomedLeaves = 0;      // number of exits discarded as dead ends
+        long long doomedLeaves = 0;      // fixed-input exit checks that need further search
+        long long continuedLeaves = 0, skippedExitChecks = 0;
         long long unverLeaves = 0;       // ...and, in a rung, as not reproduced by the replay
         double maxVerifyDrift = 0.0;     // size of psnap's lie (max diff in the cross-check pass)
 
@@ -3781,10 +3783,10 @@ class $modify(GJBaseGameLayer) {
         // ---- Leaf cross-check (plain replay + exit survivability) -------------------
         // Verify "on the spot" when the goal is reached. Formerly the cross-check ran once
         // after stopping the search, so if the first leaf that arrived was a dead end, the
-        // search ended there. The right thing is to discard the dead-end exit and keep
-        // searching (there may be other paths).
-        // Return 0=SOLVED / 1=UNVERIFIED (not reproduced by replay) / 2=DOOMED (exit is a
-        // dead end)
+        // search ended there. Replay failures are discarded; live exits whose fixed-input
+        // trials fail stay in the frontier to search later click timings.
+        // Return 0=SOLVED / 1=UNVERIFIED (not reproduced by replay) / 2=CONTINUE (fixed
+        // patterns failed, but a second full replay leaves a live exit to branch from).
         // The last leaf check's input and node lists (size, capacity), for the containment's line:
         // they live inside evalLeaf and are gone by the time an exception reaches the catch.
         size_t leafSeqN = 0, leafSeqCap = 0, leafPathN = 0, leafPathCap = 0;
@@ -3920,7 +3922,7 @@ class $modify(GJBaseGameLayer) {
                 writeResult(lb2);
             }
             lcp->release();
-            return graceOk == 0 ? 2 : 0;
+            return static_cast<int>(solver::finishSectionExit(graceOk != 0, replayLeaf));
         };
 
         // Layer breakdown (cfg `seclog=1`). Report separately whether it thinned by dead /
@@ -4001,9 +4003,11 @@ class $modify(GJBaseGameLayer) {
             foundLeaf = -1;
             stopWhy = "exception";
         };
+        solver::SectionForwardSearch forward(g_horizon, g_targetDepth, g_grace, g_secRungAuto);
         try {
         if (cpRefused) stopWhy = "no-cp";
-        for (int depth = 1; depth <= g_horizon && foundLeaf < 0 && !cpRefused; ++depth) {
+        for (int depth = 1; depth <= forward.horizon && foundLeaf < 0 && !cpRefused; ++depth) {
+            solver::SectionExitChecks exitChecks;
             nxt.clear();
             seen.clear();
             layDead = layDup = layCap = 0;
@@ -4026,7 +4030,7 @@ class $modify(GJBaseGameLayer) {
                 // search that is merely warming up.
                 if (depth >= 40 && depth % 20 == 0) {
                     const double perLayer = elapsedS / (double)(depth - 1);
-                    if (elapsedS + perLayer * (double)(g_horizon - depth + 1)
+                    if (elapsedS + perLayer * (double)(forward.horizon - depth + 1)
                         > g_deadlineSec) {
                         stopWhy = "projected";
                         break;
@@ -4276,9 +4280,9 @@ class $modify(GJBaseGameLayer) {
                     // Where the physics stands, not where the node was moved for drawing during a
                     // mirror transition (psnap::physPosition).
                     const cocos2d::CCPoint at = psnap::physPosition(p, this);
-                    const double px = at.x;
-                    const double py = at.y;
-                    const double pv = (double)p->m_yVelocity;
+                    double px = at.x;
+                    double py = at.y;
+                    double pv = (double)p->m_yVelocity;
                     // cfg seccoins: the coins this step touched, and a coin left behind.
                     uint32_t bitsHere = coinsOn ? coinBits[(size_t)ni] : 0u;
                     if (coinsOn) {
@@ -4351,11 +4355,11 @@ class $modify(GJBaseGameLayer) {
                     layMinX = std::min(layMinX, px);
                     layMinY = std::min(layMinY, py);
                     layMaxY = std::max(layMaxY, py);
-                    if (reachedGoal(px, py, depth)) {
-                        // After the cutoff, discard without evaluating (see the note on
-                        // g_maxDoomed). The search continues but the cost does not grow.
-                        if (g_maxDoomed > 0 && doomedLeaves >= g_maxDoomed)
-                            continue;
+                    const bool atGoal = reachedGoal(px, py, depth);
+                    const bool checkExit = atGoal && exitChecks.take(
+                        doomedLeaves, g_maxDoomed, controllable(p));
+                    if (atGoal && !checkExit) ++skippedExitChecks;
+                    if (atGoal && checkExit) {
                         // cfg dpseccoinrung: a rung fired for a coin is answered only by a leaf
                         // that has it.
                         if (coinsOn && secsolve::g_rungCoin >= 0
@@ -4405,15 +4409,28 @@ class $modify(GJBaseGameLayer) {
                             foundDepth = depth;
                             break;
                         }
-                        // Do not stop at a dead-end exit. The search continues. The
-                        // cross-check returned the world to the section head, so the next
-                        // expansion starts from a restore on either path (checkpoint and
-                        // psnap alike).
+                        // A failed fixed-input test is not proof that no later click works.
+                        // evalLeaf leaves the game at the live, fully replayed exit. Reuse
+                        // the normal dedupe/cap/snapshot path to expand it on the next layer.
                         ++doomedLeaves;
-                        needWake = true;
-                        // Keep the last dead-end exit for the report (foundLeaf stays unset)
+                        ++continuedLeaves;
                         foundX = verifyX;
-                        continue;
+                        p = m_player1;
+                        px = verifyX; py = verifyY; pv = verifyVy;
+                        // The trial node has no descendants or retained checkpoint yet.
+                        // Remove it before the common insertion so every array keeps one
+                        // entry per node and only the replay-corrected state is recorded.
+                        g_nodes.pop_back(); g_dash.pop_back(); g_vy.pop_back();
+                        g_accel.pop_back(); g_pad.pop_back(); coinBits.pop_back();
+                        secsolve::g_dash2.pop_back(); secsolve::g_vy2.pop_back();
+                        secsolve::g_accel2.pop_back(); secsolve::g_pad2.pop_back();
+                        checkpointInputs.pop_back();
+                        g_cps.pop_back(); actSigs.pop_back();
+                        if (keepSnaps) {
+                            snaps.pop_back(); pulses.pop_back(); states.pop_back();
+                            touches.pop_back(); acts.pop_back();
+                        }
+                        if (g_worldOn) worlds.pop_back();
                     }
                     const int cntHere = secsolve::cntNow(this);
                     // The objects this child has used (psnap only: on the checkpoint path the
@@ -4821,13 +4838,15 @@ class $modify(GJBaseGameLayer) {
             // checked during expansion, before the branch can disappear from the frontier.
             // Surviving nodes have their snapshots retaken from the real state after the
             // replay (if they had drifted, that fixes them there).
-            postmortem::g_secPhase = 55;
-            if (g_snapOn && g_verifyEvery > 0 && !nxt.empty()
-                && depth % g_verifyEvery == 0) {
-                postmortem::g_secPhase = 60;
+            // A live snapshot frontier at the horizon is not proof of a live route. Check
+            // every retained candidate from the head before allowing bounded lookahead.
+            const bool boundaryCheck = forward.enabled && depth == forward.horizon
+                                       && foundLeaf < 0;
+            if (!nxt.empty() && (boundaryCheck
+                || (g_snapOn && g_verifyEvery > 0 && depth % g_verifyEvery == 0))) {
                 std::vector<int> ok;
                 ok.reserve(nxt.size());
-                int vDead = 0, vFixed = 0, vAnchored = 0;
+                int vDead = 0, vFixed = 0, vAnchored = 0, verifiedExits = 0;
                 double vMaxDy = 0.0;
                 std::vector<uint8_t> seq;
                 // Replay from the previous cross-check checkpoint to keep checks short. A
@@ -4838,7 +4857,7 @@ class $modify(GJBaseGameLayer) {
                 // Cancellation at a yield must release anchors not yet published globally.
                 std::vector<geode::Ref<CheckpointObject>> anchorKeepAlive;
                 std::unordered_map<int, std::vector<uint8_t>> newAnchorSnaps;
-                if (g_anchor) {
+                if (g_snapOn && g_anchor && !boundaryCheck) {
                     for (size_t k = 0; k < nxt.size(); ++k) {
                         int a = nxt[k];
                         for (int s = 0; s < g_verifyEvery && a > 0; ++s)
@@ -4933,6 +4952,18 @@ class $modify(GJBaseGameLayer) {
                         worstDrift.dy = dmax;
                     }
                     if (dx > g_verifyTol || dy > g_verifyTol || dv > g_verifyTol) ++vFixed;
+                    if (!g_snapOn) {
+                        CheckpointObject* cp = markCheckpointAtPhys(pl);
+                        if (!cp) {
+                            ++vDead;
+                            if (ni == g_spineNext) g_spineNext = -1;
+                            releaseCp(ni);
+                            continue;
+                        }
+                        cp->retain(); ++cpMade;
+                        if (g_cps[(size_t)ni]) g_cps[(size_t)ni]->release();
+                        g_cps[(size_t)ni] = cp;
+                    }
                     g_nodes[(size_t)ni].x = (float)rx;
                     g_nodes[(size_t)ni].y = (float)ry;
                     g_nodes[(size_t)ni].vy = (float)rv;
@@ -4943,12 +4974,14 @@ class $modify(GJBaseGameLayer) {
                     captureAux(ni);
                     // Retake from the real state. Skipping this means the match passed but
                     // the continuation grows from the old snapshot.
-                    psnap::capture(vp, this, snaps[(size_t)ni]);
-                    psnap::captureEM(this, pulses[(size_t)ni]);
-                    if (!states[(size_t)ni]) states[(size_t)ni] = newState();
-                    if (!touches[(size_t)ni]) touches[(size_t)ni] = std::make_unique<psnap::Touch>();
-                    psnap::captureState(this, *states[(size_t)ni]);
-                    psnap::captureTouch(vp, *touches[(size_t)ni], this);
+                    if (keepSnaps) {
+                        psnap::capture(vp, this, snaps[(size_t)ni]);
+                        psnap::captureEM(this, pulses[(size_t)ni]);
+                        if (!states[(size_t)ni]) states[(size_t)ni] = newState();
+                        if (!touches[(size_t)ni]) touches[(size_t)ni] = std::make_unique<psnap::Touch>();
+                        psnap::captureState(this, *states[(size_t)ni]);
+                        psnap::captureTouch(vp, *touches[(size_t)ni], this);
+                    }
                     // ...and which objects the real replay has used, which is what the node
                     // carries from here on (36ef322 left the psnap-side flags in place).
                     if ((size_t)ni < acts.size() && psnap::g_snapAct) {
@@ -4956,11 +4989,11 @@ class $modify(GJBaseGameLayer) {
                         if ((size_t)ni < actSigs.size()) actSigs[(size_t)ni] = sig;
                         actSigSeen.insert(sig);
                     }
-                    if (g_worldOn)
+                    if (g_snapOn && g_worldOn)
                         psnap::captureWorld(g_movSet, worlds[(size_t)ni]);
                     // Origin of the next cross-check. The real state is here right now, so
                     // make it here.
-                    if (g_anchor) {
+                    if (g_snapOn && g_anchor && !boundaryCheck) {
                         if (CheckpointObject* ac = markCheckpointAtPhys(pl)) {
                             anchorKeepAlive.emplace_back(ac);
                             newAnchors[ni] = ac;
@@ -4968,6 +5001,7 @@ class $modify(GJBaseGameLayer) {
                                 newAnchorSnaps[ni] = snaps[(size_t)ni];
                         }
                     }
+                    if (boundaryCheck && reachedGoal(rx, ry, depth)) ++verifiedExits;
                     ok.push_back(ni);
                 }
                 // Discard and replace the old generation of anchors. Letting them pile up
@@ -5013,6 +5047,18 @@ class $modify(GJBaseGameLayer) {
                     writeResult(db);
                 }
                 nxt.swap(ok);
+                if (boundaryCheck) {
+                    const bool extended = forward.extend(verifiedExits > 0);
+                    char fb[192];
+                    snprintf(fb, sizeof(fb), "secforward: d=%d headChecked=%zu alive=%zu "
+                             "exits=%d action=%s horizon=%d limit=%d",
+                             depth, nxt.size() + (size_t)vDead, nxt.size(), verifiedExits,
+                             extended ? "extend" : "backtrack", forward.horizon, forward.limit);
+                    writeResult(fb);
+                    if (!extended)
+                        stopWhy = nxt.empty() ? "forward-dead"
+                                  : verifiedExits == 0 ? "forward-no-exit" : "forward-limit";
+                }
                 if (nxt.empty()) { deepest = depth; spineLied(depth); break; }
             }
             deepest = depth;
@@ -5194,7 +5240,7 @@ class $modify(GJBaseGameLayer) {
             if (g_sliceMs > 0) {
                 char hb[96];
                 snprintf(hb, sizeof(hb), "secsolve: layer %d/%d, frontier %zu",
-                         depth, g_horizon, cur.size());
+                         depth, forward.horizon, cur.size());
                 g_hudPhase = hb;
                 if (sliceExpired()) co_await std::suspend_always{};
             }
@@ -5236,15 +5282,12 @@ class $modify(GJBaseGameLayer) {
                  // A solution that failed the cross-check is never called SOLVED. The
                  // caller looks only at the verdict, so rejecting it here makes it
                  // structurally impossible for a false solution to be grafted.
-                 // A solution whose exit is a dead end is never called SOLVED (DOOMED).
-                 // Even if it reaches the goal, it is no solution if every press from
-                 // there dies. Dead-end exits are discarded and the search continues, so
-                 // DOOMED appears when "paths to the goal were found, but every one was a
-                 // dead end".
+                 // Keep DOOMED as the caller's failure verdict, not a proof of impossibility:
+                 // fixed patterns failed and bounded continuation found no verified handoff.
                  foundLeaf < 0 ? (doomedLeaves > 0 ? "DOOMED" : "EXHAUSTED")
                                : (g_leafVerified ? "SOLVED" : "UNVERIFIED"),
                  !g_snapOn ? "cp" : (g_worldOn ? "psnap+wsnap" : "psnap"),
-                 g_worldOn ? g_movSet.size() : (size_t)0, deepest, g_horizon,
+                 g_worldOn ? g_movSet.size() : (size_t)0, deepest, forward.horizon,
                  cur.size(), restores, steps, cpMade, cpPeak, freeze, ms,
                  rephases, psnap::g_shrinks, (long long)g_ckptTick,
                  // The absolute-tick origin when grafting onto the plain replay =
@@ -5280,6 +5323,20 @@ class $modify(GJBaseGameLayer) {
                  g_targetY, g_targetYDir, g_targetDepth, graceOk, graceDeadAt,
                  doomedLeaves, killAboveY, maxVerifyDrift, stopWhy);
         writeResult(b);
+        if (forward.enabled) {
+            char fb[128];
+            snprintf(fb, sizeof(fb), "secforward: initial=%d searched=%d horizon=%d "
+                     "limit=%d extensions=%d", forward.initial, deepest, forward.horizon,
+                     forward.limit, forward.extensions);
+            writeResult(fb);
+        }
+        if (continuedLeaves > 0 || skippedExitChecks > 0) {
+            char eb[160];
+            snprintf(eb, sizeof(eb), "secexit: continued=%lld budgetSkipped=%lld "
+                     "targetDepth=%d searchedDepth=%d horizon=%d",
+                     continuedLeaves, skippedExitChecks, g_targetDepth, deepest, forward.horizon);
+            writeResult(eb);
+        }
         if (spineChecks > 0) {
             char sb[128];
             snprintf(sb, sizeof(sb), "secspine: checked=%lld rescued=%lld confirmedDead=%lld",
@@ -5421,7 +5478,9 @@ class $modify(GJBaseGameLayer) {
         // lets the loop carry on -- GD verifies the new plan the way it verifies any
         // other, so the loop's invariant ("the prefix GD replayed is true") holds.
         if (g_secRung) {
+            const bool retryAuto = g_secRungAuto;
             g_secRung = false;
+            g_secRungAuto = false;
             // cfg dpsecstate: the probe's answer is a verdict, not a plan (repair.hpp stateFire).
             const int stateKind = g_secState;
             g_secState = 0;
@@ -5505,11 +5564,11 @@ class $modify(GJBaseGameLayer) {
                 // The handoff installed the deepest plan (g_best) to replay to the section head;
                 // that is what GD flies next, so it is the loop's plan too (see g_plan above).
                 dpsolve::g_plan = g_cfg.inputs;
-                writeResult(stateKind == 1
-                                ? std::string("secrung: the probe ") + (foundLeaf >= 0 ? "crossed" : "did not cross")
-                                      + " - a verdict, nothing is spliced; the loop carries on from the deepest plan"
-                                : std::string("secrung: the search found nothing - the loop carries on from the "
-                                              "deepest plan"));
+                writeResult(retryAuto
+                                ? "secrung: the search found nothing - queuing an earlier window "
+                                  "without replaying the unchanged deepest plan"
+                                : "secrung: the search found nothing - the loop carries on from "
+                                  "the deepest plan");
             }
             // The section head is a one-shot of the SESSION: practice mode goes on once and the
             // checkpoint is placed once (resetSessionState clears both), and the one-way handoff
@@ -5579,6 +5638,20 @@ class $modify(GJBaseGameLayer) {
             dpsolve::g_stop = false;     // the loop may spawn solves again
             g_paused = redoCp;           // ...unless the redo is queued: held until it is taken
             g_forceCleanStart = true;    // drop the search's practice mode and checkpoints
+            if (foundLeaf < 0 && retryAuto && !ownTiers && !redoCp) {
+                // A deadline is a resource limit, not evidence of a bad entry. Do not spend
+                // more immediately on still longer windows after this sequence hit its limit.
+                if (std::strcmp(stopWhy, "deadline") == 0
+                    || std::strcmp(stopWhy, "projected") == 0) {
+                    dpsolve::g_autoLastT0 = 1;
+                    writeResult(std::string("secrung: backtrack stopped by the section resource "
+                                            "limit (") + stopWhy + ")");
+                }
+                g_secRetryPending = true;
+                g_paused = true;
+                g_hudPhase = "secrung: waiting to try an earlier entry";
+                co_return;               // poll queues the next rung after this coroutine is gone
+            }
             g_hudPhase = "secrung: replaying the spliced plan";
             // cfg secbookfirst: the coin books go back to the searched attempt's HERE, before the
             // reset below starts the next attempt. Left to coinBook's destructor, they went back

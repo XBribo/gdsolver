@@ -499,9 +499,9 @@ inline std::string shaderSig(GJBaseGameLayer* l) {
              (unsigned)(h & 0xffffffffULL));
     return b;
 }
-// After how many doomed exits to give up with "nothing from this entry"
-// (cfg `secmaxdoomed`). Each one costs a replay + 10 grace lines ≈ 1,300 steps,
-// measured 344 of them in 104 seconds. That is plenty as evidence, so stop there.
+// Budget for inconclusive fixed-input exit trials (cfg `secmaxdoomed`; 0 = unlimited).
+// Once spent, air exits keep branching without these costly trials. Exits that
+// regain control still get a replay check within the same horizon and frontier cap.
 inline long long g_maxDoomed = 500;
 // Out-of-bounds ceiling (cfg `secmaxy`). 0 = auto (topmost object of the level
 // + margin).

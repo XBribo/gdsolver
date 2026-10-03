@@ -128,6 +128,8 @@ inline std::string (*g_cpFlightSummary)() = nullptr;
 // can arrive while a solver worker thread is in flight and only the loop knows when it is
 // safe to stop (a detached worker cannot be cancelled).
 inline bool g_secReqPending = false;
+inline bool g_secRetryPending = false;  // a failed rung queues its earlier window at a frame boundary
+inline bool g_secReqAuto = false;       // only loop-fired windows form the automatic backtrack
 inline long long g_secReqStart = -1;
 inline double g_secReqTarget = 0.0;
 inline long long g_secReqHorizon = -1;   // -1 = keep secsolve's current value
@@ -180,6 +182,7 @@ inline int g_secState = 0;           // ...the kind of the rung in flight
 // death.
 inline bool g_secReqRung = false;    // the queued request is a rung
 inline bool g_secRung = false;       // ...and the search in flight is one
+inline bool g_secRungAuto = false;   // command-fired rungs retain their ordinary resume behavior
 inline long long g_secPin = -1;      // no anchor before this tick (-1 = none)
 // The death the rung was fired at. The pin is placed past it as well as past the
 // spliced ticks: an anchor between the two hands the crossing back to the model
@@ -247,8 +250,11 @@ inline void resetSecsolveSession() {
         g_secSettings.valid = false;
     }
     g_secReqPending = false;
+    g_secRetryPending = false;
+    g_secReqAuto = false;
     g_secReqRung = false;
     g_secRung = false;
+    g_secRungAuto = false;
     g_secPin = -1;
     g_secPinWall = -1;
     g_secReqCoin = -1;
@@ -432,6 +438,7 @@ inline void pollCommandFileImpl(const std::string& cmd) {
         g_secReqCap = cp;
         g_secReqDepth = -1;
         g_secReqRung = rung;
+        g_secReqAuto = false;
         g_secReqPending = true;
         writeResult(what + " cmd: queued start=" + std::to_string(st)
             + " target=" + std::to_string(tx)

@@ -38,6 +38,7 @@
 //   * lookahead DOUBLING. This loop runs the inverse -- the whole level, shortened to
 //     kHorizonShort under stall -- which covers the same ground from the other end.
 #include "mod/session.hpp"
+#include "solver/repair_progress.hpp"
 #include "solver/failed_plan.hpp"
 #include "solver/attempt_end.hpp"
 
@@ -1061,6 +1062,7 @@ constexpr long long kAutoCreep = 30;
 inline float g_bestDeathX = 0.f;         // where the deepest death was
 inline long long g_autoWall = -1;        // the deepest death the counts below began at
 inline int g_autoWallRounds = 0;         // rounds since then (the dpsecstall signal)
+inline solver::RepairProgress g_autoProgress;
 inline long long g_autoHead = -1;        // earliest real fixup recorded for a death at the wall
 inline int g_autoNoRec = 0;              // deaths at the wall in a row the recorder wrote nothing for
 inline int g_autoRecNow = 0;             // real records in the recorder run in progress
@@ -1165,16 +1167,17 @@ inline void autoRungDone(long long headTick, long long steps, bool onSnap, bool 
     g_autoLastFound = found;
     g_autoLastCapBound = capBound;
     g_autoRoundWork = 0.0;
-    // The rent was spent on this rung. If the wall still holds, a further try has to be earned
-    // again -- by rounds or by work -- rather than following at once on the old balance.
+    // A successful splice earns a new handoff through repairs. A failed entry is retried directly,
+    // without replaying the unchanged deepest plan or charging another ordinary repair round.
     g_autoWallWork = 0.0;
     g_autoWallRounds = 0;
+    if (found) g_autoProgress.reset();
 }
 
 // A rung whose prefix did not reach its head (see g_secRungPrefixFails): counted once per attempt,
 // and after kSecRungPrefixTries the rung is given up the way a search that found nothing is -- the
 // cfg the handoff overwrote goes back, the deepest plan it installed stays the loop's plan, and the
-// loop runs again. The reset that follows drops practice mode and checkpoints (g_forceCleanStart).
+// next frame tries an earlier head. Its reset drops practice mode and checkpoints (g_forceCleanStart).
 // `died` is the tick the prefix ended at. True when this call gave the rung up.
 inline bool secRungPrefixFailed(long long died, float x, const char* how) {
     if (!g_secRung || !secsolve::g_on || g_ckpt) return false;
@@ -1188,7 +1191,9 @@ inline bool secRungPrefixFailed(long long died, float x, const char* how) {
     writeResult(b);
     if (g_secRungPrefixFails < kSecRungPrefixTries) return false;
     const int head = g_cfg.checkpointAt;
+    const bool retryAuto = g_secRungAuto;
     g_secRung = false;
+    g_secRungAuto = false;
     if (g_secState) {   // cfg dpsecstate: the size is the rung's, not the next one's
         secsolve::g_forceP1Size = -1;
         secsolve::g_keepP1Size = -1;
@@ -1209,13 +1214,16 @@ inline bool secRungPrefixFailed(long long died, float x, const char* how) {
     g_headHeld = 0;
     g_practiceOn = false;
     g_stop = false;                 // the loop may spawn solves again
-    g_paused = false;
+    g_paused = retryAuto;           // hold the failed world until poll chooses the next head
+    g_secRetryPending = retryAuto;
     g_forceCleanStart = true;       // drop practice mode and checkpoints at the next reset
     g_hudPhase = "secrung: abandoned - the prefix does not reach the head";
     snprintf(b, sizeof(b), "secrung: abandoned - the prefix did not reach the head t=%d in %d tries; "
-             "the loop carries on from the deepest plan", head, kSecRungPrefixTries);
+             "%s", head, kSecRungPrefixTries,
+             retryAuto ? "an earlier window will be tried at the frame boundary"
+                       : "the loop carries on from the deepest plan");
     writeResult(b);
-    secRenderRelease();
+    if (!retryAuto) secRenderRelease();
     return true;
 }
 
@@ -4243,13 +4251,9 @@ struct AutoWindow {
 // the game itself, so a stretch it cannot cross from an entry is not one the model will plan
 // across from there: it is the loop's last line, and it keeps going back. Linearly past 800
 // ticks, since a window's search grows with its length.
-constexpr long long kAutoFirstBack = 200;
-constexpr long long kAutoDoubleUpTo = 800;   // doubling up to here, then this much more per try
+// Keep the window progression in the game-independent repair policy for boundary tests.
 inline long long autoBack(int level) {
-    long long back = kAutoFirstBack;
-    for (int i = 0; i < level; ++i)
-        back = back < kAutoDoubleUpTo ? back * 2 : back + kAutoDoubleUpTo;
-    return back;
+    return solver::RepairBacktrack::back(level);
 }
 inline bool autoWindow(AutoWindow& w, int level) {
     const long long wall = rungWall();
@@ -4334,6 +4338,13 @@ inline int autoLevel() {
     if (!sameWall) return 0;
     if (autoCapRetry()) return g_autoTries - 1;
     return (g_autoLastT0 >= 0 && g_autoLastT0 <= 1) ? -1 : g_autoTries;
+}
+
+// Only an already-started sequence at this wall may outlive the repair budget.
+inline bool autoCanContinue() {
+    const bool sameWall = g_autoTriedWall >= 0 && rungWall() >= g_autoTriedWall
+                          && rungWall() < g_autoTriedWall + kAutoCreep;
+    return sameWall && g_autoTries > 0 && autoLevel() >= 0;
 }
 inline bool autoTried() { return autoLevel() < 0; }
 
@@ -4603,6 +4614,7 @@ inline bool autoFire(const char* why) {
     g_secReqHorizon = w.horizon;
     g_secReqCap = cap;
     g_secReqRung = true;
+    g_secReqAuto = true;
     g_secReqCoin = coinRung ? g_coinWallCoin : -1;
     // cfg dpsecstate: a window under the run's size requirement keeps the size (a rung of kind 3).
     const bool keepReq = g_cfg.dpSecState && !coinRung && stateReqActive() && w.t0 >= g_reqFrom;
@@ -6059,8 +6071,11 @@ inline void start(GJBaseGameLayer* l) {
     g_secPin = -1;
     g_secPinWall = -1;
     g_secRung = false;
+    g_secRungAuto = false;
+    g_secRetryPending = false;
     g_autoWall = -1;
     g_autoWallRounds = 0;
+    g_autoProgress.reset();
     g_failedPlans.clear();
     g_candidateContext = solver::PlanContext{};
     g_candidateEdges.clear();
@@ -6319,6 +6334,15 @@ inline void giveUp(const char* reason, const char* sessionWhy) {
     // over either way and nothing is being driven.
     g_paused = true;
     endSession(sessionWhy);
+}
+
+// The normal repair budget never restarts; a final backtrack only drains its existing windows.
+inline void stopIterationBudget() {
+    writeResult("dpsolve: iteration budget exhausted (" + std::to_string(g_cfg.dpMaxIters)
+                + ") - no eligible backtrack window, stopping");
+    g_stop = true;
+    g_hudPhase = "gave up: out of iterations";
+    giveUp("it ran out of repair rounds", "dpsolve_budget");
 }
 
 // The replay just died. Decide which plan the next iteration starts from, then re-solve.
@@ -7444,14 +7468,9 @@ inline void onDeath(long long dt, float deathX,
             writeResult(mb);
         }
     }
-    if (g_iter > g_cfg.dpMaxIters) {
-        writeResult("dpsolve: iteration budget exhausted (" + std::to_string(g_cfg.dpMaxIters)
-                    + ") - stopping");
-        g_stop = true;
-        g_hudPhase = "gave up: out of iterations";
-        giveUp("it ran out of repair rounds", "dpsolve_budget");
-        return;
-    }
+    // Rank this last verification before deciding whether its existing backtrack has more heads.
+    // In particular, a splice that reached a new wall must not open another sequence over budget.
+    const bool outOfIterations = g_iter > g_cfg.dpMaxIters;
     // cfg coinoverdepth: this attempt has every coin the deepest plan had and took, as GD credited
     // it, a coin that plan never had (the one coinmisspost ranked it at). Progress whatever the
     // tick: the deepest plan's rank is a tick on its own route and this death one on another.
@@ -7481,7 +7500,8 @@ inline void onDeath(long long dt, float deathX,
     // cfg dptopstop: the same stop, reached by the search sitting at its largest capacity without
     // getting deeper. Only going deeper takes the ladder back down (the first branch below), so a
     // round that is about to do that is let through.
-    if (g_cfg.dpTopStop > 0 && g_capTier == (int)(sizeof(kCapTiers) / sizeof(kCapTiers[0]))
+    if (!outOfIterations && g_cfg.dpTopStop > 0
+        && g_capTier == (int)(sizeof(kCapTiers) / sizeof(kCapTiers[0]))
         && !deeper && g_iter - g_topTierIter >= g_cfg.dpTopStop) {
         // HEURISTIC-STALLED, NOT UNSOLVABLE: this is an empirical cut of the search, not a proof
         // that the level has no solution from here, so it says so in its own words -- a verdict
@@ -7754,6 +7774,12 @@ inline void onDeath(long long dt, float deathX,
             g_coinWallPlan.clear();
         }
     }
+    if (outOfIterations) {
+        if (autoCanContinue()
+            && autoFire("finishing the existing backtrack after the repair budget")) return;
+        stopIterationBudget();
+        return;
+    }
     // cfg dpsecauto: point fixes are not getting the deepest wall across -- either the recorder
     // cannot express what is wrong there (it wrote nothing, death after death), or it can and the
     // loop is still not moving. Either way the wall goes to a section solve instead of another
@@ -7766,11 +7792,18 @@ inline void onDeath(long long dt, float deathX,
         // The round that FOUND the wall is not rent paid at it -- it got there.
         if (!autoSync()) g_autoWallWork += roundWork;
         ++g_autoWallRounds;   // a round that did not move the wall (autoSync restarts the count)
+        // Keep this streak across autoSync's small cumulative wall shifts. Point fixes that
+        // advance a few ticks each round must not postpone the section search indefinitely.
+        g_autoProgress.observe(rungWall(), (!wasWedged && !voidAttempt && !postScored)
+                                           ? dt : -1);
         char why[128] = "";
         if (g_cfg.dpSecNoRec > 0 && g_autoNoRec >= g_cfg.dpSecNoRec)
             snprintf(why, sizeof(why), "the recorder wrote nothing for %d deaths", g_autoNoRec);
         else if (g_cfg.dpSecStall > 0 && g_autoWallRounds >= g_cfg.dpSecStall)
             snprintf(why, sizeof(why), "%d rounds", g_autoWallRounds);
+        else if (g_cfg.dpSecRent && g_autoProgress.shouldSearch())
+            snprintf(why, sizeof(why), "%d consecutive rounds advancing less than %lld ticks",
+                     g_autoProgress.rounds, solver::RepairProgress::kMinAdvance);
         else if (g_cfg.dpSecRent && g_autoWallWork >= autoRungEstimate())
             snprintf(why, sizeof(why), "%.1f s-equiv of work spent (a rung is ~%.1f, %d measured)",
                      g_autoWallWork / 1e6, autoRungEstimate() / 1e6, g_autoRungN);
@@ -8201,6 +8234,28 @@ inline void poll() {
     // Waits for an idle boundary -- a solver worker cannot be cancelled (spawn() detaches),
     // so the handoff never runs while one is out.
     if (g_secReqPending && (!g_started || g_sessionOver)) g_secReqPending = false;
+    if (g_secRetryPending && (!g_started || g_sessionOver || !g_cfg.dpSolve || g_dpShowSolution))
+        g_secRetryPending = false;
+    // A failed section has no new plan to verify. Queue its next earlier head directly, while
+    // retaining the render hold until the next handoff has reset the search's dirty world.
+    // The coroutine has finished and released its checkpoints before poll reaches this block.
+    if (g_secRetryPending && !g_running.load() && !g_deepActive) {
+        g_secRetryPending = false;
+        g_stallResetPending = false;  // this decision performs the clean reset itself
+        if (!g_secReqPending
+            && !(autoCanContinue()
+                 && autoFire("the previous section failed - trying an earlier entry"))) {
+            writeResult(g_iter >= g_cfg.dpMaxIters
+                            ? "secrung: no earlier window remains and the repair budget is spent"
+                            : "secrung: no earlier window remains - returning to ordinary repairs");
+            g_paused = false;
+            if (auto* pl = PlayLayer::get()) pl->resetLevel();
+            secRenderRelease();
+            // At the budget there is no reason to fly the same failed deepest plan once more.
+            if (g_iter >= g_cfg.dpMaxIters) stopIterationBudget();
+            return;
+        }
+    }
     // Stop the loop from starting anything new, FIRST, and take over once the solver thread in
     // flight has finished. Waiting for an idle thread without this never fires: one frame of a
     // fast loop installs a plan, replays the whole attempt, books the death and spawns the next
@@ -8242,7 +8297,9 @@ inline void poll() {
         // A RUNG puts all of this back when the search is done (secsolve's end in
         // hooks_gamelayer), so what it overwrites is written down first.
         g_secRung = g_secReqRung;
+        g_secRungAuto = g_secReqAuto;
         g_secReqRung = false;
+        g_secReqAuto = false;
         // The wall this rung is being fired at: the deepest death the loop has reached.
         // The pin the resume installs has to clear it (see g_secPinWall).
         g_secPinWall = coinRung ? g_coinWall : g_bestDeath;
