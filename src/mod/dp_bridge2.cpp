@@ -47,7 +47,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#include <xmmintrin.h>
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+#include <xmmintrin.h>   // as cli.hpp and repair.hpp: x86 only, so the Android build compiles
+#endif
 
 // THE SECOND COPY'S STDOUT IS HELD, and printed or thrown away with the search it came from
 // (dp_bridge.cpp), so that a log reads as it would if the plain search had run in the first copy:
