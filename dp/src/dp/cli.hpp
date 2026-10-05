@@ -1537,6 +1537,8 @@ inline int cliMainOnce(int argc, char** argv) {
                     float x2;
                     if (std::sscanf(d, ",x2=%f", &x2) == 1) f.x2 = x2;
                 }
+                if (const char* d = std::strstr(ln.c_str(), ",gravity="))
+                    std::sscanf(d, ",gravity=%f/%f", &f.gravityMod, &f.gravityMod2);
                 g_fixups.push_back(f);
             }
             for (const Fixup& fx : g_fixups)
@@ -2181,6 +2183,22 @@ inline int cliMainOnce(int argc, char** argv) {
         }
     }
     prepMark(3);
+    loadPlayerTriggers(L, trigPath, grpPath);
+    if (!g_playerRoots.empty()) {
+        // Player-only roots append slots after the geometry population was measured.
+        unsigned long long h = 1469598103934665603ull;
+        for (const auto& source : g_touch) {
+            for (int byte = 0; byte < 8; ++byte) {
+                h ^= ((unsigned long long)(unsigned)source.uid >> (byte * 8)) & 0xffull;
+                h *= 1099511628211ull;
+            }
+            h ^= (unsigned)source.playerBody;
+            h *= 1099511628211ull;
+        }
+        g_outcome.trigMapSig = h;
+        std::printf("player effects: %zu effects, %zu one-shot sources, shared slots %zu/%d\n",
+                    L.playerEffects.size(), g_playerRoots.size(), g_touch.size(), kTouchBits);
+    }
     // A level this build cannot represent: say so and return 2 -- the exit code the
     // loader's old std::exit(2) gave the CLI, without ending the host process when
     // this runs inside the game (see Level::unsupported).
@@ -2484,6 +2502,8 @@ inline int cliMainOnce(int argc, char** argv) {
     // set, including the boxes it named that this build has no bit for -- a
     // payload written against a wider window than this one's 32.
     std::vector<std::pair<int, int>> payloadTouch;
+    std::vector<PlayerFire> payloadPlayer;
+    bool sawGravityKey = false, sawSpinKey = false, sawPlayerKey = false;
     std::vector<int> payloadPortal, payloadPortal2;
     std::vector<std::pair<std::string, int>> payloadHist;
     int histVersion = 1;
@@ -2568,22 +2588,39 @@ inline int cliMainOnce(int argc, char** argv) {
                 sawPortal2Key = true;
             } else if (p.first == "position2") {
                 const std::string& value = p.second;
-                const size_t comma = value.find(',');
                 double wx = 0.0, wy = 0.0;
-                const char* end = value.data() + value.size();
-                const char* mid = value.data() + (comma == std::string::npos ? value.size() : comma);
-                const auto rx = std::from_chars(value.data(), mid, wx);
-                const auto ry = comma == std::string::npos ? rx
-                    : std::from_chars(mid + 1, end, wy);
-                if (comma == std::string::npos || rx.ec != std::errc{} || rx.ptr != mid
-                    || ry.ec != std::errc{} || ry.ptr != end
-                    || !std::isfinite(wx) || !std::isfinite(wy)) {
+                if (!parseFinitePair(value, wx, wy)) {
                     std::printf("seed payload rejected: position2 must be finite world X,Y\n");
                     return 2;
                 }
                 double u, v;
                 toFrame(init.frame, wx, wy, u, v);
                 init.xAbs2 = (float)u; init.y2 = (float)v;
+            } else if (p.first == "gravity" || p.first == "spin") {
+                double a, b;
+                if (!parseFinitePair(p.second, a, b)
+                    || !std::isfinite((float)a) || !std::isfinite((float)b)) {
+                    std::printf("seed payload rejected: gravity must be two finite multipliers\n");
+                    return 2;
+                }
+                if (p.first == "gravity") {
+                    init.gravityMod = (float)a; init.gravityMod2 = (float)b;
+                    sawGravityKey = true;
+                } else {
+                    // Legacy levels retain their established spin seeding convention.
+                    if (std::any_of(L.playerEffects.begin(), L.playerEffects.end(),
+                                    [](const PlayerEffect& e) { return e.teleport.id == 2066; })) {
+                        init.spinMod = (float)a * (init.rotBoost ? 2.f : 1.f);
+                        init.spinMod2 = (float)b;
+                    }
+                    sawSpinKey = true;
+                }
+            } else if (p.first == "player") {
+                if (!parsePlayerHistory(p.second, t0, payloadPlayer)) {
+                    std::printf("seed payload rejected: player must be unique uid/body:tick events within the anchor\n");
+                    return 2;
+                }
+                sawPlayerKey = true;
             }
         }
         havePayload = g_ownsTouch;
@@ -2643,6 +2680,10 @@ inline int cliMainOnce(int argc, char** argv) {
             // stderr does not survive into the place results are compared.
             g_seedPartial = missing;
         }
+    }
+    if (t0 > 0 && !g_playerRoots.empty() && (!sawGravityKey || !sawSpinKey || !sawPlayerKey)) {
+        std::printf("seed payload incomplete: player effects require gravity, spin and player history\n");
+        return 2;
     }
     if (t0 > 0 && havePayload) {
         int set = 0, unmapped = 0;
@@ -3362,11 +3403,22 @@ inline int cliMainOnce(int argc, char** argv) {
         if (!found)
             std::printf("dyndbg: uid=%d is NOT in dyn (static grid)\n", g_dynDbg);
     }
+    if (t0 > 0 && sawPlayerKey) {
+        // Apply after all recording heuristics; player-source dates are native observations.
+        for (int b : g_playerRoots) {
+            init.trig &= ~touchBit(b); init.fireB[b] = 0;
+            for (const auto& e : payloadPlayer)
+                if (g_touch[(size_t)b].uid == e.uid && g_touch[(size_t)b].playerBody == e.body) {
+                    init.trig.set(b); init.fireB[b] = (uint16_t)e.tick;
+                }
+        }
+    }
     if (g_needUnseen) {
         // A box is "seen" when at least one of the objects it controls actually
         // moved in a recording. Read off Dynamics, which already joined the map
         // to the timeline.
         for (size_t b = 0; b < g_touch.size(); ++b) {
+            if (g_touch[b].playerOnly) continue;   // player events need no geometry recording
             bool seenIt = false;
             for (size_t i = 0; i < L.dyn.objs.size() && !seenIt; ++i)
                 if ((L.dyn.trigMask[i] & touchBit(b)) && L.dyn.trigRecFire[i] >= 0)
@@ -4636,6 +4688,10 @@ inline int cliMainOnce(int argc, char** argv) {
     // start (t0=0) is as before.
     long long tEnd = (long long)std::ceil(goalX / kDx) + 2;
     if (t0 > 0) tEnd = std::max(tEnd, t0 + 8000);
+    if (!g_playerRoots.empty() && tEnd >= 65535) {
+        std::printf("unsupported: player trigger run exceeds the 16-bit source clock\n");
+        return 2;
+    }
 
     const gdapprox::ShipParams SP = gdapprox::ShipParams::normal();
     const gdapprox::ShipParams SPmini = gdapprox::ShipParams::mini();
@@ -5187,7 +5243,7 @@ inline int cliMainOnce(int argc, char** argv) {
               // `fxblk`: the moving object that kept a MATCHING fixup from
               // firing on the step into this row, -1 if none (fixup.hpp,
               // g_fxBlockedUid). The recorder's third answer.
-              ",fxblk,x2\n";
+              ",fxblk,x2,gravity,gravity2\n";
         // Make --snaplog usable in replay too (it used to exist only on the
         // SOLVE side, so a known plan's stair snaps could never be checked
         // against GD's snaptrace).
@@ -5472,6 +5528,10 @@ inline int cliMainOnce(int argc, char** argv) {
                 std::printf("seed: t=%lld a1cLatch=%d\n", t, (int)s.a1cLatch);
                 std::printf("seed: t=%lld x2=%.9g teleported=%d/%d\n", t,
                             (double)s.xAbs2, (int)s.tpSkip, (int)s.tpSkip2);
+                std::printf("seed: t=%lld gravity=%.9g/%.9g\n", t,
+                            (double)s.gravityMod, (double)s.gravityMod2);
+                std::printf("seed: t=%lld spin=%.9g/%.9g\n", t,
+                            (double)s.spinMod, (double)s.spinMod2);
                 // ...and the same state as a READY-MADE --startrotq argument.
                 //
                 // rotSpent is a mask over g_rotQ, and the bit order is
@@ -5659,6 +5719,7 @@ inline int cliMainOnce(int argc, char** argv) {
                << ',' << (int)s.ceilT2 << ',' << (int)s.mini2
                << ',' << g_fxBlockedUid
                << ',' << wX2
+               << ',' << s.gravityMod << ',' << s.gravityMod2
                << "\n";
             if (rdead) {
                 // --replayon (diagnostic): note the first death and walk on, the
@@ -8266,7 +8327,7 @@ inline int cliMainOnce(int argc, char** argv) {
         // the tick, so a later reader (--rejoinuse) can tell the walk's deaths from its corpse
         // rows -- the walk runs on through a kill, and y/vy alone do not say where it fired.
         tr << "tick,x,y,vy,mode,grounded,dual,y2,vy2,flip2,act,flip,frame"
-              ",rotspent,rotchan,rotrev,dead,key,key_fields,x2\n";
+              ",rotspent,rotchan,rotrev,dead,key,key_fields,x2,gravity,gravity2\n";
         std::ofstream sn;
         if (!snapLogPath.empty()) {
             sn.open(snapLogPath);
@@ -8462,7 +8523,8 @@ inline int cliMainOnce(int argc, char** argv) {
                << ',' << s.rotSpent << ',' << (int)s.rotChan
                << ',' << (unsigned)s.rotRev << ',' << (rdead ? 1 : 0)
                << ',' << (unsigned long long)SearchKeyHash{}(traceKey)
-               << ',' << keyText(traceKey) << ',' << s.xAbs2 << "\n";
+               << ',' << keyText(traceKey) << ',' << s.xAbs2
+               << ',' << s.gravityMod << ',' << s.gravityMod2 << "\n";
             // --rejoinuse: past the join the walk must retrace the old plan's walk -- the same
             // fields on every tick the old trace has, and no kill it did not have. The first tick
             // it does not is the join failing its own premise (repair.hpp refuses the join).

@@ -1,6 +1,7 @@
 #pragma once
 #include "dp/object.hpp"
 #include <atomic>
+#include <charconv>
 
 namespace dp {
 
@@ -872,7 +873,19 @@ inline std::string g_anchorState;
 // says. Declaring ownership keeps "replaces wholesale" true WITHIN a
 // subsystem and leaves the others honestly alone.
 inline const char* const kAnchorKeys[] = {"owns", "touch", "portal", "portal2",
-                                          "hist", "position2"};
+                                          "hist", "position2", "gravity", "spin", "player"};
+
+// Parse a complete finite pair for position and per-body physics anchors.
+inline bool parseFinitePair(const std::string& value, double& a, double& b) {
+    const size_t comma = value.find(',');
+    if (comma == std::string::npos) return false;
+    const char* mid = value.data() + comma;
+    const char* end = value.data() + value.size();
+    const auto ra = std::from_chars(value.data(), mid, a);
+    const auto rb = std::from_chars(mid + 1, end, b);
+    return ra.ec == std::errc{} && rb.ec == std::errc{} && ra.ptr == mid && rb.ptr == end
+        && std::isfinite(a) && std::isfinite(b);
+}
 // `owns=hist` -> the per-body history values that --start does not carry, as
 // ONE versioned value: `hist=<version>|<count>|name:value,name:value`. The
 // version and the count are checked, and a name this build does not know is
@@ -974,6 +987,38 @@ inline std::vector<std::pair<int, int>> parseTouchPayload(const std::string& v) 
                          std::atoi(tok.substr(colon + 1).c_str()));
     }
     return out;
+}
+// Player events require an exact source clock; never silently discard a malformed token.
+inline bool parsePlayerHistory(const std::string& v, long long anchor,
+                               std::vector<PlayerFire>& out) {
+    out.clear();
+    if (v == "-") return true;
+    if (v.empty()) return false;
+    size_t begin = 0;
+    while (begin < v.size()) {
+        const size_t comma = v.find(',', begin);
+        const size_t end = comma == std::string::npos ? v.size() : comma;
+        const size_t colon = v.find(':', begin);
+        if (colon == std::string::npos || colon >= end) return false;
+        int uid = -1, tick = -1, body = 0;
+        const size_t slash = v.find('/', begin);
+        const size_t uidEnd = slash < colon ? slash : colon;
+        const auto a = std::from_chars(v.data() + begin, v.data() + uidEnd, uid);
+        if (uidEnd != colon) {
+            const auto role = std::from_chars(v.data() + slash + 1, v.data() + colon, body);
+            if (role.ec != std::errc{} || role.ptr != v.data() + colon || body < 0 || body > 2)
+                return false;
+        }
+        const auto b = std::from_chars(v.data() + colon + 1, v.data() + end, tick);
+        if (a.ec != std::errc{} || b.ec != std::errc{} || a.ptr != v.data() + uidEnd
+            || b.ptr != v.data() + end || uid < 0 || tick < 0 || tick > anchor || tick >= 65535)
+            return false;
+        for (const auto& old : out) if (old.uid == uid && old.body == body) return false;
+        out.push_back({uid, body, tick});
+        if (comma == std::string::npos) return true;
+        begin = comma + 1;
+    }
+    return false;   // a trailing comma is not an event
 }
 // `uid,uid,uid` -> uids. The portal payload carries no tick: a spent portal is
 // spent, and unlike a touch box nothing downstream asks WHEN.

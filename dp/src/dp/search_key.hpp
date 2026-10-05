@@ -137,6 +137,7 @@ struct SearchKey {
     int32_t bandFloor = 0, bandHeight = 0, slopeUid0 = 0, slopeUidNow = 0;
     int64_t exitVy = 0;
     uint32_t taps = 0;
+    uint32_t gravity = 0, gravity2 = 0, spin = 0, spin2 = 0;
     uint8_t mode = 0, mini = 0, flip = 0, dual = 0, mode2 = 0, mini2 = 0, flip2 = 0;
     uint8_t ringHold = 0, pressSpent = 0, ringHold2 = 0, pressSpent2 = 0;
     uint8_t hover = 0, dash = 0, action = 0, jumpBuf = 0;
@@ -157,6 +158,7 @@ struct SearchKey {
     static auto fields(Self& k) {
         return std::tie(k.x, k.y, k.vy, k.y2, k.vy2, k.x2, k.bandFloor, k.bandHeight,
                         k.slopeUid0, k.slopeUidNow, k.exitVy, k.taps,
+                        k.gravity, k.gravity2, k.spin, k.spin2,
                         k.mode, k.mini, k.flip, k.dual, k.mode2, k.mini2, k.flip2,
                         k.ringHold, k.pressSpent, k.ringHold2, k.pressSpent2,
                         k.hover, k.dash, k.action, k.jumpBuf, k.slopeT, k.slopeT2,
@@ -204,7 +206,7 @@ struct SearchKeyHash {
 // Versioned full keys let rejoinfull reject legacy digest-only traces.
 inline std::string keyText(const SearchKey& k) {
     std::ostringstream out;
-    out << "v2" << std::hex;
+    out << "v3" << std::hex;
     keyWords(k, [&](auto v) { out << ':' << (uint64_t)v; });
     return out.str();
 }
@@ -213,7 +215,7 @@ inline std::string keyText(const SearchKey& k) {
 inline bool parseKeyText(const std::string& text, SearchKey& result) {
     std::istringstream in(text);
     std::string word;
-    if (!std::getline(in, word, ':') || word != "v2") return false;
+    if (!std::getline(in, word, ':') || word != "v3") return false;
     SearchKey k;
     bool ok = true;
     keyWords(k, [&](auto& v) {
@@ -231,6 +233,10 @@ inline bool parseKeyText(const std::string& text, SearchKey& result) {
 // Preserve the existing grid and conditional dimensions; t is the owning layer.
 inline SearchKey keyOf(const State& s, long long t) {
     SearchKey k;
+    std::memcpy(&k.gravity, &s.gravityMod, sizeof(k.gravity));
+    std::memcpy(&k.gravity2, &s.gravityMod2, sizeof(k.gravity2));
+    if (s.mode == 0) std::memcpy(&k.spin, &s.spinMod, sizeof(k.spin));
+    if (s.dual && s.mode2 == 0) std::memcpy(&k.spin2, &s.spinMod2, sizeof(k.spin2));
     const bool flying = s.mode == 1 || s.mode == 3;
     const double ys = flying ? g_shipYq : g_cubeYq;
     const double vs = flying ? g_shipVq : g_cubeVq;
@@ -302,6 +308,15 @@ inline SearchKey keyOf(const State& s, long long t) {
             || t - (long long)s.fireB[b] >= g_touchMoveTicks[b]) continue;
         if (g_keyCensus) ++g_keyCount[b];
         k.movingFire[b] = (uint16_t)((s.fireB[b] >> 2) + 1);
+    }
+    // Pending player writes need exact fire ticks, not geometry's four-tick buckets.
+    for (int b : g_playerRoots) {
+        if (!s.trig.test(b)) continue;
+        for (const auto& a : g_touch[(size_t)b].playerActions)
+            if ((long long)s.fireB[b] + a.delay > t) {
+                k.movingFire[(size_t)b] = (uint16_t)(s.fireB[b] + 1);
+                break;
+            }
     }
     return k;
 }

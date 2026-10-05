@@ -1122,6 +1122,12 @@ struct State {
     // p2 has its own position: teleportPlayer moves only the selected body.
     // Seeded by the named position2 anchor; appended to preserve aggregate callers.
     float xAbs2 = 0.f;
+    // Native m_gravityMod is per body, including the inactive second body.
+    // Named gravity anchors seed both; swapHalves and stepBoth carry them.
+    float gravityMod = 1.f, gravityMod2 = 1.f;
+    // A cube's rotation stake keeps the multiplier from its last runNormalRotation call.
+    // A later gravity trigger changes acceleration immediately, not this existing stake.
+    float spinMod = 1.f, spinMod2 = 1.f;
 };
 
 // THIS ASSERT IS A QUESTION, NOT A BUDGET. If you added a field and the build
@@ -1212,8 +1218,10 @@ struct State {
 // and is not seeded, as seatT is not.
 // [2026-10-04] 520 -> 528: waveTurns is search-only cost; an anchor's common prefix is omitted.
 // [2026-10-05] xAbs2 uses the tail padding (still 528); seeded by position2 and printed by seeddump.
+// [2026-10-05] 528 -> 544: per-body gravity and the cube's retained spin multiplier;
+// seeded by gravity/spin and printed by seeddump. Pending player events reuse fireB.
 constexpr size_t kStateBytes =
-    (528u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
+    (544u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
           + (sizeof(TouchMask) - sizeof(uint32_t))
           + 2u * (sizeof(GravLatch) - sizeof(Bits<128>)) + 7u) / 8u * 8u;
 static_assert(sizeof(State) == kStateBytes,

@@ -1,5 +1,6 @@
 #pragma once
 #include "dp/groups.hpp"
+#include <tuple>
 
 namespace dp {
 
@@ -45,6 +46,17 @@ namespace dp {
 struct TouchTrig {
     double cx, cy, hw, hh;          // the box the player has to enter
     std::vector<TrigCtl> ctl;
+    // Player writes share this source's bit and fireB tick; no second event clock.
+    struct PlayerAction {
+        PlayerEffect effect;
+        int delay = 0;
+        // Positive-delay Spawn ancestors: enqueue offset and native group traversal order.
+        std::vector<std::pair<int, int>> queuePath;
+    };
+    std::vector<PlayerAction> playerActions;
+    bool playerOnly = false, playerAuto = false;
+    int playerChannel = 0, playerOrder = 0;
+    int playerBody = 0;    // 0 = shared/autonomous, 1/2 = independent native touch latches
     // The TRIGGER's own uid. Bit numbering here is a property of this build's
     // window (the first 32 boxes from the anchor), so anything arriving from
     // outside -- an anchor payload written by the mod, say -- has to name the
@@ -223,6 +235,7 @@ inline std::vector<Collectible> g_collect;
 // layer loop and the witness resim all need the same numbering, and there is
 // exactly one level in flight.
 inline std::vector<TouchTrig> g_touch;
+inline std::vector<int> g_playerRoots;
 // The toggle blocks among them (TouchTrig::press), for the dedupe key (search_key.hpp): near one
 // the state has not fired, whether the button is down decides whether the next tick fires it, so
 // a held child and a released one are not the same node there. Frame-0 x range, grown by the
@@ -785,6 +798,188 @@ inline const std::unordered_map<int, std::vector<int>>* groupMembersCached(
         c.bytes = std::move(bytes);
     }
     return &c.byGroup;
+}
+
+// Attach bounded, acyclic Spawn chains without changing geometry's trigger population.
+inline void loadPlayerTriggers(Level& L, const std::string& trigPath,
+                               const std::string& groupPath) {
+    g_playerRoots.clear();
+    if (L.playerEffects.empty() || !L.unsupported.empty()) return;
+    const auto* rows = trigPath.empty() ? nullptr : trigRowsCached(trigPath);
+    const auto* groups = groupPath.empty() ? nullptr : groupMembersCached(groupPath);
+    std::unordered_map<int, const PlayerEffect*> effects;
+    for (const auto& e : L.playerEffects) effects.emplace(e.teleport.uid, &e);
+    std::vector<PlayerTriggerMeta> roots;
+    for (const auto& p : L.playerSources)
+        if (!p.second.spawn || p.second.touch) roots.push_back(p.second);
+    std::sort(roots.begin(), roots.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.order, a.cx, a.uid) < std::tie(b.order, b.cx, b.uid);
+    });
+    std::unordered_set<int> reached;
+    for (const auto& root : roots) {
+        std::vector<TouchTrig::PlayerAction> actions;
+        std::vector<int> path;
+        std::vector<std::pair<int, int>> queuePath;
+        std::unordered_set<int> visited;
+        int visits = 0;
+        std::string bad;
+        // Spawn's handler supplies no triggering-player ID to its descendants (0x4b91f0).
+        auto walk = [&](auto&& self, int uid, int delay,
+                        const std::vector<std::pair<int, int>>& remap) -> void {
+            if (++visits > 4096 || std::find(path.begin(), path.end(), uid) != path.end()) {
+                bad = "cyclic or oversized Spawn graph";
+                return;
+            }
+            visited.insert(uid);
+            if (const auto e = effects.find(uid); e != effects.end()) {
+                const auto& m = L.playerSources.at(uid);
+                if (uid != root.uid && !m.spawn) return;
+                reached.insert(uid);
+                if (!m.silent) actions.push_back({*e->second, delay, queuePath});
+                if (m.onExit) bad = "exit-triggered player effect";
+                return;
+            }
+            if (!rows || !groups) return;
+            const auto it = rows->find(uid);
+            if (it == rows->end() || it->second.id != 1268) return;
+            const TrigRow& sp = it->second;
+            if (uid != root.uid && !sp.spawn) return;
+            const auto mi = L.playerSources.find(uid);
+            if (mi == L.playerSources.end()) {
+                bad = "Spawn metadata missing; refresh objrects";
+                return;
+            }
+            const auto& m = mi->second;
+            if (m.delayRange != 0 || m.ordered || m.onExit)
+                bad = "random, ordered or exit-triggered Spawn";
+            if (m.silent) return;
+            if (!sp.remap.empty() && !remap.empty()) {
+                bad = "nested remap composition (not measured)";
+                return;
+            }
+            // The scheduler accumulates FLOAT dt in a double (0x261da0), not exact 1/240.
+            const double hops = std::ceil(m.delay / (double)(float)(1.0 / 240.0));
+            if (!std::isfinite(m.delay) || m.delay < 0 || hops > 65534 - delay) {
+                bad = "Spawn delay outside the event clock";
+                return;
+            }
+            const int nextDelay = delay + (int)hops;
+            const int target = remapGroup(remap, sp.target);
+            const auto gi = groups->find(target);
+            if (gi == groups->end()) return;
+            path.push_back(uid);
+            if (hops > 0) queuePath.emplace_back(delay, visits);
+            const auto nextRemap = composeRemap(sp.remap, remap);
+            for (int child : gi->second) self(self, child, nextDelay, nextRemap);
+            if (hops > 0) queuePath.pop_back();
+            path.pop_back();
+        };
+        walk(walk, root.uid, 0, {});
+        if (actions.empty()) continue;
+        for (int uid : visited) {
+            const auto m = L.playerSources.find(uid);
+            if (m != L.playerSources.end() && (m->second.disabled || m->second.noTouch))
+                bad = "disabled or NoTouch player source/effect (not modelled)";
+        }
+        if (!bad.empty() || root.multi || root.onExit || root.channel < 0 || root.channel > 15) {
+            L.unsupported = "player trigger source uid " + std::to_string(root.uid) + ": "
+                + (!bad.empty() ? bad : "repeating, exit or invalid-channel source");
+            return;
+        }
+        if (!root.touch && !g_rotTrig.empty()) {
+            L.unsupported = "autonomous player source uid " + std::to_string(root.uid)
+                + " shares the gameplay-rotation queue (not modelled)";
+            return;
+        }
+        if (!g_timeWarps.empty() && std::any_of(actions.begin(), actions.end(),
+                [](const auto& a) { return a.delay > 0; })) {
+            L.unsupported = "delayed player effects with TimeWarp need a game-time event clock";
+            return;
+        }
+        // No snapshot approximation for sources/effects/exits controlled by another trigger.
+        if (rows && groups) for (const auto& p : *rows) {
+            const int id = p.second.id;
+            if (id != 901 && id != 1346 && id != 1347 && id != 1814 && id != 2067
+                && id != 1049 && id != 1616 && !(id >= 3006 && id <= 3008)
+                && !(id >= 3011 && id <= 3013) && id != 3016) continue;
+            const auto gi = groups->find(p.second.target);
+            if (gi == groups->end()) continue;
+            bool affected = false;
+            for (int uid : gi->second) affected |= visited.count(uid) != 0;
+            for (const auto& action : actions) {
+                const auto& meta = L.playerSources.at(action.effect.teleport.uid);
+                affected |= std::find(gi->second.begin(), gi->second.end(), meta.uid) != gi->second.end();
+                if (meta.exitUid >= 0)
+                    affected |= std::find(gi->second.begin(), gi->second.end(), meta.exitUid) != gi->second.end();
+            }
+            if (affected) {
+                L.unsupported = "player trigger source uid " + std::to_string(root.uid)
+                    + " has a group-controlled source, effect or exit (not modelled)";
+                return;
+            }
+        }
+        const int copies = root.touch && !root.singleTouch ? 2 : 1;
+        for (int who = 1; who <= copies; ++who) {
+            const int body = copies == 2 ? who : 0;
+            int bit = -1;
+            for (size_t b = 0; b < g_touch.size(); ++b)
+                if (g_touch[b].uid == root.uid
+                    && (g_touch[b].playerBody == body
+                        || (who == 1 && g_touch[b].playerActions.empty()))) {
+                    bit = (int)b; break;
+                }
+            if (bit < 0) {
+                if (g_touch.size() >= (size_t)kTouchBits) {
+                    L.unsupported = "player triggers exceed the shared " + std::to_string(kTouchBits)
+                        + " source slots";
+                    return;
+                }
+                TouchTrig t{};
+                t.uid = root.uid; t.id = root.id;
+                t.cx = root.cx; t.cy = root.cy; t.hw = root.hw; t.hh = root.hh;
+                t.playerOnly = true;
+                bit = (int)g_touch.size();
+                g_touch.push_back(std::move(t));
+            }
+            auto& t = g_touch[(size_t)bit];
+            t.playerAuto = !root.touch;
+            t.playerChannel = root.channel; t.playerOrder = root.order;
+            t.playerBody = body;
+            t.playerActions = actions;
+            g_playerRoots.push_back(bit);
+        }
+    }
+    for (const auto& e : L.playerEffects) {
+        const auto& m = L.playerSources.at(e.teleport.uid);
+        if (m.spawn && !m.silent && !reached.count(m.uid)) {
+            L.unsupported = "player trigger uid " + std::to_string(m.uid)
+                + " has no modelled Spawn source (export triggers and objgroups)";
+            return;
+        }
+    }
+    // A shared touch latch does not retain whether P1 or P2 enqueued its events.
+    if (g_playerRoots.size() > 1) for (int b : g_playerRoots) {
+        const auto& t = g_touch[(size_t)b];
+        if (!t.playerAuto && !t.playerBody && std::any_of(t.playerActions.begin(),
+                t.playerActions.end(), [](const auto& a) { return a.delay > 0; })) {
+            L.unsupported = "shared-touch delayed player source has ambiguous queue ordering";
+            return;
+        }
+    }
+    // A malformed graph must not disappear merely because it produced no leaf actions.
+    for (const auto& root : roots)
+        if (root.id != 1268 && !root.silent && !reached.count(root.uid)) {
+            L.unsupported = "player trigger uid " + std::to_string(root.uid) + " is unreachable";
+            return;
+        }
+    buildTouchMoveTicks();
+    std::stable_sort(g_playerRoots.begin(), g_playerRoots.end(), [](int a, int b) {
+        const auto& x = g_touch[(size_t)a]; const auto& y = g_touch[(size_t)b];
+        if (!x.playerAuto && !y.playerAuto)
+            return std::tie(x.uid, x.playerBody) < std::tie(y.uid, y.playerBody);
+        if (x.playerAuto != y.playerAuto) return x.playerAuto;
+        return std::tie(x.playerOrder, x.cx, x.uid) < std::tie(y.playerOrder, y.cx, y.uid);
+    });
 }
 
 // g_offMoves: is the trigger T switched off when the player crosses its x? GD does not fire a

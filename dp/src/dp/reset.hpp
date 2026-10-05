@@ -381,6 +381,7 @@ inline void resetInvocationState() {
 
     // triggers.hpp
     g_touch.clear();
+    g_playerRoots.clear();
     g_touchFollowObjs = nullptr;   // pointed into the last call's Level
     // ...and the per-box move length derived from it. Built beside g_touch in
     // cliMain, so it is cleared beside g_touch here: left behind, the next

@@ -67,7 +67,7 @@ inline std::unordered_map<int, ObbBox> g_obb;
 // How many comma fields of an objrects row the loader reads. The dump has 49
 // columns (rev is the last); the headroom is deliberate, and a column read by
 // NAME past this bound is refused rather than read out of range.
-inline constexpr int kObjFields = 64;
+inline constexpr int kObjFields = 80;
 
 // A row's comma fields into f[0..n), exactly as a loop of
 // `std::getline(std::stringstream(line), f[i], ',')` fills them -- an empty field between two
@@ -312,9 +312,14 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
     // old behaviour instead of silently reading a neighbour.
     int colFree = -1, colTouch = -1, colSpawn = -1, colChan = -1;
     int colAxis = -1, colExStat = -1, colRev = -1, colNoCol = -1;
+    int colDisabled = -1, colNoTouch = -1;
     int colTpEntryX = -1, colTpEntryY = -1, colTpSave = -1, colTpExits = -1;
     int colTpForce = -1, colTpForceV = -1, colTpForceAdd = -1, colTpAngle = -1;
     int colTpRedirect = -1, colTpMod = -1, colTpMin = -1, colTpMax = -1, colTpDash = -1;
+    const std::array<const char*, 13> playerColumns = {"pgrav", "ptarget1", "ptarget2",
+        "ptrigger", "multi", "trigexit", "ord", "silent", "psdelay", "psrange", "psordered", "pexituid", "psingle"};
+    std::array<int, 13> playerCol;
+    playerCol.fill(-1);
     {
         std::stringstream hs(line);
         std::string name;
@@ -330,6 +335,8 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             else if (name == "exstat") colExStat = i;
             else if (name == "rev") colRev = i;
             else if (name == "nocol") colNoCol = i;
+            else if (name == "dis") colDisabled = i;
+            else if (name == "notouch") colNoTouch = i;
             else if (name == "tpentryx") colTpEntryX = i;
             else if (name == "tpentryy") colTpEntryY = i;
             else if (name == "tpsave") colTpSave = i;
@@ -343,6 +350,8 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             else if (name == "tprmin") colTpMin = i;
             else if (name == "tprmax") colTpMax = i;
             else if (name == "tprdash") colTpDash = i;
+            for (size_t p = 0; p < playerColumns.size(); ++p)
+                if (name == playerColumns[p]) playerCol[p] = i;
         }
     }
     // Counted per load, not per invocation: loadLevelFrom runs again for each
@@ -1334,7 +1343,7 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
         // stacked at one x, and lv16's really are scaled to 25x75.
         const double w0 = f[15].empty() ? 0.0 : std::atof(f[15].c_str());
         const double h0 = f[16].empty() ? 0.0 : std::atof(f[16].c_str());
-        if (type == 28) {
+        if (type == 28 || o.id == 3022) {
             o.tpY = f[17].empty() ? 0.0 : std::atof(f[17].c_str());
             o.tpGrav = f[18].empty() ? 0 : (uint8_t)std::atoi(f[18].c_str());
             o.tpEx = f[34].empty() ? 0.0 : std::atof(f[34].c_str());
@@ -1382,6 +1391,50 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             if (o.tpGrav)
                 loadPrintf("teleport: uid %d at (%.0f,%.0f) sets gravity mode %d\n",
                            o.uid, o.cx, o.cy, (int)o.tpGrav);
+        }
+        if (o.id == 3022 || o.id == 2066 || o.id == 1268) {
+            auto pv = [&](int p, double fallback = 0.0) {
+                const int col = playerCol[(size_t)p];
+                return col >= 0 && col < kObjFields && !f[col].empty()
+                    ? std::atof(f[col].c_str()) : fallback;
+            };
+            PlayerTriggerMeta m;
+            m.uid = o.uid; m.id = o.id;
+            m.cx = o.cx; m.cy = o.cy; m.hw = o.hw; m.hh = o.hh;
+            m.touch = colTouch >= 0 && std::atoi(f[colTouch].c_str()) != 0;
+            m.spawn = colSpawn >= 0 && std::atoi(f[colSpawn].c_str()) != 0;
+            m.channel = colChan >= 0 ? std::atoi(f[colChan].c_str()) : 0;
+            m.multi = pv(4) != 0; m.onExit = pv(5) != 0;
+            m.order = (int)pv(6); m.silent = pv(7) != 0;
+            m.delay = pv(8); m.delayRange = pv(9); m.ordered = pv(10) != 0;
+            m.exitUid = (int)pv(11, -1);
+            m.singleTouch = pv(12) != 0;
+            m.disabled = colDisabled >= 0 && colDisabled < kObjFields
+                && std::atoi(f[colDisabled].c_str()) != 0;
+            m.noTouch = colNoTouch >= 0 && colNoTouch < kObjFields
+                && std::atoi(f[colNoTouch].c_str()) != 0;
+            L.playerSources.emplace(o.uid, m);
+            if (o.id != 1268) {
+                if (playerCol[0] < 0 || playerCol[12] < 0 || colTouch < 0 || colSpawn < 0)
+                    L.unsupported = "player trigger uid " + std::to_string(o.uid)
+                        + " needs a refreshed objrects export";
+                PlayerEffect e;
+                e.teleport = o;
+                e.gravity = (float)pv(0, 1.0);
+                e.player1 = (uint8_t)(pv(1) != 0);
+                e.player2 = (uint8_t)(pv(2) != 0);
+                e.triggeringPlayer = (uint8_t)(pv(3) != 0);
+                if (o.id == 2066 && pv(3) < 0)
+                    L.unsupported = "gravity trigger role layout has not been measured on this platform";
+                if (!std::isfinite(e.gravity))
+                    L.unsupported = "gravity trigger uid " + std::to_string(o.uid)
+                        + " has a non-finite multiplier";
+                if (o.id == 3022 && o.tpExitCount > 0 && m.exitUid < 0)
+                    L.unsupported = "teleport trigger uid " + std::to_string(o.uid)
+                        + " needs a refreshed exit UID export";
+                L.playerEffects.push_back(e);
+                continue;   // A trigger is not a collision portal, even with type 28.
+            }
         }
         if (o.radius == 0.0 && !o.slope && w0 > 1.0 && h0 > 1.0) {
             const double m = std::fabs(std::fmod(o.rot, 90.0));

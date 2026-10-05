@@ -1065,6 +1065,8 @@ inline void splice(const Choice& c) {
     for (const auto& e : s.seeds.rings) if (e.second <= T) ringseed::g_fired.push_back(e);
     touchseed::g_first.clear();
     for (const auto& kv : s.seeds.touch) if (kv.second <= T) touchseed::g_first.insert(kv);
+    playerseed::g_first.clear();
+    for (const auto& kv : s.seeds.player) if (kv.second <= T) playerseed::g_first.insert(kv);
     portalseed::g_first.clear();
     for (const auto& kv : s.seeds.portal) if (kv.second <= T) portalseed::g_first.insert(kv);
     portalseed::g_first2.clear();
@@ -1318,7 +1320,7 @@ inline std::string probeCapture(long long end, float endX, const char* how) {
     p.how = how;
     p.rows = anchors::g_live;
     p.seeds = anchors::Seeds{padseed::g_first, ringseed::g_fired, touchseed::g_first, portalseed::g_first,
-                             portalseed::g_first2};
+                             portalseed::g_first2, playerseed::g_first};
     p.coinGd = solver::g_coinGdTick;
     p.coinPickup = solver::g_coinPickupTick;
     p.routeOn = route::g_onTick;

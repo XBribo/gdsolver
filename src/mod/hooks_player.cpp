@@ -1,8 +1,29 @@
 // EnhancedGameObject (pad trace) and PlayerObject hooks: state dump, physics tracing.
 #include "mod/playlayer_helpers.hpp"
 #include <Geode/modify/EndTriggerGameObject.hpp>
+#include <Geode/modify/EffectGameObject.hpp>
+#include <Geode/modify/SpawnTriggerGameObject.hpp>
 
 using namespace p1;
+
+class $modify(PlayerEffectTrace, EffectGameObject) {
+    // Record actual invocation, not overlap; an autonomous source has no touch latch.
+    void triggerObject(GJBaseGameLayer* layer, int playerID, gd::vector<int> const* remapKeys) {
+        if (m_objectID == 2066 || m_objectID == 3022)
+            playerseed::g_first.emplace(std::make_pair(m_uniqueID,
+                m_isTouchTriggered && !m_isSinglePTouch ? playerID : 0), (int)g_tick);
+        EffectGameObject::triggerObject(layer, playerID, remapKeys);
+    }
+};
+
+class $modify(PlayerSpawnTrace, SpawnTriggerGameObject) {
+    // Spawn overrides the base method, so it needs its own source clock observer.
+    void triggerObject(GJBaseGameLayer* layer, int playerID, gd::vector<int> const* remapKeys) {
+        playerseed::g_first.emplace(std::make_pair(m_uniqueID,
+            m_isTouchTriggered && !m_isSinglePTouch ? playerID : 0), (int)g_tick);
+        SpawnTriggerGameObject::triggerObject(layer, playerID, remapKeys);
+    }
+};
 
 class $modify(PadTraceGameObject, EnhancedGameObject) {
     void activatedByPlayer(PlayerObject* p) {

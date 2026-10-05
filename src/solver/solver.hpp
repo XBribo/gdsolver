@@ -368,7 +368,9 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
     //   already does.
           "editvel,vmodx,vmody,ovrvel,force,free,touch,spawn,chan,axis,exstat,rev,"
           "nocol,tpentryx,tpentryy,tpsave,tpexits,"
-          "tpf,tpfv,tpfadd,tpangle,tpr,tprmod,tprmin,tprmax,tprdash\n";
+          "tpf,tpfv,tpfadd,tpangle,tpr,tprmod,tprmin,tprmax,tprdash,"
+          "pgrav,ptarget1,ptarget2,ptrigger,multi,trigexit,ord,silent,"
+          "psdelay,psrange,psordered,pexituid,psingle\n";
     // PlayLayer's anti-cheat spike (id 8, created last, at 0,105) sits in m_objects but never
     // collides: GD only hands it to destroyPlayer as a check (hooks_playlayer.cpp). Written out,
     // the model read it as a hazard on the spawn point and a ship or ball start died on tick 2
@@ -388,12 +390,12 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
             sup = obj->m_slopeUphill ? 1 : 0;
         }
         double tpy = 0.0, tpex = 0.0, tpey = 0.0;
-        int tpg = 0, tpix = 0, tpiy = 0;
+        int tpg = 0, tpix = 0, tpiy = 0, pexituid = -1;
         double tpentryx = 0.0, tpentryy = 0.0;
         int tpsave = 0, tpexits = 0;
         int tpf = 0, tpfadd = 0, tpr = 0, tprdash = 0;
         float tpfv = 0.f, tpangle = 0.f, tprmod = 1.f, tprmin = 0.f, tprmax = 0.f;
-        if ((int)obj->m_objectType == 28) {
+        if ((int)obj->m_objectType == 28 || obj->m_objectID == 3022) {
             auto* tp = static_cast<TeleportPortalObject*>(obj);
             const auto entry = obj->getRealPosition();
             tpentryx = entry.x; tpentryy = entry.y;
@@ -437,6 +439,7 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
                               "members (random exit - NOT deterministic)",
                               obj->m_uniqueID, tp->m_targetGroupID, n);
             }
+            if (exitObject) pexituid = exitObject->m_uniqueID;
             // Native vtable+0x4e8 is isFlipX (0x1981a0), not isFacingDown.
             GameObject* bearing = exitObject ? exitObject : obj;
             const int eid = bearing->m_objectID;
@@ -523,6 +526,9 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
         // property table: an EffectGameObject parses them at load and the
         // members are what the game itself then reads.
         int touch = 0, spawn = 0, chan = 0, axis = 0, exstat = 0, freem = 0, rev = 0;
+        float pgrav = 1.f, psdelay = 0.f, psrange = 0.f;
+        int ptarget1 = 0, ptarget2 = 0, ptrigger = 0, multi = 0, trigexit = 0;
+        int ord = 0, silent = 0, psordered = 0, psingle = 0;
         if (auto* e = geode::cast::typeinfo_cast<EffectGameObject*>(obj)) {
             rev = e->m_isReverse ? 1 : 0;
             touch = e->m_isTouchTriggered ? 1 : 0;
@@ -535,6 +541,28 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
             // bindings' own source carries `// property 111` directly above it,
             // which is a stronger identification than matching an offset.
             freem = e->m_cameraIsFreeMode ? 1 : 0;
+            pgrav = e->m_gravityValue;
+            // EffectGameObject::triggerObject, 2.2081 0x4a5f30 case 2066:
+            // +0x6a4/+0x6a5 exclude the OTHER player; +0x6a6 selects the caller.
+            // Two bytes are typed; the caller flag is unnamed Windows padding.
+            ptarget1 = e->m_rotateFollowP1 ? 1 : 0;
+            ptarget2 = e->m_rotateFollowP2 ? 1 : 0;
+            ptrigger = -1;   // an unmeasured layout must not export a guessed role
+#if defined(GEODE_IS_WINDOWS)
+            const auto* bytes = reinterpret_cast<const unsigned char*>(e);
+            if (reinterpret_cast<const unsigned char*>(&e->m_rotateFollowP1) - bytes == 0x6a4)
+                ptrigger = bytes[0x6a6] != 0;
+#endif
+            multi = e->m_isMultiTriggered ? 1 : 0;
+            trigexit = e->m_triggerOnExit ? 1 : 0;
+            ord = e->m_ordValue;
+            silent = e->m_isSilent ? 1 : 0;
+            psordered = e->m_spawnOrdered ? 1 : 0;
+            psingle = e->m_isSinglePTouch ? 1 : 0;
+        }
+        if (auto* sp = geode::cast::typeinfo_cast<SpawnTriggerGameObject*>(obj)) {
+            psdelay = sp->m_spawnDelay;
+            psrange = sp->m_delayRange;
         }
         if (auto* c = geode::cast::typeinfo_cast<CameraTriggerGameObject*>(obj))
             exstat = c->m_exitStatic ? 1 : 0;
@@ -561,8 +589,13 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
            << "," << (int)(unsigned char)reinterpret_cast<const char*>(obj)[gdoff::kObjPassable]
            << "," << tpentryx << "," << tpentryy << "," << tpsave << "," << tpexits
            << "," << tpf << "," << tpfv << "," << tpfadd << "," << tpangle
-           << "," << tpr << "," << tprmod << "," << tprmin << "," << tprmax << "," << tprdash
+           << "," << tpr << "," << tprmod << "," << tprmin << "," << tprmax << "," << tprdash;
+        const auto oldPrecision = rf.precision(9);   // round-trip player float fields exactly
+        rf << "," << pgrav << "," << ptarget1 << "," << ptarget2 << "," << ptrigger
+           << "," << multi << "," << trigexit << "," << ord << "," << silent
+           << "," << psdelay << "," << psrange << "," << psordered << "," << pexituid << "," << psingle
            << "\n";
+        rf.precision(oldPrecision);
     }
 }
 

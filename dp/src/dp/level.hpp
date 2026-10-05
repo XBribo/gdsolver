@@ -67,6 +67,8 @@ struct Level {
     std::string unsupported;
     // Spatial teleports can separate the frontier into distant travel windows.
     bool spatialTeleport = false;
+    std::vector<PlayerEffect> playerEffects;
+    std::unordered_map<int, PlayerTriggerMeta> playerSources;
     // Shared gravity-portal bits, where each changes hands (prelude.hpp, g_gpHandoff). The loader
     // fills this; cliMain copies it into the global the step reads.
     std::vector<GpHandoff> gpHandoff;

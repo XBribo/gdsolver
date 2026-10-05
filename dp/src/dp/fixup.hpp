@@ -1,5 +1,6 @@
 #pragma once
 #include "dp/step.hpp"
+#include <optional>
 
 namespace dp {
 
@@ -45,6 +46,7 @@ struct Fixup {
     uint8_t dual = 0, gAfter2 = 255;
     float y2 = 0, vy2 = 0, dy2 = 0, dvy2 = 0;
     float x2 = 0;   // named tail; legacy records inherit the primary X
+    float gravityMod = 1.f, gravityMod2 = 1.f;
     // File position at load. The file is append-only within a run, so a
     // larger ord is a NEWER measurement -- the conflict filter (cli.hpp)
     // keeps the newest of two records that share a key but disagree.
@@ -115,6 +117,7 @@ inline bool fixupMatches(const Fixup& f, const State& s, int input) {
     // the first body is doing. Records written before duals were recordable carry dual=0 and so
     // keep matching exactly the states they always did.
     if (f.dual != s.dual) return false;
+    if (f.gravityMod != s.gravityMod || f.gravityMod2 != s.gravityMod2) return false;
     if (std::fabs((double)s.xAbs - (double)f.x) > 1.2) return false;
     if (std::fabs((double)s.y - (double)f.y) > 4.0) return false;
     if (std::fabs((double)s.vy - (double)f.vy) > 1.0) return false;
@@ -337,7 +340,154 @@ struct BodyWindow {
     }
 };
 
-inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
+// Apply triggerObject's player writes; a teleport trigger always selects native P1.
+inline void applyPlayerEffect(State& c, const PlayerEffect& e, int triggeringPlayer) {
+    Obj o = e.teleport;
+    if (o.id == 2066) {
+        if (e.triggeringPlayer) {
+            if (triggeringPlayer == 1) c.gravityMod = e.gravity;
+            else if (triggeringPlayer == 2) c.gravityMod2 = e.gravity;
+        } else {
+            if (!e.player2) c.gravityMod = e.gravity;
+            if (!e.player1) c.gravityMod2 = e.gravity;
+        }
+        return;
+    }
+    if (c.frame) turnObj(o, c.frame);
+    c.tpSkip = 1;
+    if (o.tpExitCount != 0) {
+        double x, y;
+        teleportTarget(o, c.frame, c.xAbs, c.y, x, y);
+        c.xAbs = (float)x; c.y = (float)y;
+        c.grounded = 0; c.onSlope = 0; c.slopeM = 0;
+        c.snapObj = nullptr; c.snapDist = 0;
+    }
+    const uint8_t oldUp = c.frame == 3 ? (uint8_t)!c.flip : c.flip;
+    const int up = o.tpGrav == 1 ? 0 : o.tpGrav == 2 ? 1 : o.tpGrav == 3 ? !oldUp : -1;
+    if (up >= 0 && up != oldUp) {
+        c.flip = c.frame == 3 ? (uint8_t)!up : (uint8_t)up;
+        c.vy *= 0.5f; c.flipT = 0; c.grounded = 0;
+        if (c.mode == 2) {
+            c.rotStep = (float)(ballRotRate(c.mini != 0, true, c.dx) * c.gravityMod);
+            c.rotNeg = (uint8_t)!((c.flip != 0) ^ (c.rev != 0));
+        }
+        if (c.dual && sameModeFlags(c.mode, c.mode2)) {
+            const uint8_t partner = (uint8_t)!c.flip;
+            if (c.flip2 != partner) {
+                c.flip2 = partner; c.vy2 *= 0.5f;
+                c.flipT2 = 0; c.grounded2 = 0;
+                if (c.mode2 == 2) {
+                    c.rotStep2 = (float)(ballRotRate(c.mini2 != 0, true, c.dx) * c.gravityMod2);
+                    c.rotNeg2 = (uint8_t)!((c.flip2 != 0) ^ (c.rev != 0));
+                }
+            }
+        }
+    }
+    teleportForce(o, c.frame, c.vy, c.boost);
+}
+
+enum class PlayerPhase : uint8_t { Pending, TouchP1, TouchP2, Automatic };
+
+// Dispatch the native scheduler before either body moves, without allocating for idle ticks.
+inline void applyPendingPlayerEffects(State& c, long long tick) {
+    if (g_playerRoots.empty()) return;
+    struct Due { int bit; size_t action; };
+    std::vector<Due> due;
+    for (int b : g_playerRoots) if (c.trig.test(b)) {
+        const auto& actions = g_touch[(size_t)b].playerActions;
+        for (size_t a = 0; a < actions.size(); ++a)
+            if (actions[a].delay > 0 && (long long)c.fireB[b] + actions[a].delay == tick)
+                due.push_back({b, a});
+    }
+    // Scheduler order is enqueue time, then the order of the event that enqueued it.
+    auto compareQueue = [&](auto&& self, const Due& a, int ai,
+                            const Due& b, int bi) -> int {
+        const auto& x = g_touch[(size_t)a.bit]; const auto& y = g_touch[(size_t)b.bit];
+        const auto& xp = x.playerActions[a.action].queuePath;
+        const auto& yp = y.playerActions[b.action].queuePath;
+        const auto xe = ai < 0 ? std::pair<int, int>{0, 0} : xp[(size_t)ai];
+        const auto ye = bi < 0 ? std::pair<int, int>{0, 0} : yp[(size_t)bi];
+        const int xt = c.fireB[a.bit] + xe.first, yt = c.fireB[b.bit] + ye.first;
+        if (xt != yt) return xt < yt ? -1 : 1;
+        const auto xf = ai > 0 ? PlayerPhase::Pending : x.playerAuto ? PlayerPhase::Automatic
+            : x.playerBody == 2 ? PlayerPhase::TouchP2 : PlayerPhase::TouchP1;
+        const auto yf = bi > 0 ? PlayerPhase::Pending : y.playerAuto ? PlayerPhase::Automatic
+            : y.playerBody == 2 ? PlayerPhase::TouchP2 : PlayerPhase::TouchP1;
+        if (xf != yf) return xf < yf ? -1 : 1;
+        if (ai > 0 && bi > 0) {
+            const int parent = self(self, a, ai - 1, b, bi - 1);
+            if (parent) return parent;
+        } else if (a.bit != b.bit) {
+            if (xf == PlayerPhase::Automatic) {
+                const auto xk = std::tie(x.playerOrder, x.cx, x.uid);
+                const auto yk = std::tie(y.playerOrder, y.cx, y.uid);
+                if (xk != yk) return xk < yk ? -1 : 1;
+            } else if (x.uid != y.uid) return x.uid < y.uid ? -1 : 1;
+        }
+        return xe.second == ye.second ? 0 : xe.second < ye.second ? -1 : 1;
+    };
+    std::stable_sort(due.begin(), due.end(), [&](const Due& a, const Due& b) {
+        const int order = compareQueue(compareQueue, a,
+            (int)g_touch[(size_t)a.bit].playerActions[a.action].queuePath.size() - 1,
+            b, (int)g_touch[(size_t)b.bit].playerActions[b.action].queuePath.size() - 1);
+        return order ? order < 0 : a.action < b.action;
+    });
+    for (const auto& d : due)
+        applyPlayerEffect(c, g_touch[(size_t)d.bit].playerActions[d.action].effect, 0);
+}
+
+// Latch one-shot collision/crossing sources and apply only their immediate writes.
+inline void playerTriggerTick(State& c, const StepCtx& K, PlayerPhase phase, double touchY = 0.0) {
+    if (g_playerRoots.empty()) return;
+    const bool automatic = phase == PlayerPhase::Automatic;
+    const bool p2 = phase == PlayerPhase::TouchP2;
+    const int body = p2 ? 2 : 1;
+    const int frame = c.frame;
+    double wx, wy;
+    fromFrame(frame, p2 ? c.xAbs2 : c.xAbs, automatic ? c.y : touchY, wx, wy);
+    const double half = playerHalf(p2 ? c.mode2 : c.mode, (p2 ? c.mini2 : c.mini) != 0);
+    // Snapshot the entry position: teleportPlayer does not collect a new collision bucket.
+    const double bucketRef = (frame & 1) ? wy : wx;
+    for (int b : g_playerRoots) {
+        const auto& t = g_touch[(size_t)b];
+        if (c.trig.test(b) || t.playerAuto != automatic) continue;
+        bool fire = false;
+        if (automatic) {
+            if (t.playerChannel != c.rotChan) continue;
+            const bool reverse = ((c.rotRev >> t.playerChannel) & 1u) != 0;
+            const double p = (frame & 1) ? t.cy : t.cx;
+            const double ref = (frame & 1) ? wy : wx;
+            fire = reverse ? ref <= p : ref >= p;
+        } else {
+            if (t.playerBody && t.playerBody != body) continue;
+            const double sourceRef = (frame & 1) ? t.cy : t.cx;
+            const double sourceHalf = (frame & 1) ? t.hh : t.hw;
+            fire = std::fabs(bucketRef - sourceRef) <= sourceHalf + half + 60.0
+                && std::fabs(wx - t.cx) <= t.hw + half
+                && std::fabs(wy - t.cy) <= t.hh + half;
+        }
+        if (!fire) continue;
+        c.trig.set(b); c.fireB[b] = (uint16_t)K.t; c.trigT = (int32_t)K.t;
+        for (const auto& action : t.playerActions) {
+            if (action.delay) continue;
+            const auto before = std::make_pair(p2 ? c.xAbs2 : c.xAbs, p2 ? c.y2 : c.y);
+            applyPlayerEffect(c, action.effect, t.id == 2066 && !automatic ? body : 0);
+            if (!automatic && before != std::make_pair(p2 ? c.xAbs2 : c.xAbs, p2 ? c.y2 : c.y))
+                fromFrame(frame, p2 ? c.xAbs2 : c.xAbs, p2 ? c.y2 : c.y, wx, wy);
+        }
+    }
+}
+
+inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bool& dead) {
+    std::optional<State> queued;
+    if (!g_playerRoots.empty()) {
+        queued.emplace(entering);
+        applyPendingPlayerEffects(*queued, baseK.t);
+    }
+    const State& s = queued ? *queued : entering;
+    BodyWindow p1Window;
+    const StepCtx K = s.xAbs != entering.xAbs && baseK.slices[0]
+        ? p1Window.at(s, baseK) : baseK;
     bool d1 = false;
     g_halfNow = 0;
     g_fxBlockedUid = -1;
@@ -352,7 +502,11 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     const double preBtnY = g_preBtnY;
     const bool p1Tapped = g_ballTapped;   // --repelland, likewise
     const uint8_t p1HitG = g_hitGRepel;   // --repela0c, likewise
+    const uint8_t beforeEffectFlip2 = c.flip2;
+    const float beforeEffectVy2 = c.vy2;
+    playerTriggerTick(c, K, PlayerPhase::TouchP1, touchPreY(s, c, preBtnSet, preBtnY));
     if (!s.dual) {
+        playerTriggerTick(c, K, PlayerPhase::Automatic);
         dead = d1;
         markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0);
         // No fixup of either kind applies near moving geometry (nearDynObject
@@ -375,6 +529,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // Native 2.2081 update (0x23850e..0x238561) checks the entry dual flag
     // AND the live flag after p1's collision pass before advancing p2.
     if (!c.dual) {
+        playerTriggerTick(c, K, PlayerPhase::Automatic);
         dead = d1;
         markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0);
         if (!g_fixups.empty()) applyFixup(s, input, c, dead);
@@ -382,6 +537,16 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     }
     State sb = s;
     swapHalves(sb);
+    if (!g_playerRoots.empty()) {
+        sb.gravityMod = c.gravityMod2;
+        sb.gravityMod2 = c.gravityMod;
+        sb.trig = c.trig;
+        std::copy(std::begin(c.fireB), std::end(c.fireB), std::begin(sb.fireB));
+        if (c.flip2 != beforeEffectFlip2 || c.vy2 != beforeEffectVy2) {
+            sb.flip = c.flip2; sb.vy = c.vy2; sb.grounded = c.grounded2;
+            sb.rotStep = c.rotStep2; sb.rotNeg = c.rotNeg2;
+        }
+    }
     // GD PROCESSES p1 FIRST, so the second body sees the first one's FINISHED tick -- and the
     // one thing that reads across the pair is the dual ball's flip, whose gate is "has the
     // partner landed" (stepOne's `s.grounded2`). Both halves are stepped from the same start
@@ -437,6 +602,7 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     const StepCtx p2K = (s.xAbs2 != s.xAbs && K.slices[0])
         ? p2Window.at(sb, K) : K;
     State cb = stepOne(sb, input, p2K, d2, &p2FlippedGravity);
+    const double p2TouchY = touchPreY(sb, cb, g_preBtnSet, g_preBtnY);
     g_dualOtherMode = -1;
     const bool p2WroteBand = g_bandPortalWrote;
     g_halfNow = 0;
@@ -452,6 +618,8 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // layer flag write survives the rest of this already-started collision pass.
     c.dual = cb.dual;
     c.xAbs2 = cb.xAbs2;
+    c.gravityMod2 = cb.gravityMod2;
+    c.spinMod2 = cb.spinMod2;
     c.tpSkip2 = cb.tpSkip2;
     c.y2 = cb.y2;            c.vy2 = cb.vy2;
     c.mode2 = cb.mode2;      c.mini2 = cb.mini2;
@@ -575,6 +743,8 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
             c.vy2 *= 0.5f;
         }
     }
+    playerTriggerTick(c, K, PlayerPhase::TouchP2, p2TouchY);
+    playerTriggerTick(c, K, PlayerPhase::Automatic);
     // --repelland: the dual balls' repel, decided where GD decides it. checkRepellPlayer
     // (0x2398d0) runs from GJBaseGameLayer::update (0x238845) after both players' collisions and
     // rotation, and the taps come from the next step's processQueuedButtons -- in a model tick,

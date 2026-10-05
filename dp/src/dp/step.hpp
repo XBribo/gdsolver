@@ -2742,8 +2742,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // ...and the BALL's 0.129 was confirmed **flat across all speeds and
         // sizes** (mode 0.129 in all 8 combinations of 0.7/0.9/1.1/1.3 x 1.0/0.6,
         // n=21,900). The "OPEN: measured at speed 0.9 only" above is resolved.
-        const double gAcc =
-            g_rawValues ? rawGravStep(isBall || isSpider, isRobot, (double)useDx)   // speed.hpp
+        const double gAcc = s.gravityMod != 1.f
+            ? playerGravityStep(s.mode, useDx, c.mini != 0, s.gravityMod, 1.0)
+            : g_rawValues ? rawGravStep(isBall || isSpider, isRobot, (double)useDx)   // speed.hpp
             : isBall     ? kBallG
             : isRobot  ? ((useDx > 1.78) ? -0.195 : -0.194)
             : isSpider ? kBallG
@@ -3346,7 +3347,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // and everything after it (2,818 divergent ticks) hangs off it.
         pinnedOnBlock =
             groundedNow && (s.flip || (double)s.y > (kGroundY + pHalf) + 0.5);
-        prePinY = (float)((double)s.y + kYScale * qVy(gAcc) * gsign);
+        prePinY = (float)((double)s.y + kYScale * qVy(s.gravityMod == 1.f ? gAcc
+            : playerGravityStep(s.mode, useDx, c.mini != 0, s.gravityMod, tScale)) * gsign);
         double vpNew = vp;
         bool ballFlipped = false;
         // (`gravPortalThisTick` is decided ABOVE the support scan -- the whole
@@ -3614,7 +3616,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // the grounded law, and with no rotation-gameplay term. The
                 // inversion exists to cancel the flip that brought us here, so
                 // the spin looks continuous through a tap.
-                c.rotStep = (float)ballRotRate(c.mini != 0, true, useDx);
+                c.rotStep = (float)(ballRotRate(c.mini != 0, true, useDx) * c.gravityMod);
                 c.rotNeg = (uint8_t)!((c.flip != 0) ^ (c.rev != 0));
                 // the ball's tap scales with size like every other impulse.
                 // Measured on lv11 t=8398 (mini ball): GD leaves with 2.6832
@@ -3877,7 +3879,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 yFree = c.y;
             } else {
                 c.dashing = 0;
-                double acc = gAcc;
+                const double acc = s.gravityMod == 1.f ? gAcc * tScale
+                    : playerGravityStep(s.mode, useDx, c.mini != 0, s.gravityMod, tScale);
                 // FORCE FIELD: world-frame push, converted to the player frame
                 // by gsign like every other world force. Position is the
                 // START-of-tick one (xPrev, s.y): the effect shows up one tick
@@ -3913,11 +3916,11 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // vy went 0 -> 0.043 -> 0.086 -> 0.129 under a 0.0432 step; the
                 // exact accumulation would have given 0.130 on the third).
                 // r102: the tick after hitting a black orb on a fast climb has no terminal
-                VPSET(vpNew) = s.pNoTerm ? qVy(vp + acc * tScale)
-                                  : qVy(std::max(vp + acc * tScale, gTerm));
+                VPSET(vpNew) = s.pNoTerm ? qVy(vp + acc)
+                                  : qVy(std::max(vp + acc, gTerm));
                 // --a1clatch: the fall test reads vy after the gravity step and before the force
                 // (updateJump's +0xa1c path has no clamp; past the clamp the answer is the same)
-                a1cVyUpd = qVy(vp + acc * tScale) * gsign;
+                a1cVyUpd = qVy(vp + acc) * gsign;
                 VPSET(vpNew) += forceAcc * tScale;
                 if (isRobot) c.rHover = 0;
                 YSET(c.y) = (float)((double)s.y + kYScale * vpNew * gsign * tScale);
@@ -3931,7 +3934,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 if (ogLingerGate && input && !s.action && !ringTookPress && !freshTapHeld) {
                     if (isBall) {
                         c.flip = c.flip ? 0 : 1;
-                        c.rotStep = (float)ballRotRate(c.mini != 0, true, useDx);
+                        c.rotStep = (float)(ballRotRate(c.mini != 0, true, useDx) * c.gravityMod);
                         c.rotNeg = (uint8_t)!((c.flip != 0) ^ (c.rev != 0));
                         const double bTap = ballFlipFor(useDx) * (c.mini ? kMiniImpulse : 1.0);
                         VYSET(c.vy) = (float)(-bTap * (c.flip ? -1.0 : 1.0));
@@ -5253,13 +5256,14 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 && (s.flip || (double)s.y > (floorY + pHalf) + 0.5)) {
                 const bool thrFlipRest = s.dual ? true : (s.flip != 0);
                 const double vpRest = qVy(
-                    isSwing ? -kSwingG
+                    isSwing ? (s.gravityMod == 1.f ? -kSwingG
+                        : playerGravityStep(7, useDx, c.mini != 0, s.gravityMod, 1.0))
                     : isUfo ? gdapprox::UfoModel::stepVy(
                                 0.0, false, ufoParamsFor(useDx, c.mini, K),
-                                thrFlipRest)
+                                thrFlipRest, false, 0.0, s.gravityMod)
                             : gdapprox::ShipModel::stepVy(
                                 0.0, false, shipParamsFor(useDx, c.mini, K),
-                                thrFlipRest));
+                                thrFlipRest, false, s.gravityMod));
                 pinnedOnBlock = true;
                 prePinY = (float)((double)c.y + kYScale * vpRest * gsign);
                 // the same statement as the cube's grounded branch: the update
@@ -5344,7 +5348,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // and y by -0.089 where the model stepped -0.086 and -0.905
                 // (5x and 10x). The terminal is a velocity, so it is NOT
                 // scaled.
-                vpS -= swingG(c.mini != 0) * tScale;
+                vpS += s.gravityMod == 1.f ? -swingG(c.mini != 0) * tScale
+                    : playerGravityStep(7, useDx, c.mini != 0, s.gravityMod, tScale);
             }
             if (!ceilTakeoff) {
                 // The cap is SYMMETRIC in the WORLD frame: |vy| <= 8, a hard
@@ -5491,10 +5496,10 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             double vpNew = qVy(
                 (isUfo ? gdapprox::UfoModel::stepVy(
                             vp, act, ufoParamsFor(useDx, c.mini, K), thrFlip,
-                            boostNow, lawSvIn)
+                            boostNow, lawSvIn, s.gravityMod, tScale)
                        : gdapprox::ShipModel::stepVy(
                             vp, act, shipParamsFor(useDx, c.mini, K), thrFlip,
-                            boostNow))
+                            boostNow, s.gravityMod, tScale))
                 + fbAcc);
             // A normal UFO flapping off a floor ramp leaves at kUfoRampFlap,
             // not at its plain flap -- see the constant for the rig and for why
@@ -10752,7 +10757,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                                    : (float)(2.0 * dir);
                     } else if (c.mode == 7) {
                         const double dir = (m * (double)useDx >= 0.0) ? 1.0 : -1.0;
-                        const double gRide = swingG(c.mini != 0);
+                        const double gRide = s.gravityMod == 1.f ? swingG(c.mini != 0)
+                            : -playerGravityStep(7, useDx, c.mini != 0, s.gravityMod, 1.0);
                         // TRIED AND REVERTED (2026-08-14): basing the step on
                         // `s.vy` instead of `c.vy`. `c.vy` already carries the
                         // airborne branch's own `vpS -= kSwingG`, so the ride
@@ -12920,8 +12926,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     const bool onFloorT = !s.flip && s.frame == 0
                         && (double)s.y <= (kGroundY + pHalf) + 0.5;
                     if (!onFloorT) {
-                        const double gT = std::fabs(cubePhysFor(useDx).g)
-                            * (c.mode == 5 ? kRobotGScale : 1.0);
+                        const double gT = s.gravityMod == 1.f
+                            ? std::fabs(cubePhysFor(useDx).g) * (c.mode == 5 ? kRobotGScale : 1.0)
+                            : -playerGravityStep(c.mode, useDx, c.mini != 0, s.gravityMod, tScale);
                         const double vT = (s.flip ? 1.0 : -1.0) * gT;
                         VYSET(c.vy) = (float)(gravChanged ? vT * 0.5 : vT);
                     }
@@ -12947,8 +12954,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         && (double)s.y <= (kGroundY + pHalf) + 0.5;
                     if (!onFloor)
                         vTp = (s.flip ? 1.0 : -1.0)
-                            * std::fabs(cubePhysFor(useDx).g)
-                            * (c.mode == 5 ? kRobotGScale : 1.0);
+                            * (s.gravityMod == 1.f
+                                ? std::fabs(cubePhysFor(useDx).g) * (c.mode == 5 ? kRobotGScale : 1.0)
+                                : -playerGravityStep(c.mode, useDx, c.mini != 0, s.gravityMod, tScale));
                 }
                 VYSET(c.vy) = (float)(gravChanged ? vTp * 0.5 : vTp);
             }
@@ -13347,7 +13355,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     && (double)s.y <= (kGroundY + pHalf) + 0.5;
                 if (!onFloor)
                     vAtPortal = (s.flip ? 1.0 : -1.0)
-                              * std::fabs(cubePhysFor(useDx).g);
+                              * (s.gravityMod == 1.f ? std::fabs(cubePhysFor(useDx).g)
+                                : -playerGravityStep(0, useDx, c.mini != 0, s.gravityMod, tScale));
                 // --portalunpin: ...and y keeps that step too, like a pad taken off a block.
                 // Nothing re-seats the body once gravity points away from the block. gdref:
                 //   lv6 t=13,615 y=195 (block) up0->1  y 195 -> 194.9514 (-0.0486)
@@ -13488,7 +13497,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // ball rolling at 3.125 (0.9's mini ground rate) takes the gravity portal uid 408
                 // and the rot column steps 2.2135 (its air rate) on that row; the model kept 3.125.
                 if (c.mode == 2 && c.flip != flipBefore) {
-                    c.rotStep = (float)ballRotRate(c.mini != 0, true, useDx);
+                    c.rotStep = (float)(ballRotRate(c.mini != 0, true, useDx) * c.gravityMod);
                     c.rotNeg = (uint8_t)!((c.flip != 0) ^ (c.rev != 0));
                 }
                 // [2026-09-05] **GD's flipGravity also fires the PARTNER.** A
@@ -13555,9 +13564,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     && std::fabs((double)c.vy) < 1e-6
                     && (c.mode == 5 || c.mode == 6)
                     && !(std::fabs((double)s.y + pHalf - invCeilG) < 0.6)) {
-                    const double gMag =
-                        (c.mode == 6) ? -kBallG
-                        : (((double)useDx > 1.78) ? 0.195 : 0.194);
+                    const double gMag = s.gravityMod == 1.f
+                        ? ((c.mode == 6) ? -kBallG : (((double)useDx > 1.78) ? 0.195 : 0.194))
+                        : -playerGravityStep(c.mode, useDx, c.mini != 0, s.gravityMod, tScale);
                     VYSET(c.vy) = (float)(0.5 * gMag);
                     YSET(c.y) = (float)((double)c.y + 0.225 * gMag);
                 }
@@ -13575,7 +13584,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // as the robot/spider blip (above), but that one places from
                 // vy 0; this one is y only.
                 if (flipBefore && !c.flip && s.grounded && c.mode == 0) {
-                    const double gMagC = std::fabs(cubePhysFor(useDx).g);
+                    const double gMagC = s.gravityMod == 1.f ? std::fabs(cubePhysFor(useDx).g)
+                        : -playerGravityStep(0, useDx, c.mini != 0, s.gravityMod, tScale);
                     if (std::fabs((double)c.vy - 0.5 * gMagC) < 0.002)
                         YSET(c.y) = (float)((double)c.y + 0.225 * gMagC);
                 }
@@ -13741,7 +13751,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         c.pressSpent = 1;
                     } else if (wantMode == 2) {
                         c.flip = c.flip ? 0 : 1;
-                        c.rotStep = (float)ballRotRate(c.mini != 0, true, useDx);
+                        c.rotStep = (float)(ballRotRate(c.mini != 0, true, useDx) * c.gravityMod);
                         c.rotNeg = (uint8_t)!((c.flip != 0) ^ (c.rev != 0));
                         const double bTap = ballFlipFor(useDx) * (c.mini ? kMiniImpulse : 1.0);
                         VYSET(c.vy) = (float)(-bTap * (c.flip ? -1.0 : 1.0));
@@ -15552,7 +15562,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                         preRingStep = c.rotStep;
                         preRingNeg = c.rotNeg;
                     }
-                    c.rotStep = (float)ballRotRate(c.mini != 0, true, useDx);
+                    c.rotStep = (float)(ballRotRate(c.mini != 0, true, useDx) * c.gravityMod);
                     c.rotNeg = (uint8_t)!((c.flip != 0) ^ (c.rev != 0));
                 }
                 // A ring that takes the press SPENDS it: in GD the ring path of
@@ -15874,6 +15884,11 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         const uint8_t spinSign =
             rotPadSpin ? rotPadFlip
                        : (boostSpin || relSpin || fallStake) ? c.rotNeg : rotSignNow;
+        if (boostSpin) c.spinMod = 1.f;   // boostPlayer does not read +0xb84.
+        else if (rotWrite || relSpin || fallStake || (s.grounded && !c.grounded) || s.mode != 0)
+            c.spinMod = c.gravityMod;
+        const float spinModNow = boostSpin || relSpin || fallStake || rotWrite || rotPadSpin || s.mode != 0
+            ? c.spinMod : s.spinMod;
         // THE BASE IS c.rot, NOT s.rot, and every law below has to agree. A mode
         // portal earlier in this same tick may already have written the angle
         // (the edge table at the `c.mode = wantMode` site), and `State c = s` at
@@ -15930,7 +15945,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             const double rate = (c.rotBoost && !rotPadSpin)
                                     ? (c.mini ? 1.125 : 0.8653846)
                                     : (c.mini ? 2.25 : 1.7307692);
-            c.rot = (float)((double)c.rot + (spinSign ? -rate : rate));
+            c.rot = (float)((double)c.rot + (spinSign ? -rate : rate) * spinModNow);
         } else {
             // ...and the rate is **0.13125 x GD's speed multiplier**.
             // Size-independent. Taking per-speed medians over 23,868 samples
@@ -16752,7 +16767,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // off, and the move carries the full impulse.
     if (spawnRingJumpNow && !dead && c.mode == 0) {
         const double vRing = kOrbYellow * ringScaleFor(useDx) * (c.mini ? kMiniImpulse : 1.0);
-        const double gMag = std::fabs(cubePhysFor(useDx).g);
+        const double gMag = c.gravityMod == 1.f ? std::fabs(cubePhysFor(useDx).g)
+            : -playerGravityStep(0, useDx, c.mini != 0, c.gravityMod, tScale);
         VYSET(c.vy) = (float)((c.flip ? -1.0 : 1.0) * (vRing + gMag));
         c.grounded = 0;
     }
@@ -16772,6 +16788,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
 // first once either of them touches anything.
 inline void swapHalves(State& s) {
     std::swap(s.xAbs, s.xAbs2);
+    std::swap(s.gravityMod, s.gravityMod2);
+    std::swap(s.spinMod, s.spinMod2);
     std::swap(s.tpSkip, s.tpSkip2);
     std::swap(s.y, s.y2);
     std::swap(s.vy, s.vy2);
@@ -16906,7 +16924,8 @@ inline void markTouched(State& c, const StepCtx& K, double preY, bool btnHeld) {
         // A COUNT trigger has no box to enter: the item counter fires it, from
         // wherever the player happens to be (cli.hpp's item test). Nor does a
         // TAP trigger: the press fires that one, once its x is behind.
-        if (T->count >= 0 || T->tap) continue;
+        if (T->count >= 0 || T->tap || T->playerOnly || T->playerAuto
+            || !T->playerActions.empty()) continue;   // playerTriggerTick owns their source clock
         // ...and a toggle block needs the button down while the boxes overlap.
         if (T->press && !btnHeld) continue;
         // --p2touch: WOULD THE SECOND PLAYER HAVE ENTERED THIS BOX.

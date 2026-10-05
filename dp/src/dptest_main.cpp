@@ -775,6 +775,357 @@ void teleportDualStep() {
     dp::resetInvocationState();
 }
 
+// Native role selection includes the inactive partner and never inherits a Spawn's toucher.
+void playerEffectRoles() {
+    dp::PlayerEffect e{};
+    e.teleport.id = 2066; e.gravity = 2.f;
+    for (int flags = 0; flags < 4; ++flags) {
+        e.player1 = (uint8_t)(flags & 1); e.player2 = (uint8_t)((flags >> 1) & 1);
+        dp::State s{};
+        dp::applyPlayerEffect(s, e, 0);
+        check(s.gravityMod == (e.player2 ? 1.f : 2.f)
+            && s.gravityMod2 == (e.player1 ? 1.f : 2.f),
+            "gravity target flags match native writes, including an inactive P2");
+    }
+    e.triggeringPlayer = 1;
+    for (int who = 0; who < 3; ++who) {
+        dp::State s{};
+        dp::applyPlayerEffect(s, e, who);
+        check(s.gravityMod == (who == 1 ? 2.f : 1.f)
+            && s.gravityMod2 == (who == 2 ? 2.f : 1.f),
+            "triggering-player gravity writes only a real collision toucher");
+    }
+    e = {};
+    e.teleport.id = 3022; e.teleport.tpExitCount = 1;
+    e.teleport.tpEx = 1000; e.teleport.tpEy = 300;
+    dp::State s{};
+    s.xAbs = 100; s.y = 200; s.xAbs2 = 2000; s.y2 = 400; s.dual = 1;
+    dp::applyPlayerEffect(s, e, 2);
+    check(s.xAbs == 1000 && s.y == 300 && s.xAbs2 == 2000 && s.y2 == 400,
+          "a teleport trigger always teleports P1, even when P2 touches it");
+    check(s.tpSkip == 1 && !s.portalLatch.any(),
+          "teleport triggers set the arrival byte without spending a collision portal");
+    e.teleport.tpExitCount = 0; e.teleport.tpStaticForce = 1;
+    e.teleport.tpForce = 12; e.teleport.tpForceAngle = 90;
+    dp::applyPlayerEffect(s, e, 0);
+    check(s.xAbs == 1000 && s.y == 300 && std::fabs(s.vy - 12) < 1e-5 && s.boost,
+          "a trigger without an exit still applies its native force");
+    s.gravityMod = 0; s.gravityMod2 = -2; s.spinMod = .5f; s.spinMod2 = 3;
+    dp::swapHalves(s);
+    check(s.gravityMod == -2 && s.gravityMod2 == 0 && s.spinMod == 3 && s.spinMod2 == .5f,
+          "per-body gravity and retained spin swap with their body");
+}
+
+// Exercise the public tail, not a hand-constructed effect, including the actual Spawn delay.
+void playerEffectColumns() {
+    dp::resetInvocationState();
+    const std::string tail = ",tpentryx,tpentryy,tpsave,tpexits,tpf,tpfv,tpfadd,tpangle,"
+        "tpr,tprmod,tprmin,tprmax,tprdash,pgrav,ptarget1,ptarget2,ptrigger,multi,"
+        "trigexit,ord,silent,psdelay,psrange,psordered,pexituid,psingle";
+    std::vector<std::string> v(76, "0");
+    v[0] = "2066"; v[1] = "20"; v[2] = "100"; v[3] = "300";
+    v[4] = "30"; v[5] = "30"; v[7] = "42"; v[63] = "-0.5";
+    v[64] = "1"; v[66] = "1"; v[69] = "7";
+    // Build the same column boundaries the exporter uses.
+    auto text = [&]() {
+        std::string row;
+        for (size_t i = 0; i < v.size(); ++i) row += (i ? "," : "") + v[i];
+        return std::string(kObjHeader) + tail + "\n" + row + "\n";
+    };
+    std::istringstream g(text());
+    auto level = dp::loadLevelFrom(g);
+    check(level.unsupported.empty() && level.playerEffects.size() == 1
+        && level.playerEffects[0].gravity == -.5f && level.playerEffects[0].player1
+        && level.playerEffects[0].triggeringPlayer && level.playerSources.at(42).order == 7,
+        "gravity value, roles and ordering survive the complete objrects export");
+    v[0] = "3022"; v[34] = "1000"; v[35] = "400"; v[53] = "1";
+    std::istringstream tp(text());
+    level = dp::loadLevelFrom(tp);
+    check(level.unsupported.empty() && level.playerEffects.size() == 1 && level.portals.empty()
+        && level.playerEffects[0].teleport.tpEx == 1000 && level.spatialTeleport,
+        "ID 3022 resolves an exit but is never routed as an ordinary portal");
+    v[0] = "1268"; v[71] = ".125"; v[72] = ".25"; v[73] = "1";
+    std::istringstream sp(text());
+    level = dp::loadLevelFrom(sp);
+    const auto& meta = level.playerSources.at(42);
+    check(meta.delay == .125 && meta.delayRange == .25 && meta.ordered,
+          "Spawn scheduling reads its own delay, range and ordered flag, not dur");
+    std::istringstream old(std::string(kObjHeader) + "\n"
+        "2066,20,100,300,30,30,0,42\n");
+    check(dp::loadLevelFrom(old).unsupported.find("refreshed") != std::string::npos,
+          "old exports cannot silently drop player effect metadata");
+    dp::resetInvocationState();
+}
+
+// Delayed effects share source clocks with geometry, without widening every search state.
+void playerTriggerClocks() {
+    dp::resetInvocationState();
+    dp::TouchTrig t{};
+    t.uid = 10; t.id = 1268; t.cx = 100; t.cy = 300; t.hw = t.hh = 15;
+    t.playerOnly = true; t.playerAuto = true;
+    dp::PlayerEffect e{};
+    e.teleport.id = 2066; e.gravity = 2;
+    t.playerActions.push_back({e, 10});
+    dp::g_touch = {t}; dp::g_playerRoots = {0};
+    std::vector<const dp::Obj*> empty;
+    dp::StepCtx k{}; k.t = 100;
+    dp::State s{}; s.xAbs = 99; s.y = 300;
+    dp::playerTriggerTick(s, k, dp::PlayerPhase::Automatic);
+    check(!s.trig.any(), "an autonomous player source does not fire before its crossing");
+    s.xAbs = 100;
+    dp::playerTriggerTick(s, k, dp::PlayerPhase::Automatic);
+    check(s.trig.test(0) && s.fireB[0] == 100 && s.gravityMod == 1,
+          "an autonomous source latches its own crossing without applying a delayed leaf early");
+    dp::State later = s; later.fireB[0] = 101;
+    check(dp::keyOf(s, 105) != dp::keyOf(later, 105),
+          "pending player events retain exact fire ticks within the old four-tick key bucket");
+    dp::SearchKey parsed;
+    check(dp::parseKeyText(dp::keyText(dp::keyOf(s, 105)), parsed)
+          && parsed == dp::keyOf(s, 105) && !dp::parseKeyText("v2:0", parsed),
+          "player-state full keys round-trip and reject a pre-gravity schema");
+    k.t = 109; dp::applyPendingPlayerEffects(s, k.t);
+    check(s.gravityMod == 1, "a delayed player event remains pending through the tick before due");
+    k.t = 110; dp::applyPendingPlayerEffects(s, k.t);
+    check(s.gravityMod == 2 && s.gravityMod2 == 2,
+          "the exact due tick updates both native gravity fields");
+    k.t = 111; dp::applyPendingPlayerEffects(later, k.t);
+    check(s.gravityMod == later.gravityMod && dp::keyOf(s, 200) == dp::keyOf(later, 200),
+          "once delayed writes settle, identical worlds can merge again");
+    dp::TouchTrig earlier = t;
+    earlier.uid = 20;
+    earlier.playerActions[0] = {e, 60, {{0, 1}}};
+    earlier.playerActions[0].effect.gravity = 3;
+    dp::g_touch[0].playerActions[0].queuePath = {{0, 1}};
+    dp::g_touch.push_back(earlier); dp::g_playerRoots = {0, 1};
+    dp::State simultaneous{};
+    simultaneous.trig.set(0); simultaneous.trig.set(1);
+    simultaneous.fireB[0] = 100; simultaneous.fireB[1] = 50;
+    k.t = 110;
+    dp::applyPendingPlayerEffects(simultaneous, k.t);
+    check(simultaneous.gravityMod == 2,
+          "simultaneous delayed writes follow enqueue time, not source UID order");
+    dp::g_touch[0].playerActions[0] = {e, 10, {{0, 1}, {5, 2}}};
+    dp::g_touch[1].playerActions[0].delay = 7;
+    simultaneous.fireB[1] = 103; simultaneous.gravityMod = 1;
+    dp::applyPendingPlayerEffects(simultaneous, k.t);
+    check(simultaneous.gravityMod == 2,
+          "nested delayed writes compare the final Spawn enqueue, not the root date");
+    dp::g_touch[1].playerActions[0].delay = 5;
+    simultaneous.fireB[1] = 105; simultaneous.gravityMod = 1;
+    dp::applyPendingPlayerEffects(simultaneous, k.t);
+    check(simultaneous.gravityMod == 3,
+          "a pending event enqueues before an autonomous root on the same tick");
+    dp::g_touch.resize(1); dp::g_playerRoots = {0};
+    k.t = 111;
+    later = s; later.gravityMod2 = 3;
+    check(dp::keyOf(s, 200) != dp::keyOf(later, 200),
+          "an inactive P2 multiplier is still part of future search identity");
+    later = s; later.spinMod = .5f;
+    check(dp::keyOf(s, 200) != dp::keyOf(later, 200),
+          "a cube's retained spin stake cannot merge into another magnitude");
+    dp::g_touch[0].playerAuto = false; dp::g_touch[0].id = 2066;
+    dp::g_touch[0].playerActions[0] = {e, 0};
+    dp::g_touch[0].playerActions[0].effect.triggeringPlayer = 1;
+    s = {}; s.xAbs = 100; s.y = 300;
+    dp::playerTriggerTick(s, k, dp::PlayerPhase::TouchP1, 300);
+    check(s.gravityMod == 2 && s.gravityMod2 == 1 && s.fireB[0] == 111,
+          "a direct touch supplies P1's ID and the collision tick");
+    dp::resetInvocationState();
+    check(dp::g_playerRoots.empty() && dp::g_touch.empty(),
+          "a second solver invocation inherits no player sources or pending actions");
+}
+
+// The graph uses measured Spawn metadata, and refuses schedules not represented by a clock.
+void playerSpawnGraph() {
+    dp::resetInvocationState();
+    const std::string tr = writeTmp("dptest_player_trig.txt", "header\n"
+        + trigRow(1, 1268, 100, 10, 0, -1, 99, 0)
+        + trigRow(2, 1268, 200, 20, 1, -1, 99, 0));
+    const std::string gr = writeTmp("dptest_player_group.txt", "uid,groups\n2 10\n3 20\n");
+    dp::Level l;
+    dp::PlayerTriggerMeta a{}, b{}, c{};
+    a.uid = 1; a.id = 1268; a.cx = 100; a.cy = 300; a.delay = .125;
+    b = a; b.uid = 2; b.spawn = true; b.delay = .001;
+    c = a; c.uid = 3; c.id = 2066; c.spawn = true;
+    l.playerSources = {{1, a}, {2, b}, {3, c}};
+    dp::PlayerEffect e{}; e.teleport.id = 2066; e.teleport.uid = 3; e.gravity = 0;
+    l.playerEffects = {e};
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(l.unsupported.empty() && dp::g_playerRoots.size() == 1
+          && dp::g_touch[0].playerActions.size() == 1
+          && dp::g_touch[0].playerActions[0].delay == 31
+          && dp::g_touch[0].playerActions[0].queuePath
+              == std::vector<std::pair<int, int>>{{0, 1}, {30, 2}},
+          "nested Spawn delays use the native float-dt clock per hop, ignoring dur/sdelay");
+    dp::g_touch[0].playerOnly = false;
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(dp::g_touch.size() == 1 && !dp::g_touch[0].playerOnly,
+          "a Spawn that also controls geometry reuses its existing source bit");
+    l.playerSources[1].delay = (double)0.05f;
+    l.playerSources[2].delay = 0;
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(l.unsupported.empty() && dp::g_touch[0].playerActions[0].delay == 12,
+          "a float 0.05-second delay fires at 12 ticks, not ceil(float delay * 240) = 13");
+    l.playerSources[2].delayRange = .1;
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(l.unsupported.find("random") != std::string::npos,
+          "random Spawn delays are refused instead of being treated as deterministic");
+    l.unsupported.clear(); l.playerSources[2].delayRange = 0;
+    l.playerSources[1].multi = true;
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(l.unsupported.find("repeating") != std::string::npos,
+          "a repeated source cannot overwrite its only event clock silently");
+    l.unsupported.clear(); l.playerSources[1].multi = false;
+    dp::loadPlayerTriggers(l, "", "");
+    check(l.unsupported.find("no modelled Spawn source") != std::string::npos,
+          "a spawned player effect without the graph export is explicitly unsupported");
+    dp::resetInvocationState(); l.unsupported.clear();
+    dp::g_timeWarps.push_back({0, .5});
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(l.unsupported.find("game-time event clock") != std::string::npos,
+          "TimeWarp cannot silently turn a tick clock into a real-time Spawn timer");
+    dp::resetInvocationState(); l.unsupported.clear();
+    dp::g_rotTrig.push_back({});
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(l.unsupported.find("rotation queue") != std::string::npos,
+          "unmodelled autonomous queue interleaving is explicitly refused");
+    dp::resetInvocationState();
+    l.unsupported.clear(); l.playerSources[1].disabled = true;
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(l.unsupported.find("disabled or NoTouch") != std::string::npos,
+          "a disabled source cannot silently fire its player effects");
+    dp::resetInvocationState();
+}
+
+// Gravity changes acceleration, not jump/flap targets, ship thrust or terminal velocities.
+void gravityMultiplierPhysics() {
+    for (int mode : {0, 2, 5, 6, 7}) {
+        check(dp::playerGravityStep(mode, 1.6, false, 0, 1) == 0,
+              "zero gravity removes each gravity-mode acceleration");
+        check(dp::playerGravityStep(mode, 1.6, false, -2, 1)
+              == -dp::playerGravityStep(mode, 1.6, false, 2, 1),
+              "negative gravity reverses acceleration rather than flipping body polarity");
+    }
+    check(dp::playerGravityStep(5, 1, false, 2, 1)
+          != dp::playerGravityStep(5, 2, false, 2, 1),
+          "robot gravity retains its speed-dependent native base");
+    const auto ship = gdapprox::ShipParams::normal();
+    const auto ufo = gdapprox::UfoParams::normal();
+    check(gdapprox::ShipModel::stepVy(0, true, ship, false, false, 0)
+          == gdapprox::ShipModel::stepVy(0, true, ship),
+          "zero gravity does not remove a ship's upward thrust");
+    check(gdapprox::ShipModel::stepVy(0, false, ship, false, false, 0) == 0,
+          "zero gravity does remove a ship's downward acceleration");
+    check(gdapprox::UfoModel::stepVy(0, true, ufo, false, false, 0, 0) == ufo.flapTargetVy,
+          "zero gravity preserves the UFO's native flap target");
+    check(gdapprox::UfoModel::stepVy(-100, false, ufo, false, false, 0, 10)
+          == ufo.vyMinPlayerFrame,
+          "the UFO terminal is not multiplied by gravity");
+    dp::resetInvocationState();
+    dp::Level level;
+    dp::XSlice near(level.objs), ports(level.portals), pads(level.pads), orbs(level.orbs),
+        slopes(level.slopes), speeds(level.speeds);
+    std::vector<const dp::Obj*> empty;
+    const auto shipMini = gdapprox::ShipParams::mini();
+    const auto ufoMini = gdapprox::UfoParams::mini();
+    dp::StepCtx k{101.6, 100, 1.6f, 1, &empty, &empty, &empty, &empty, &empty, &empty,
+        &ship, &shipMini, &ufo, &ufoMini};
+    k.slices = {&near, &ports, &pads, &orbs, &slopes, &speeds}; k.dyn = &level.dyn;
+    dp::State s{}; s.xAbs = 100; s.y = 300; s.dx = 1.6f;
+    bool dead = false;
+    s.gravityMod = 0;
+    const auto zero = dp::stepBoth(s, 0, k, dead);
+    check(!dead && zero.y == 300 && zero.vy == 0,
+          "the real transition preserves an airborne zero-gravity cube");
+    s.gravityMod = 4; s.vy = -14.9f;
+    const auto capped = dp::stepBoth(s, 0, k, dead);
+    check(!dead && capped.vy == -15,
+          "scaled cube acceleration still uses the native -15 terminal");
+    s = {}; s.xAbs = 100; s.y = 300; s.dx = 1.6f; s.mode = 4;
+    const auto wave = dp::stepBoth(s, 0, k, dead);
+    s.gravityMod = 0;
+    const auto waveZero = dp::stepBoth(s, 0, k, dead);
+    check(wave.y == waveZero.y && wave.vy == waveZero.vy,
+          "wave motion ignores the stored gravity multiplier");
+    s = {}; s.xAbs = 100; s.y = 300; s.dx = 1.6f;
+    s.dual = 1; s.xAbs2 = 3000; s.y2 = 400; s.flip2 = 1;
+    dp::TouchTrig t{}; t.uid = 42; t.id = 2066; t.cx = 100; t.cy = 300;
+    t.hw = t.hh = 15; t.playerOnly = true;
+    dp::PlayerEffect e{}; e.teleport.id = 2066; e.gravity = 0;
+    t.playerActions.push_back({e, 0}); dp::g_touch = {t}; dp::g_playerRoots = {0};
+    const auto pair = dp::stepBoth(s, 0, k, dead);
+    check(!dead && pair.vy < 0 && pair.vy2 == 0 && pair.gravityMod == 0 && pair.gravityMod2 == 0,
+          "P1's collision changes P2 gravity before its same-tick physics, not P1's finished move");
+    dp::g_touch[0].playerAuto = true;
+    const auto automatic = dp::stepBoth(s, 0, k, dead);
+    check(!dead && automatic.vy < 0 && automatic.vy2 > 0 && automatic.gravityMod == 0
+        && automatic.gravityMod2 == 0,
+        "an autonomous gravity write follows both moves, unlike a collision touch");
+    dp::g_touch[0].playerAuto = false;
+    dp::g_touch[0].cx = 3000; dp::g_touch[0].cy = 400;
+    dp::g_touch[0].playerActions[0].effect.player1 = 1;
+    const auto fromP2 = dp::stepBoth(s, 0, k, dead);
+    check(!dead && fromP2.vy < 0 && fromP2.vy2 > 0 && fromP2.gravityMod == 0
+        && fromP2.gravityMod2 == 1,
+        "P2's collision updates P1 only after both bodies have integrated");
+    dp::resetInvocationState();
+}
+
+// Re-anchoring must reject malformed clocks and preserve exact finite multipliers.
+void playerAnchorParsing() {
+    std::vector<dp::PlayerFire> events;
+    check(dp::parsePlayerHistory("-", 10, events) && events.empty(),
+          "an explicitly empty player history is complete");
+    check(dp::parsePlayerHistory("42:0,50:10", 10, events) && events.size() == 2,
+          "player history accepts reset-tick and anchor-tick sources");
+    check(dp::parsePlayerHistory("42/1:2,42/2:5", 10, events) && events.size() == 2
+          && events[0].body == 1 && events[1].body == 2,
+          "the same source UID retains independent P1/P2 native clocks");
+    for (const char* bad : {"", "42", "42:x", "-1:2", "42:-1", "42:11", "42:2,",
+                            "42:2,42:3", "42:2junk", "42:2:3", "42:99999999999"})
+        check(!dp::parsePlayerHistory(bad, 10, events), "malformed/future player history is refused");
+    double a, b;
+    check(dp::parseFinitePair("0,-0.5", a, b) && a == 0 && b == -.5,
+          "zero and negative gravity multipliers are valid anchor values");
+    for (const char* bad : {"nan,1", "inf,1", "1", "1,2junk", "1,2,3"})
+        check(!dp::parseFinitePair(bad, a, b), "non-finite or truncated multiplier pairs are refused");
+}
+
+// Touch-triggered effects latch per player; m_isSinglePTouch intentionally shares one slot.
+void playerTouchLatches() {
+    dp::resetInvocationState();
+    dp::Level l;
+    dp::PlayerTriggerMeta m{};
+    m.uid = 42; m.id = 2066; m.touch = true;
+    m.cx = 100; m.cy = 300; m.hw = m.hh = 15;
+    l.playerSources.emplace(42, m);
+    dp::PlayerEffect e{}; e.teleport.uid = 42; e.teleport.id = 2066;
+    e.gravity = 0; e.triggeringPlayer = 1;
+    l.playerEffects.push_back(e);
+    dp::loadPlayerTriggers(l, "", "");
+    check(l.unsupported.empty() && dp::g_playerRoots.size() == 2,
+          "ordinary touch effects allocate independent body slots without widening State");
+    dp::StepCtx k{}; k.t = 5;
+    dp::State s{}; s.xAbs = s.xAbs2 = 100; s.y = s.y2 = 300; s.dual = 1;
+    dp::playerTriggerTick(s, k, dp::PlayerPhase::TouchP1, 300);
+    check(s.gravityMod == 0 && s.gravityMod2 == 1 && s.trig.test(0) && !s.trig.test(1),
+          "P1 spends only its own touch effect latch");
+    k.t = 8; dp::playerTriggerTick(s, k, dp::PlayerPhase::TouchP2, 300);
+    check(s.gravityMod2 == 0 && s.fireB[0] == 5 && s.fireB[1] == 8,
+          "P2 can fire the same effect later with its own source date");
+    dp::resetInvocationState();
+    l.playerSources[42].singleTouch = true;
+    dp::loadPlayerTriggers(l, "", "");
+    check(dp::g_playerRoots.size() == 1,
+          "single-player-touch deliberately shares one source between both bodies");
+    s = {}; s.xAbs = s.xAbs2 = 100; s.y = s.y2 = 300; s.dual = 1;
+    dp::playerTriggerTick(s, k, dp::PlayerPhase::TouchP1, 300);
+    dp::playerTriggerTick(s, k, dp::PlayerPhase::TouchP2, 300);
+    check(s.gravityMod == 0 && s.gravityMod2 == 1,
+          "a shared touch latch prevents the second player's independent re-fire");
+    dp::resetInvocationState();
+}
+
 // dptest --groups-corpus <file>...: the same comparison on real recordings.
 static int groupsCorpus(int argc, char** argv) {
     int bad = 0;
@@ -804,6 +1155,13 @@ int main(int argc, char** argv) {
     teleportColumns();
     independentWindows();
     teleportDualStep();
+    playerEffectRoles();
+    playerEffectColumns();
+    playerTriggerClocks();
+    playerSpawnGraph();
+    gravityMultiplierPhysics();
+    playerAnchorParsing();
+    playerTouchLatches();
     std::printf(g_fail ? "FAILED\n" : "all ok\n");
     return g_fail;
 }

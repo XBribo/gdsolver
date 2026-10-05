@@ -817,6 +817,19 @@ inline double rawGravStep(bool ballLike, bool robot, double dx) {
     if (ballLike) return -0.958199024 * 0.6 * 0.225;
     return -(robot ? 0.9 : 1.0) * g * 0.225;
 }
+
+// updateJump multiplies the native base by m_gravityMod before mode factors and rounding.
+inline double playerGravityStep(int mode, double dx, bool mini, float mod, double timeScale) {
+    const double speed = speedMulForDx(dx);
+    const float base = (mode == 0 || mode == 5) ? (speed < 0.8 ? 0.940199f : speed < 1.0 ? 0.958199024f
+                                : speed < 1.2 ? 0.957199f : 0.961199f)
+                                : 0.958199024f;
+    float step = (float)(0.225 * timeScale) * (base * mod);
+    if (mode == 2 || mode == 6) step *= 0.6000000238418579f;
+    else if (mode == 5) step *= 0.8999999761581421f;
+    else if (mode == 7) step *= mini ? 0.6000000238418579f : 0.4000000059604645f;
+    return -(double)step;
+}
 // --offboard <margin> (EXPERIMENT): the repair loop's own definition of a run that has left the
 // playfield (repair.hpp offBoardTick: world y more than `margin` outside the recorded band at that
 // tick), applied in the search. GD does not kill there; the loop credits the death there instead.

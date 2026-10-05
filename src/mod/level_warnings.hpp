@@ -38,11 +38,10 @@ enum : uint32_t {
     // A 2902 whose target group holds more than one object: teleportPlayer (0x20fdb0) draws one of
     // them from the seed at 0x6c2ef8. The export takes the first; the model has no draw.
     kTeleportSeveralExits = 1u << 3,
-    // The teleport orb (3027, GameObjectType::TeleportOrb) and the teleport trigger (3022): the
-    // export lists the orb as a point of interest and dp reads neither.
+    // The teleport orb (3027, GameObjectType::TeleportOrb) remains unmodelled.
     kTeleportOrb = 1u << 4,
     kTeleportTrigger = 1u << 5,
-    // The 2.2 gravity trigger (2066): dp has no gravity multiplier.
+    // Legacy warning bits retained for decoding older logs; the core now reads 3022/2066.
     kGravityTrigger = 1u << 6,
     // A level the dp loader refuses for its gravity portals ("gravity portals: N (limit 128, ...)"
     // in level_loader.hpp). The portal latch holds kGravPortalBits (128) of them; past that the
@@ -264,8 +263,8 @@ inline Findings scan(std::string_view all, bool platformer) {
                 }
                 break;
             case 3027: r.unmodelled |= kTeleportOrb; break;
-            case 3022: r.unmodelled |= kTeleportTrigger; break;
-            case 2066: r.unmodelled |= kGravityTrigger; break;
+            // 3022/2066 are modelled player effects. Unsupported schedules are diagnosed
+            // by the core after the Spawn graph and native metadata have been exported.
             case 3641: r.unmodelled |= kAttemptDependent; break;
             case 3619: case 3620:
                 if (field(obj, "476") == "5" || field(obj, "477") == "5")

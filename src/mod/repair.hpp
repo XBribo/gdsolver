@@ -66,6 +66,8 @@ struct AnchorRow {
     int dual = 0;
     int teleported = 0, teleported2 = 0;   // per-player m_wasTeleported, hist version 5
     float x2 = 0.f, y2 = 0.f, v2 = 0.f;
+    float gravityMod = 1.f, gravityMod2 = 1.f;
+    float spinMod = 1.f, spinMod2 = 1.f;
     // g2 / g2b are the SECOND body's two contact flags, kept raw exactly like p1's pair above
     // and filtered by groundedOf2() where the anchor is built.
     int f2 = 0, g2 = 0, g2b = 0;
@@ -184,6 +186,7 @@ struct Seeds {
     std::vector<std::pair<int, int>> rings;           // ringseed::g_fired
     std::unordered_map<int, int> touch;               // touchseed::g_first
     std::unordered_map<int, int> portal, portal2;     // portalseed::g_first / g_first2
+    std::map<std::pair<int, int>, int> player;        // playerseed::g_first, (uid, body) -> tick
 };
 inline Seeds g_seedsDead;
 inline Seeds g_seedsDeepest;
@@ -207,7 +210,7 @@ inline void bank() {
     g_dead.swap(g_live);
     g_live.clear();
     g_seedsDead = Seeds{padseed::g_first, ringseed::g_fired, touchseed::g_first,
-                        portalseed::g_first, portalseed::g_first2};
+                        portalseed::g_first, portalseed::g_first2, playerseed::g_first};
 }
 
 // This attempt got further than any before it: keep its trajectory with its plan.
@@ -280,6 +283,15 @@ inline void record(GJBaseGameLayer* l, long long t) {
     r.dual = l->m_gameState.m_isDualMode ? 1 : 0;
     r.teleported = p->m_wasTeleported ? 1 : 0;
     r.teleported2 = (r.dual && l->m_player2 && l->m_player2->m_wasTeleported) ? 1 : 0;
+    r.gravityMod = p->m_gravityMod;
+    r.gravityMod2 = l->m_player2 ? l->m_player2->m_gravityMod : 1.f;
+    // startArg carries the measured turn sign; this is the stake's magnitude relative to
+    // the cube's ordinary size-dependent rate. Zero is a real stationary stake.
+    r.spinMod = std::fabs(p->m_rotationSpeed) / (180.f / (p->m_vehicleSize == 1.f
+        ? 0.4333333373069763f : 0.3333333432674408f));
+    if (auto* p2 = l->m_player2)
+        r.spinMod2 = std::fabs(p2->m_rotationSpeed) / (180.f / (p2->m_vehicleSize == 1.f
+            ? 0.4333333373069763f : 0.3333333432674408f));
     r.y2 = (r.dual && l->m_player2) ? l->m_player2->getPositionY() : 0.f;
     r.x2 = (r.dual && l->m_player2) ? l->m_player2->getPositionX() : 0.f;
     r.v2 = (r.dual && l->m_player2) ? (float)l->m_player2->m_yVelocity : 0.f;
@@ -2924,6 +2936,19 @@ inline std::string anchorPayloadAll(long long t0) {
     add(histPayload(t0));
     if (const AnchorRow* r = anchors::row(t0); r && r->dual)
         add("position2=" + num(r->x2) + "," + num(r->y2));
+    if (const AnchorRow* r = anchors::row(t0))
+        add("gravity=" + num(r->gravityMod) + "," + num(r->gravityMod2));
+    if (const AnchorRow* r = anchors::row(t0))
+        add("spin=" + num(r->spinMod) + "," + num(r->spinMod2));
+    std::vector<std::pair<std::pair<int, int>, int>> player;
+    for (const auto& event : anchors::seeds().player)
+        if (event.second <= t0) player.push_back(event);
+    std::sort(player.begin(), player.end());
+    std::string playerHistory;
+    for (const auto& event : player)
+        playerHistory += (playerHistory.empty() ? "" : ",") + std::to_string(event.first.first)
+            + "/" + std::to_string(event.first.second) + ":" + std::to_string(event.second);
+    add("player=" + (playerHistory.empty() ? std::string("-") : playerHistory));
     return out;
 }
 
@@ -2990,6 +3015,7 @@ inline int g_fixupNoop = 0;
 struct TraceRow {
     bool valid = false;
     double x = 0, y = 0, vy = 0, y2 = 0, vy2 = 0, x2 = 0;
+    double gravityMod = 1, gravityMod2 = 1;
     int mode = 0, grounded = 0, dual = 0, act = -1;
     // The MODEL's own flip and mini (trace columns 24 and 16; -1 = an old
     // trace without them). The fixup key must be built from these, not from
@@ -3178,6 +3204,8 @@ inline bool loadTrace(const std::string& path, std::map<long long, TraceRow>& ou
         const long long t = (long long)num(c, "tick");
         r.x = num(c, "x");
         r.x2 = num(c, "x2", r.x);
+        r.gravityMod = num(c, "gravity", 1);
+        r.gravityMod2 = num(c, "gravity2", 1);
         r.y = num(c, "y");
         r.vy = num(c, "vy");
         r.mode = integer(c, "mode");
@@ -3214,6 +3242,7 @@ inline bool loadTrace(const std::string& path, std::map<long long, TraceRow>& ou
 // that "would the solver treat these two as the same transition" is asked in one place.
 struct FixupKey {
     double x = 0, y = 0, vy = 0, y2 = 0, vy2 = 0, x2 = 0;
+    double gravityMod = 1, gravityMod2 = 1;
     int in = 0, mode = 0, mini = 0, flip = 0, g = 0, kill = 0, dual = 0;
 };
 
@@ -3233,6 +3262,8 @@ inline bool parseFixupKey(const std::string& line, FixupKey& k,
     k.x2 = k.x;
     if (const size_t px = line.find(",x2="); px != std::string::npos)
         std::sscanf(line.c_str() + px, ",x2=%lf", &k.x2);
+    if (const size_t pg = line.find(",gravity="); pg != std::string::npos)
+        std::sscanf(line.c_str() + pg, ",gravity=%lf/%lf", &k.gravityMod, &k.gravityMod2);
     if (dvOut) *dvOut = dvy;
     const size_t p = line.find(",dual2=");
     if (p != std::string::npos) {
@@ -3257,6 +3288,8 @@ inline bool sameTransition(const FixupKey& a, const FixupKey& b) {
     if (a.in != b.in || a.kill != b.kill || a.mode != b.mode || a.mini != b.mini
         || a.flip != b.flip || a.g != b.g || a.dual != b.dual)
         return false;
+    if ((float)a.gravityMod != (float)b.gravityMod
+        || (float)a.gravityMod2 != (float)b.gravityMod2) return false;
     if (std::fabs(a.x - b.x) > 1.2 || std::fabs(a.y - b.y) > 4.0
         || std::fabs(a.vy - b.vy) > 1.0)
         return false;
@@ -3445,6 +3478,8 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
     key.y2 = mPrev->second.y2;
     key.x2 = mPrev->second.x2;
     key.vy2 = mPrev->second.vy2;
+    key.gravityMod = mPrev->second.gravityMod;
+    key.gravityMod2 = mPrev->second.gravityMod2;
     // ...and "covered" is refined by the solver's own answer, the only side that can see the
     // gate: covered by a record the solver keeps back is a model wall. It REPLACES FixupOnFile
     // and nothing else, so every other outcome -- a refined record written over a disagreeing
@@ -3466,10 +3501,10 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
     char line[700];
     snprintf(line, sizeof(line),
              "x=%.4f,in=%d,mode=%d,mini=%d,flip=%d,g=%d,y=%.4f,vy=%.4f,"
-             "dy=%.4f,dvy=%.4f,g2=%d,kill=%d,edy=%.4f,edvy=%.4f%s",
+             "dy=%.4f,dvy=%.4f,g2=%d,kill=%d,edy=%.4f,edvy=%.4f%s,gravity=%.9g/%.9g",
              mPrev->second.x, act, mPrev->second.mode, keyMini, keyFlip,
              mPrev->second.grounded, mPrev->second.y, mPrev->second.vy,
-             dyG, dvG, g2, kill, eDy, eDvy, dual2);
+             dyG, dvG, g2, kill, eDy, eDvy, dual2, key.gravityMod, key.gravityMod2);
     {
         std::ofstream f(noop ? g_fixupNoopPath : g_fixupPath, std::ios::app);
         if (!f) return FixupIoError;
@@ -3923,6 +3958,7 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
             r.y2 = a->y2;
             r.x2 = a->x2;
             r.vy2 = a->v2;
+            r.gravityMod = a->gravityMod; r.gravityMod2 = a->gravityMod2;
             r.act = -1;    // no transition ENDS at t0, so no input is attributed to it
             // model == GD at t0 by construction, so GD's flags stand in for the
             // model's -- with the same frame-3 flip mirror startArg applies.
@@ -3958,6 +3994,11 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
         const double dy2 = pair ? it->second.y2 - gr->y2 : 0.0;
         const double dv2 = pair ? it->second.vy2 - gr->v2 : 0.0;
         const double dx2 = pair ? it->second.x2 - gr->x2 : 0.0;
+        if ((float)it->second.gravityMod != gr->gravityMod
+            || (float)it->second.gravityMod2 != gr->gravityMod2) {
+            writeResult("dpsolve:   [fixup] gravity multiplier fork - re-anchor, not a y/vy delta");
+            return made;
+        }
         if (std::fabs(dy) <= kDivergeEps && std::fabs(dv) <= kDivergeEps
             && std::fabs(dy2) <= kDivergeEps && std::fabs(dv2) <= kDivergeEps
             && std::fabs(it->second.x - gr->x) <= kForkX && std::fabs(dx2) <= kForkX) continue;

@@ -32,7 +32,8 @@ public:
     // --ufolawflap), 0 otherwise.
     static double stepVy(double vy, bool flap, const UfoParams& p,
                          bool gravityFlipped = false, bool boostLatch = false,
-                         double slopeVel = 0.0) {
+                         double slopeVel = 0.0, float gravityMod = 1.f,
+                         double timeScale = 1.0) {
         // A flap RAISES vy to the target and then the same call's gravity step
         // runs, which is where the old constant 6.871 came from. It is not an
         // overwrite: GD (PlayerObject::updateJump) only calls setYVelocity when
@@ -48,7 +49,16 @@ public:
             }
         }
         const double s = gravityFlipped ? -p.accelSwitchVy : p.accelSwitchVy;
-        const double a = (vy <= s) ? p.gravityWeak : p.gravityStrong;
+        double a = (vy <= s) ? p.gravityWeak : p.gravityStrong;
+        // Scale the native float product before quantisation, never the flap target or cap.
+        if (gravityMod != 1.f) {
+            const float base = 0.9581990242004395f * gravityMod;
+            float step = (float)(0.225 * timeScale) * base;
+            step *= vy <= s ? 0.800000011920929f : 1.2000000476837158f;
+            step *= 0.5f;
+            step /= p.vyMinPlayerFrame < -7.0 ? 0.8500000238418579f : 1.f;
+            a = -(double)step;
+        }
         double next = vy + a;
         // Both ends of GD's band, as the ship has had all along. Without the
         // rise side a UFO thrown upwards by an orb or a pad kept climbing at a

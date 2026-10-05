@@ -30,7 +30,8 @@ public:
     // the one mode whose acceleration reads it as well as the clamp -- see the
     // selector below.
     static double stepVy(double vy, bool held, const ShipParams& p,
-                         bool gravityFlipped = false, bool boostLatch = false) {
+                         bool gravityFlipped = false, bool boostLatch = false,
+                         float gravityMod = 1.f, double timeScale = 1.0) {
         // [2026-08-20 RESOLVED] A long unresolved note used to sit here saying
         // "the sign of the flipped threshold disagrees between the rig and the
         // corpus", but THERE WAS NO CONTRADICTION -- the calibration rig's
@@ -86,6 +87,17 @@ public:
             a = p.releaseStrong;
         else
             a = (held && fallingBugged) ? -p.holdWeak : p.releaseWeak;
+        // updateJump 0x38c639 bypasses the scaled base for negative xmm3 (thrust).
+        // Only downward acceleration reads m_gravityMod; limits and switch stay fixed.
+        if (gravityMod != 1.f && !(held && !boostLatch) && !(boostLatch && vy < 0.0)) {
+            const float base = 0.9581990242004395f * gravityMod;
+            float step = (float)(0.225 * timeScale) * base;
+            const bool strongRelease = !held && !fallingBugged;
+            step *= strongRelease ? 1.2000000476837158f : 0.800000011920929f;
+            step *= held && fallingBugged ? 0.5f : 0.4000000059604645f;
+            step /= p.vyMinPlayerFrame < -7.0 ? 0.8500000238418579f : 1.f;
+            a = -(double)step;
+        }
         double next = vy + a;
         // THE CLAMP IS SKIPPED OUTRIGHT WHILE THE LATCH IS UP (0x38ca9f: `cmp
         // byte [rdi+0x952], 0 / jne` past the whole block). It is not a

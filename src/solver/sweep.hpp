@@ -24,6 +24,12 @@ inline void reset() { g_lines = 0; }
 // bit is set). p1's only, because dp's markTouched reads p1's position -- a
 // bit set from p2 would be one the model can never set going forward, so an
 // anchor would claim what a whole run of the same plan would not.
+// First native invocation of each effect/Spawn source, independent of touch admission.
+namespace playerseed {
+inline std::map<std::pair<int, int>, int> g_first;
+// A new attempt cannot inherit pending player writes from the previous one.
+inline void reset() { g_first.clear(); }
+}
 namespace touchseed {
 inline std::unordered_map<int, int> g_first;   // trigger uid -> first tick
 // Activations by the SECOND player, counted and never carried. dp cannot
@@ -38,7 +44,7 @@ inline int g_p2 = 0;
 // which is the reading that stalled three separate measurements on
 // 2026-09-04. The reported line carries this beside it.
 inline int g_calls = 0;
-inline void reset() { g_first.clear(); g_p2 = 0; g_calls = 0; }
+inline void reset() { g_first.clear(); g_p2 = 0; g_calls = 0; playerseed::reset(); }
 }
 // ...and the same question for GRAVITY PORTALS, which have the same hole:
 // State::portalLatch accumulates over the run, so a state handed to dp's

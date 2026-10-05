@@ -153,6 +153,30 @@ struct Obj {
     uint8_t rev = 0;
 };
 
+// Admission and ordering of a player effect or a Spawn that can reach one.
+struct PlayerTriggerMeta {
+    int uid = -1, id = 0, channel = 0, order = 0;
+    int exitUid = -1;
+    double cx = 0, cy = 0, hw = 0, hh = 0;
+    bool touch = false, spawn = false, multi = false, onExit = false, silent = false;
+    bool ordered = false;
+    bool singleTouch = false;
+    bool disabled = false, noTouch = false;
+    double delay = 0, delayRange = 0;
+};
+
+// Native player writes, kept outside the ordinary geometry trigger walk.
+struct PlayerEffect {
+    Obj teleport{};
+    float gravity = 1.f;
+    uint8_t player1 = 0, player2 = 0, triggeringPlayer = 0;
+};
+
+// Native touch sources latch independently for each player unless single-player-touch is set.
+struct PlayerFire {
+    int uid = -1, body = 0, tick = 0;
+};
+
 // A verbatim port of GameObject::isFacingDown() (2.2081 win 0x1a1910). GD turns
 // getRotation() into an int with **cvttss2si** before dividing by 90, so the
 // truncation toward 0 is copied exactly.
