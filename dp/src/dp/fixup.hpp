@@ -44,6 +44,7 @@ struct Fixup {
     // The second body, when this was measured on a pair.
     uint8_t dual = 0, gAfter2 = 255;
     float y2 = 0, vy2 = 0, dy2 = 0, dvy2 = 0;
+    float x2 = 0;   // named tail; legacy records inherit the primary X
     // File position at load. The file is append-only within a run, so a
     // larger ord is a NEWER measurement -- the conflict filter (cli.hpp)
     // keeps the newest of two records that share a key but disagree.
@@ -118,6 +119,7 @@ inline bool fixupMatches(const Fixup& f, const State& s, int input) {
     if (std::fabs((double)s.y - (double)f.y) > 4.0) return false;
     if (std::fabs((double)s.vy - (double)f.vy) > 1.0) return false;
     if (f.dual) {
+        if (std::fabs((double)s.xAbs2 - (double)f.x2) > 1.2) return false;
         if (std::fabs((double)s.y2 - (double)f.y2) > 4.0) return false;
         if (std::fabs((double)s.vy2 - (double)f.vy2) > 1.0) return false;
     }
@@ -305,6 +307,36 @@ inline double touchPreY(const State& s, const State& c, bool set, double y) {
     return set ? y : (double)c.y;
 }
 
+// A separated dual queries two small windows, never the empty distance between them.
+struct BodyWindow {
+    std::array<std::vector<const Obj*>, 6> objects;
+    std::vector<const Obj*> solids;
+    SlopeVetoIndex veto;
+    // The indexes are read-only; dynamic positions were fixed before parallel stepping.
+    StepCtx at(const State& s, const StepCtx& base) {
+        StepCtx k = base;
+        const float dx = s.dx > 0.f ? s.dx : base.dxF;
+        k.xPrev = s.xAbs;
+        k.x = advanceX(s.xAbs, dx * timeWarpAt(s.xAbs) * (s.rev ? -1.f : 1.f));
+        const double margins[6] = {40, 60, 40, 50, 60, 80};
+        const uint8_t buckets[6] = {Dynamics::NEAR, Dynamics::PORT, Dynamics::PAD,
+                                   Dynamics::ORB, Dynamics::SLOPE, Dynamics::SPEED};
+        for (size_t i = 0; i < objects.size(); ++i) {
+            objects[i].clear();
+            const double lo = k.x - margins[i], hi = k.x + margins[i];
+            base.slices[i]->forRangeAt(lo, hi,
+                [&](const Obj& o) { objects[i].push_back(&o); });
+            if (base.dyn) base.dyn->collect(buckets[i], lo, hi, objects[i]);
+        }
+        k.near = &objects[0]; k.ports = &objects[1]; k.pads = &objects[2];
+        k.orbs = &objects[3]; k.slopes = &objects[4]; k.speeds = &objects[5];
+        solidOrderInto(objects[0], solids);
+        veto.build(objects[0], objects[4]);
+        k.nearSolid = &solids; k.veto = &veto;
+        return k;
+    }
+};
+
 inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     bool d1 = false;
     g_halfNow = 0;
@@ -401,14 +433,17 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // --dualband: the second half's portal band reads p1's finished mode, and says if it wrote
     g_bandPortalWrote = false;
     if (g_dualBand) g_dualOtherMode = (int)c.mode;
-    State cb = stepOne(sb, input, K, d2, &p2FlippedGravity);
+    BodyWindow p2Window;
+    const StepCtx p2K = (s.xAbs2 != s.xAbs && K.slices[0])
+        ? p2Window.at(sb, K) : K;
+    State cb = stepOne(sb, input, p2K, d2, &p2FlippedGravity);
     g_dualOtherMode = -1;
     const bool p2WroteBand = g_bandPortalWrote;
     g_halfNow = 0;
     const bool p2Tapped = g_ballTapped;   // --repelland
     const uint8_t p2HitG = g_hitGRepel;   // --repela0c
     swapHalves(cb);
-    // Shared x/speed come from the first half; the second half
+    // Shared speed comes from the first half; the second half
     // only contributes its own body -- and `mode` / `mini` / the ceiling press
     // counters are ITS fields now, not shared ones (State::mode2 / mini2 say
     // why). SIZE left this list on 2026-08-28: it was the last thing a portal
@@ -416,6 +451,8 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // Native collisionCheckObjects (0x21580d) lets p2 exit dual too; its
     // layer flag write survives the rest of this already-started collision pass.
     c.dual = cb.dual;
+    c.xAbs2 = cb.xAbs2;
+    c.tpSkip2 = cb.tpSkip2;
     c.y2 = cb.y2;            c.vy2 = cb.vy2;
     c.mode2 = cb.mode2;      c.mini2 = cb.mini2;
     c.ceilT2 = cb.ceilT2;    c.ceilM42 = cb.ceilM42;
@@ -603,13 +640,13 @@ inline State stepBoth(const State& s, int input, const StepCtx& K, bool& dead) {
     // 26% of the 30 px columns in that section have geometry on one side only,
     // so this is worth taking. See g_dualFreeQ for what it does with it.
     c.freeHalf = 1;
-    if (K.near) {
-        for (const Obj* o : *K.near) {
+    if (p2K.near) {
+        for (const Obj* o : *p2K.near) {
             if (std::fabs((double)c.y2 - o->cy) < o->hh + 45.0) { c.freeHalf = 0; break; }
         }
     }
-    if (c.freeHalf && K.slopes) {
-        for (const Obj* sp : *K.slopes) {
+    if (c.freeHalf && p2K.slopes) {
+        for (const Obj* sp : *p2K.slopes) {
             if (std::fabs((double)c.y2 - sp->cy) < sp->hh + 45.0) { c.freeHalf = 0; break; }
         }
     }

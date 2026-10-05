@@ -133,7 +133,7 @@ inline bool bandClamps(const State& s) {
 // Named, quantised dimensions of a cell. Group identity (dx/trig/frame/rev)
 // remains outside this key. Equality never compares a digest or struct padding.
 struct SearchKey {
-    int32_t x = 0, y = 0, vy = 0, y2 = 0, vy2 = 0;
+    int32_t x = 0, y = 0, vy = 0, y2 = 0, vy2 = 0, x2 = 0;
     int32_t bandFloor = 0, bandHeight = 0, slopeUid0 = 0, slopeUidNow = 0;
     int64_t exitVy = 0;
     uint32_t taps = 0;
@@ -146,6 +146,7 @@ struct SearchKey {
     uint8_t coins = 0, items = 0, frameChg = 0, ceilT = 0, ceilM4 = 0;
     uint8_t held = 0, grounded = 0;
     uint8_t dash2 = 0, spiderTap = 0, a1cLatch = 0, seat = 0, freshArm = 0;
+    uint8_t teleported = 0;
     std::array<uint64_t, GravLatch::kWords> portals{}, portals2{};
     uint64_t pressFired = 0, pressHeld = 0;
     // Zero means at rest; a live bucket is fireB/4 + 1, including tick zero.
@@ -154,7 +155,7 @@ struct SearchKey {
     // Keep comparison, hashing and trace encoding on the same field list.
     template <class Self>
     static auto fields(Self& k) {
-        return std::tie(k.x, k.y, k.vy, k.y2, k.vy2, k.bandFloor, k.bandHeight,
+        return std::tie(k.x, k.y, k.vy, k.y2, k.vy2, k.x2, k.bandFloor, k.bandHeight,
                         k.slopeUid0, k.slopeUidNow, k.exitVy, k.taps,
                         k.mode, k.mini, k.flip, k.dual, k.mode2, k.mini2, k.flip2,
                         k.ringHold, k.pressSpent, k.ringHold2, k.pressSpent2,
@@ -163,7 +164,7 @@ struct SearchKey {
                         k.fgArm, k.ogLinger, k.holdDead, k.armed, k.spiderAge,
                         k.coins, k.items, k.frameChg, k.ceilT, k.ceilM4,
                         k.held, k.grounded, k.dash2, k.spiderTap, k.a1cLatch, k.seat,
-                        k.freshArm, k.portals, k.portals2,
+                        k.freshArm, k.teleported, k.portals, k.portals2,
                         k.pressFired, k.pressHeld, k.movingFire);
     }
     // Compare all canonical dimensions, not the storage representation.
@@ -203,7 +204,7 @@ struct SearchKeyHash {
 // Versioned full keys let rejoinfull reject legacy digest-only traces.
 inline std::string keyText(const SearchKey& k) {
     std::ostringstream out;
-    out << "v1" << std::hex;
+    out << "v2" << std::hex;
     keyWords(k, [&](auto v) { out << ':' << (uint64_t)v; });
     return out.str();
 }
@@ -212,7 +213,7 @@ inline std::string keyText(const SearchKey& k) {
 inline bool parseKeyText(const std::string& text, SearchKey& result) {
     std::istringstream in(text);
     std::string word;
-    if (!std::getline(in, word, ':') || word != "v1") return false;
+    if (!std::getline(in, word, ':') || word != "v2") return false;
     SearchKey k;
     bool ok = true;
     keyWords(k, [&](auto& v) {
@@ -239,8 +240,10 @@ inline SearchKey keyOf(const State& s, long long t) {
     k.vy = (int32_t)std::lround(s.vy * vs);
     k.mode = s.mode; k.mini = s.mini; k.flip = s.flip; k.dual = s.dual;
     k.flip2 = s.flip2;
+    k.teleported = s.tpSkip | (s.dual ? (s.tpSkip2 << 1) : 0);
     k.ringHold = s.ringHold; k.pressSpent = s.pressSpent;
     if (s.dual) {
+        k.x2 = (int32_t)std::lround(s.xAbs2 * (flyX ? g_keyXqFly : g_keyXq));
         const double q = s.freeHalf ? g_dualFreeQ : 1.0;
         k.y2 = (int32_t)std::lround(s.y2 * (ys * q));
         k.vy2 = (int32_t)std::lround(s.vy2 * (vs * q));

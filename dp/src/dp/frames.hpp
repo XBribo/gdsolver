@@ -872,7 +872,7 @@ inline std::string g_anchorState;
 // says. Declaring ownership keeps "replaces wholesale" true WITHIN a
 // subsystem and leaves the others honestly alone.
 inline const char* const kAnchorKeys[] = {"owns", "touch", "portal", "portal2",
-                                          "hist"};
+                                          "hist", "position2"};
 // `owns=hist` -> the per-body history values that --start does not carry, as
 // ONE versioned value: `hist=<version>|<count>|name:value,name:value`. The
 // version and the count are checked, and a name this build does not know is
@@ -895,7 +895,11 @@ inline const char* const kHistNames[] = {"pressSpent", "pressSpent2"};
 // since the ride's clock +0x598 was stamped, read against +0xaa0) and
 // `slopeLanded` (a grounded row since then). -1 = not said. Parsed always,
 // seeded only under --anchorride (cli.hpp maps them onto the ride fields).
-inline std::array<const char*, 9> histNamesFor(int version) {
+// Version 5 carries each body's native m_wasTeleported arrival byte (+0x560).
+inline std::array<const char*, 11> histNamesFor(int version) {
+    if (version == 5)
+        return {"pressSpent", "pressSpent2", "freeMode", "spiderJumpT", "slopeOn",
+                "slopeUnder", "slopeUid", "slopeAge", "slopeLanded", "teleported", "teleported2"};
     if (version == 4)
         return {"pressSpent", "pressSpent2", "freeMode", "spiderJumpT", "slopeOn",
                 "slopeUnder", "slopeUid", "slopeAge", "slopeLanded"};
@@ -909,10 +913,10 @@ inline std::array<const char*, 9> histNamesFor(int version) {
             nullptr, nullptr, nullptr, nullptr};
 }
 // --anchorride / --no-anchorride (default on since 2026-09-30): seed the anchor's
-// slope-ride fields from the hist payload's version-4 values (cli.hpp, after the
+// slope-ride fields from the hist payload's version-4-or-later values (cli.hpp, after the
 // geometric guess rideAtAnchor). A payload before version 4 seeds nothing, so a
 // run without the recording keeps the guess. On together with the mod's cfg
-// histride, which writes version 4 and passes one of the two flags on every
+// histride, which includes the ride values and passes one of the two flags on every
 // anchored call (config.hpp).
 inline bool g_anchorRide = true;
 // Which subsystems this payload claims. The lock and the rotation queue keep
@@ -1282,6 +1286,80 @@ inline void turnObj(Obj& o, int f) {
         toFrame(f, o.tpEx, o.tpEy, eu, ev);
         o.tpEx = eu; o.tpEy = ev;
     }
+    double du, dv;
+    toFrame(f, o.tpEntryDx, o.tpEntryDy, du, dv);
+    o.tpEntryDx = du; o.tpEntryDy = dv;
+}
+
+// teleportPlayer (2.2081, 0x20fdb0) chooses a world point before applying ignore axes.
+inline void teleportTarget(const Obj& p, int frame, double x, double y,
+                           double& tx, double& ty) {
+    const bool hasExit = p.tpExitCount > 0
+        || (p.tpExitCount < 0 && (p.tpEx != 0.0 || p.tpEy != 0.0));
+    if (p.tpExitCount == 0) { tx = x; ty = y; return; }
+    // Preserve old exports' unlinked target convention, including turned frames.
+    if (!hasExit && p.tpExitCount < 0) {
+        tx = x; ty = p.tpIgnoreY ? y : p.tpY; return;
+    }
+    double wx, wy, ex, ey;
+    fromFrame(frame, x, y, wx, wy);
+    if (hasExit) fromFrame(frame, p.tpEx, p.tpEy, ex, ey);
+    else { ex = wx; ey = p.tpWorldY; }
+    if (p.id == 747) ex = wx;
+    if (p.tpSaveOffset) {
+        double ix, iy;
+        fromFrame(frame, p.cx + p.tpEntryDx, p.cy + p.tpEntryDy, ix, iy);
+        ex += wx - ix; ey += wy - iy;
+    }
+    if (p.tpIgnoreX) ex = wx;
+    if (p.tpIgnoreY) ey = wy;
+    toFrame(frame, ex, ey, tx, ty);
+}
+
+// Port the classic-mode force branches of teleportPlayer/redirectPlayerForce (0x39fc60).
+// Native m_xVelocity is platformer-only; classic forces never change travel speed.
+inline void teleportForce(const Obj& p, int frame, float& vy, uint8_t& boost) {
+    if (!p.tpStaticForce && !p.tpRedirectForce) return;
+    if (!p.tpRedirectForce && p.tpForce == 0.f && !p.tpForceAdditive) {
+        vy = 0.f; boost = 0; return;
+    }
+    constexpr float pi = 3.141592741012573242f;
+    const float angle = p.tpForceAngle * 0.01745329238474369f;
+    float fx = std::cos(angle), fy = std::sin(angle);
+    const float nativeVy = frame == 3 ? -vy : vy;
+    if (p.tpRedirectForce) {
+        float turn = angle - std::atan2(nativeVy, 0.f);
+        if (turn < -pi || turn > pi) {
+            const float turns = std::ceil(std::floor(std::fabs(turn) / pi) * 0.5f);
+            turn += (turn < -pi ? 1.f : -1.f) * turns * (pi + pi);
+        }
+        fx = 0.f; fy = nativeVy;
+        if (turn != 0.f) {
+            fx = -nativeVy * std::sin(turn);
+            fy = nativeVy * std::cos(turn);
+        }
+        fx *= p.tpRedirectMod; fy *= p.tpRedirectMod;
+        const float length = std::sqrt(fx * fx + fy * fy);
+        if (p.tpRedirectMax > 0.f && length > p.tpRedirectMax) {
+            const float scale = p.tpRedirectMax / length;
+            fx *= scale; fy *= scale;
+        } else if (p.tpRedirectMin > 0.f && length < p.tpRedirectMin) {
+            if (length == 0.f) {
+                fx = std::cos(angle) * p.tpRedirectMin;
+                fy = std::sin(angle) * p.tpRedirectMin;
+            } else {
+                const float scale = p.tpRedirectMin / length;
+                fx *= scale; fy *= scale;
+            }
+        }
+    } else {
+        const float scale = p.tpForce / std::sqrt(fx * fx + fy * fy);
+        fx *= scale; fy *= scale;
+    }
+    float out = (frame & 1) ? fx : fy;
+    if (!p.tpRedirectForce && p.tpForceAdditive) out += nativeVy;
+    vy = frame == 3 ? -out : out;
+    boost = 1;
 }
 
 }  // namespace dp

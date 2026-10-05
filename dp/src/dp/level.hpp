@@ -65,6 +65,8 @@ struct Level {
     // solver runs on a detached thread there, and exit() from it is an abort in
     // the host process (0xC0000409), with no log line to say why.
     std::string unsupported;
+    // Spatial teleports can separate the frontier into distant travel windows.
+    bool spatialTeleport = false;
     // Shared gravity-portal bits, where each changes hands (prelude.hpp, g_gpHandoff). The loader
     // fills this; cliMain copies it into the global the step reads.
     std::vector<GpHandoff> gpHandoff;

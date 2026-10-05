@@ -1511,6 +1511,7 @@ inline int cliMainOnce(int argc, char** argv) {
                     &g2, &kill);
                 if (n < 11) continue;
                 f.x = (float)x; f.y = (float)y; f.vy = (float)vy;
+                f.x2 = f.x;
                 f.dy = (float)dy; f.dvy = (float)dvy;
                 f.in = (uint8_t)in; f.mode = (uint8_t)mode;
                 f.mini = (uint8_t)mini; f.flip = (uint8_t)flip;
@@ -1532,6 +1533,10 @@ inline int cliMainOnce(int argc, char** argv) {
                     }
                 }
                 f.ord = (int)g_fixups.size();
+                if (const char* d = std::strstr(ln.c_str(), ",x2=")) {
+                    float x2;
+                    if (std::sscanf(d, ",x2=%f", &x2) == 1) f.x2 = x2;
+                }
                 g_fixups.push_back(f);
             }
             for (const Fixup& fx : g_fixups)
@@ -1565,7 +1570,8 @@ inline int cliMainOnce(int argc, char** argv) {
                          ++b) {
                         const Fixup &p = g_fixupDeltas[a], &q = g_fixupDeltas[b];
                         if (p.in != q.in || p.mode != q.mode || p.mini != q.mini
-                            || p.flip != q.flip || p.g != q.g || p.dual != q.dual)
+                            || p.flip != q.flip || p.g != q.g || p.dual != q.dual
+                            || (p.dual && std::fabs(p.x2 - q.x2) > 2.4f))
                             continue;
                         if (std::fabs(p.y - q.y) > 8.0f
                             || std::fabs(p.vy - q.vy) > 2.0f)
@@ -1963,6 +1969,7 @@ inline int cliMainOnce(int argc, char** argv) {
     // seed the per-state float accumulator with the anchor's absolute x. The
     // rounding depends on the magnitude, so this cannot be deferred (see advanceX)
     init.xAbs = (float)x0;
+    init.xAbs2 = init.xAbs;
 
     // --horizon N: stop as soon as the frontier has survived N ticks past the
     // anchor and emit that prefix as the plan. The driver only ever uses the
@@ -2510,9 +2517,10 @@ inline int cliMainOnce(int argc, char** argv) {
                                                             : v.find('|', b1 + 1);
                 if (b2 == std::string::npos
                     || (v.substr(0, b1) != "1" && v.substr(0, b1) != "2"
-                        && v.substr(0, b1) != "3" && v.substr(0, b1) != "4")) {
+                        && v.substr(0, b1) != "3" && v.substr(0, b1) != "4"
+                        && v.substr(0, b1) != "5")) {
                     std::printf("seed payload rejected: hist '%s' is not version "
-                                "1, 2, 3 or 4 (version|count|name:value,...)\n", v.c_str());
+                                "1, 2, 3, 4 or 5 (version|count|name:value,...)\n", v.c_str());
                     return 2;
                 }
                 histVersion = std::atoi(v.substr(0, b1).c_str());
@@ -2558,6 +2566,24 @@ inline int cliMainOnce(int argc, char** argv) {
             } else if (p.first == "portal2") {
                 payloadPortal2 = parseUidList(p.second);
                 sawPortal2Key = true;
+            } else if (p.first == "position2") {
+                const std::string& value = p.second;
+                const size_t comma = value.find(',');
+                double wx = 0.0, wy = 0.0;
+                const char* end = value.data() + value.size();
+                const char* mid = value.data() + (comma == std::string::npos ? value.size() : comma);
+                const auto rx = std::from_chars(value.data(), mid, wx);
+                const auto ry = comma == std::string::npos ? rx
+                    : std::from_chars(mid + 1, end, wy);
+                if (comma == std::string::npos || rx.ec != std::errc{} || rx.ptr != mid
+                    || ry.ec != std::errc{} || ry.ptr != end
+                    || !std::isfinite(wx) || !std::isfinite(wy)) {
+                    std::printf("seed payload rejected: position2 must be finite world X,Y\n");
+                    return 2;
+                }
+                double u, v;
+                toFrame(init.frame, wx, wy, u, v);
+                init.xAbs2 = (float)u; init.y2 = (float)v;
             }
         }
         havePayload = g_ownsTouch;
@@ -2713,6 +2739,8 @@ inline int cliMainOnce(int argc, char** argv) {
                                             | (h.second != 0 ? kBandFree : 0));
             else if (h.first == "spiderJumpT" && h.second >= 0)
                 init.spiderJumpT = (uint8_t)std::min(h.second, kSpiderJumpGraceTicks);
+            else if (h.first == "teleported") init.tpSkip = (uint8_t)(h.second != 0);
+            else if (h.first == "teleported2") init.tpSkip2 = (uint8_t)(h.second != 0);
             // slopeOn .. slopeLanded (version 4) are seeded further down, under
             // --anchorride, once the geometric ride guess (rideAtAnchor) has run.
         }
@@ -5159,7 +5187,7 @@ inline int cliMainOnce(int argc, char** argv) {
               // `fxblk`: the moving object that kept a MATCHING fixup from
               // firing on the step into this row, -1 if none (fixup.hpp,
               // g_fxBlockedUid). The recorder's third answer.
-              ",fxblk\n";
+              ",fxblk,x2\n";
         // Make --snaplog usable in replay too (it used to exist only on the
         // SOLVE side, so a known plan's stair snaps could never be checked
         // against GD's snaptrace).
@@ -5356,7 +5384,7 @@ inline int cliMainOnce(int argc, char** argv) {
             solidOrderInto(rn, rnSolid);
             const StepCtx K{x, xPrevR, rDxUsed, t, &rn, &rp, &rd, &ro, &rs, &rv,
                             &SP, &SPmini, &UP, &UPmini, &rt, nullptr, nullptr,
-                            &rnSolid};
+                            &rnSolid, {sl.get(), pl.get(), dl.get(), ol.get(), sls.get(), vl.get()}, &Lf->dyn};
             bool rdead = false;
             g_nearOrb = 0;
             g_dashVySet = 0;
@@ -5442,6 +5470,8 @@ inline int cliMainOnce(int argc, char** argv) {
                 // +0xa1c (State::a1cLatch, bit 1 = the second body): printed, not seeded -- the
                 // dump has no column for it, so an anchor starts it at 0
                 std::printf("seed: t=%lld a1cLatch=%d\n", t, (int)s.a1cLatch);
+                std::printf("seed: t=%lld x2=%.9g teleported=%d/%d\n", t,
+                            (double)s.xAbs2, (int)s.tpSkip, (int)s.tpSkip2);
                 // ...and the same state as a READY-MADE --startrotq argument.
                 //
                 // rotSpent is a mask over g_rotQ, and the bit order is
@@ -5526,6 +5556,8 @@ inline int cliMainOnce(int argc, char** argv) {
             // is, and a turned frame would otherwise read as a huge divergence.
             double wX, wY;
             fromFrame((int)s.frame, (double)s.xAbs, (double)s.y, wX, wY);
+            double wX2, wY2;
+            fromFrame((int)s.frame, s.xAbs2, s.y2, wX2, wY2);
             // ...and so is vy. GD's dump reports the player's own vertical
             // velocity in the CURRENT gameplay frame, and in frame 3 the
             // model's vertical axis points the other way -- the same statement
@@ -5604,7 +5636,8 @@ inline int cliMainOnce(int argc, char** argv) {
                 std::printf("fxwhy: t=%lld %s\n", (long long)t, g_fxWhy);
             tr << t << ',' << wX << ',' << wY << ',' << vyGd << ','
                << (int)s.mode << ',' << (int)s.grounded << ',' << (int)s.dual
-               << ',' << s.y2 << ',' << s.vy2 << ',' << (int)s.flip2 << ','
+               << ',' << wY2 << ',' << (s.vy2 * (s.frame == 3 ? -1.f : 1.f))
+               << ',' << (int)s.flip2 << ','
                << curIn
                << ',' << (int)s.onSlope << ',' << s.slopeM << ','
                << (int)s.slopeT << ',' << s.bandFloor << ',' << s.bandCeil
@@ -5625,6 +5658,7 @@ inline int cliMainOnce(int argc, char** argv) {
                << ',' << (int)s.mode2 << ',' << (int)s.ceilT
                << ',' << (int)s.ceilT2 << ',' << (int)s.mini2
                << ',' << g_fxBlockedUid
+               << ',' << wX2
                << "\n";
             if (rdead) {
                 // --replayon (diagnostic): note the first death and walk on, the
@@ -5886,7 +5920,7 @@ inline int cliMainOnce(int argc, char** argv) {
         // the flag took the loop off d008ee2's route at the second iteration, the search's
         // chosen plan dying in its own resim in frame 1 (`resimdie=511@1758/spider/no-target
         // ... f1`). Where a turned or reversed frame is live the layer is processed as before.
-        bool xsplitHere = g_groupXSplit && cur.size() > 1;
+        bool xsplitHere = (g_groupXSplit || L.spatialTeleport) && cur.size() > 1;
         for (size_t i = 0; xsplitHere && i < cur.size(); ++i)
             if (cur[i].frame != 0 || cur[i].rev != 0) xsplitHere = false;
         if (xsplitHere) {
@@ -6269,7 +6303,7 @@ inline int cliMainOnce(int argc, char** argv) {
         std::vector<const Obj*> nearSolid;   // --solidorder: near in GD's solid order, once per group
         solidOrderInto(near, nearSolid);
         const StepCtx K{x, xPrev, dxUsed, t, &near, &ports, &pads, &orbs, &slps, &spds, &SP, &SPmini, &UP, &UPmini, &trigs, &coinLive, &vetoIdx,
-                        &nearSolid};
+                        &nearSolid, {FS.near.get(), FS.port.get(), FS.pad.get(), FS.orb.get(), FS.slope.get(), FS.speed.get()}, &LG.dyn};
         ppMark(0);
         // ---- phase 1: STEP every state of this group (parallel) -------------
         // Stepping is pure -- it reads the shared windows and writes only its
@@ -6401,7 +6435,8 @@ inline int cliMainOnce(int argc, char** argv) {
             // ...and not when the input rule has just forbidden the release: then the held child
             // is the only one left.
             if (input == 1 && s.mode == 0 && !s.grounded && orbsEmpty
-                && !s.dashing && !(s.dual && s.dashing2)   // --dualdash
+                // A remote partner has its own rings and input-sensitive mode.
+                && !s.dashing && !(s.dual && (s.dashing2 || s.xAbs2 != s.xAbs))
                 && !nearPressBox(s) && !g_airPress
                 && !(edgeLocked && s.action == 1))
                 return;
@@ -8231,7 +8266,7 @@ inline int cliMainOnce(int argc, char** argv) {
         // the tick, so a later reader (--rejoinuse) can tell the walk's deaths from its corpse
         // rows -- the walk runs on through a kill, and y/vy alone do not say where it fired.
         tr << "tick,x,y,vy,mode,grounded,dual,y2,vy2,flip2,act,flip,frame"
-              ",rotspent,rotchan,rotrev,dead,key,key_fields\n";
+              ",rotspent,rotchan,rotrev,dead,key,key_fields,x2\n";
         std::ofstream sn;
         if (!snapLogPath.empty()) {
             sn.open(snapLogPath);
@@ -8353,7 +8388,8 @@ inline int cliMainOnce(int argc, char** argv) {
             std::vector<const Obj*> rnSolid;   // --solidorder: rn in GD's solid order, once per tick
             solidOrderInto(rn, rnSolid);
             const StepCtx K{x, xPrevR, rDxUsed, t, &rn, &rp, &rd, &ro, &rs, &rv, &SP, &SPmini, &UP, &UPmini, &rt,
-                            nullptr, nullptr, &rnSolid};
+                            nullptr, nullptr, &rnSolid,
+                            {sl.get(), pl.get(), dl.get(), ol.get(), sls.get(), vl.get()}, &rLf->dyn};
             bool rdead = false;
             const bool rPrevGrounded = (s.grounded != 0);
             const double rPrevY = (double)s.y;
@@ -8426,7 +8462,7 @@ inline int cliMainOnce(int argc, char** argv) {
                << ',' << s.rotSpent << ',' << (int)s.rotChan
                << ',' << (unsigned)s.rotRev << ',' << (rdead ? 1 : 0)
                << ',' << (unsigned long long)SearchKeyHash{}(traceKey)
-               << ',' << keyText(traceKey) << "\n";
+               << ',' << keyText(traceKey) << ',' << s.xAbs2 << "\n";
             // --rejoinuse: past the join the walk must retrace the old plan's walk -- the same
             // fields on every tick the old trace has, and no kill it did not have. The first tick
             // it does not is the join failing its own premise (repair.hpp refuses the join).

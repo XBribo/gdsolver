@@ -557,6 +557,224 @@ static void groupsParser() {
           "a copied parse iterates as the parse does, and so does an overlay laid over it");
 }
 
+// World-axis teleport settings must survive all four gameplay frames.
+void teleportTargets() {
+    dp::Obj entry{};
+    entry.id = 2902; entry.type = 28;
+    entry.cx = 100; entry.cy = 200;
+    entry.tpEntryDx = -3; entry.tpEntryDy = 7;
+    entry.tpEx = 1000; entry.tpEy = 400; entry.tpExitCount = 1;
+    for (int frame = 0; frame < 4; ++frame) {
+        bool ok = true;
+        for (int save = 0; save < 2; ++save)
+            for (int axes = 0; axes < 4; ++axes) {
+                dp::Obj p = entry;
+                p.tpSaveOffset = (uint8_t)save;
+                p.tpIgnoreX = (uint8_t)(axes & 1); p.tpIgnoreY = (uint8_t)(axes & 2);
+                dp::turnObj(p, frame);
+                double x, y, tx, ty, wx, wy;
+                dp::toFrame(frame, 105, 210, x, y);
+                dp::teleportTarget(p, frame, x, y, tx, ty);
+                dp::fromFrame(frame, tx, ty, wx, wy);
+                const double ex = (axes & 1) ? 105 : 1000 + (save ? 8 : 0);
+                const double ey = (axes & 2) ? 210 : 400 + (save ? 3 : 0);
+                ok = ok && wx == ex && wy == ey;
+            }
+        check(ok, "teleport offset and ignored axes use real entry/world coordinates in every frame");
+    }
+    double x, y;
+    entry.tpEx = 0; entry.tpEy = 0;
+    dp::teleportTarget(entry, 0, 105, 210, x, y);
+    check(x == 0 && y == 0, "an explicitly known exit at the origin is not a missing destination");
+    entry.tpExitCount = 0;
+    dp::teleportTarget(entry, 0, 105, 210, x, y);
+    check(x == 105 && y == 210, "a teleport with no exit does not move the body");
+    entry.id = 747; entry.tpExitCount = 1; entry.tpEx = 1000; entry.tpEy = 400;
+    dp::teleportTarget(entry, 0, 105, 210, x, y);
+    check(x == 105 && y == 400, "747 retains player X and resolves its linked exit Y");
+    entry.tpSaveOffset = 1;
+    dp::teleportTarget(entry, 0, 105, 210, x, y);
+    check(x == 113 && y == 403, "747 applies saveOffset after constructing its player-X target");
+    entry.tpSaveOffset = 0;
+    entry.tpExitCount = -1; entry.tpEx = 0; entry.tpEy = 0; entry.tpY = 275;
+    dp::teleportTarget(entry, 0, 105, 210, x, y);
+    check(x == 105 && y == 275, "old dumps retain their unlinked vertical target");
+}
+
+// Force arithmetic keeps GD's redirect precedence and boost semantics.
+void teleportForces() {
+    dp::Obj p{};
+    p.tpStaticForce = 1; p.tpForce = 20; p.tpForceAngle = 90;
+    float vy = -4;
+    uint8_t boost = 0;
+    dp::teleportForce(p, 0, vy, boost);
+    check(std::fabs(vy - 20) < 1e-5 && boost == 1, "static force overwrites velocity and raises boost");
+    p.tpForceAdditive = 1; vy = -4;
+    dp::teleportForce(p, 0, vy, boost);
+    check(std::fabs(vy - 16) < 1e-5, "additive force adds to incoming native velocity");
+    p.tpForce = 0; p.tpForceAdditive = 0; vy = 100; boost = 1;
+    dp::teleportForce(p, 0, vy, boost);
+    check(vy == 0 && boost == 0, "zero non-additive force clears velocity and boost");
+    p.tpForce = 20; p.tpForceAngle = 0; vy = 4;
+    dp::teleportForce(p, 1, vy, boost);
+    check(std::fabs(vy - 20) < 1e-5, "sideways gameplay swaps force components");
+    vy = 4;
+    dp::teleportForce(p, 3, vy, boost);
+    check(std::fabs(vy + 20) < 1e-5, "frame 3 mirrors native force into the solver axis");
+    p.tpRedirectForce = 1; p.tpForceAngle = 90; p.tpRedirectMod = 2;
+    p.tpRedirectMax = 6; vy = -4;
+    dp::teleportForce(p, 0, vy, boost);
+    check(std::fabs(vy - 6) < 1e-5, "redirect wins over static force and caps scaled magnitude");
+    p.tpRedirectMax = 0; p.tpRedirectMin = 3; vy = 0;
+    dp::teleportForce(p, 0, vy, boost);
+    check(std::fabs(vy - 3) < 1e-5, "zero-speed redirect uses its bearing and minimum");
+    p.tpRedirectMin = 10; p.tpRedirectMax = 6; vy = -4;
+    dp::teleportForce(p, 0, vy, boost);
+    check(std::fabs(vy - 6) < 1e-5, "redirect maximum takes precedence over minimum");
+}
+
+// New columns remain below the field bound and are resolved by name.
+void teleportColumns() {
+    dp::resetInvocationState();
+    const std::string tail = ",tpentryx,tpentryy,tpsave,tpexits,tpf,tpfv,tpfadd,tpangle,"
+                             "tpr,tprmod,tprmin,tprmax,tprdash";
+    std::vector<std::string> values(63, "0");
+    values[0] = "2902"; values[1] = "28";
+    values[2] = "100"; values[3] = "200"; values[4] = "10"; values[5] = "60";
+    values[7] = "42"; values[17] = "200"; values[34] = "1000"; values[35] = "400";
+    values[50] = "97"; values[51] = "207"; values[52] = "1"; values[53] = "1";
+    values[54] = "1"; values[55] = "20"; values[56] = "1"; values[57] = "90";
+    values[58] = "1"; values[59] = "2"; values[60] = "3"; values[61] = "6";
+    values[62] = "1";
+    // Serialize exactly the CSV field boundaries used by objrects.
+    auto row = [&]() {
+        std::string out;
+        for (const auto& value : values) out += (out.empty() ? "" : ",") + value;
+        return out + "\n";
+    };
+    std::istringstream in(std::string(kObjHeader) + tail + "\n" + row());
+    const dp::Level level = dp::loadLevelFrom(in);
+    check(level.portals.size() == 1, "new export columns retain the teleport portal");
+    if (!level.portals.empty()) {
+        const dp::Obj& p = level.portals[0];
+        check(p.tpEntryDx == -3 && p.tpEntryDy == 7 && p.tpSaveOffset && p.tpExitCount == 1
+            && p.tpStaticForce && p.tpForce == 20 && p.tpForceAdditive && p.tpForceAngle == 90
+            && p.tpRedirectForce && p.tpRedirectMod == 2 && p.tpRedirectMin == 3
+            && p.tpRedirectMax == 6 && p.tpRedirectDash && level.spatialTeleport,
+            "all geometry and force settings survive the complete export tail");
+    }
+    check(level.unsupported.find("redirects a dash") != std::string::npos,
+          "unmodelled dash redirection is reported rather than silently dropped");
+    values[62] = "0";
+    values[53] = "2";
+    std::istringstream random(std::string(kObjHeader) + tail + "\n" + row());
+    check(dp::loadLevelFrom(random).unsupported.find("random destinations") != std::string::npos,
+          "random multi-exit teleport is refused rather than choosing the first exit");
+    values[53] = "1";
+    std::string crowded = std::string(kObjHeader) + tail + "\n";
+    for (int i = 0; i <= dp::kGravPortalBits; ++i) {
+        values[7] = std::to_string(i + 1);
+        crowded += row();
+    }
+    std::istringstream over(crowded);
+    check(dp::loadLevelFrom(over).unsupported.find("independent activation bits") != std::string::npos,
+          "spatial levels cannot silently exceed their per-body portal activation capacity");
+    dp::resetInvocationState();
+}
+
+// A remote body's read-only query must neither move a group cursor nor lose wide rectangles.
+void independentWindows() {
+    std::vector<dp::Obj> objects(3);
+    objects[0].cx = 10; objects[0].hw = 1; objects[0].uid = 1;
+    objects[1].cx = 100; objects[1].hw = 1; objects[1].uid = 2;
+    objects[2].cx = 1000; objects[2].hw = 1000; objects[2].uid = 3;
+    dp::XSlice slice(objects);
+    slice.seekTo(2500);
+    const size_t cursor = slice.lo;
+    std::vector<int> found;
+    slice.forRangeAt(10, 10, [&](const dp::Obj& o) { found.push_back(o.uid); });
+    check(found == std::vector<int>({1, 3}) && slice.lo == cursor,
+          "separate windows find overlapping wide objects without changing the shared cursor");
+}
+
+// Exercise the same dual transition used by search, replay and witness reconstruction.
+void teleportDualStep() {
+    dp::resetInvocationState();
+    dp::Level level;
+    dp::Obj a{};
+    a.id = 2902; a.type = 28; a.uid = 10; a.gpBit = 0;
+    a.cx = 100; a.cy = 200; a.hw = 1; a.hh = 30;
+    a.tpEx = 1000; a.tpEy = 300; a.tpExitCount = 1;
+    dp::Obj b = a;
+    b.uid = 20; b.gpBit = 1; b.cx = 3017; b.cy = 400;
+    b.tpEx = 4000; b.tpEy = 500;
+    level.portals = {a, b};
+    dp::XSlice near(level.objs), ports(level.portals), pads(level.pads), orbs(level.orbs),
+               slopes(level.slopes), speeds(level.speeds);
+    std::vector<const dp::Obj*> empty, primary{&level.portals[0]};
+    const auto ship = gdapprox::ShipParams::normal(), shipMini = gdapprox::ShipParams::mini();
+    const auto ufo = gdapprox::UfoParams::normal(), ufoMini = gdapprox::UfoParams::mini();
+    dp::State s{};
+    s.xAbs = 83.5f; s.xAbs2 = 3000; s.y = 200; s.y2 = 400;
+    s.dual = 1; s.mode2 = 0; s.flip2 = 1; s.dx = 1.6f;
+    dp::StepCtx k{85.1, 83.5, 1.6f, 1, &empty, &primary, &empty, &empty, &empty, &empty,
+                  &ship, &shipMini, &ufo, &ufoMini};
+    k.slices = {&near, &ports, &pads, &orbs, &slopes, &speeds}; k.dyn = &level.dyn;
+    bool dead = false;
+    const dp::State c = dp::stepBoth(s, 0, k, dead);
+    check(!dead && c.xAbs == 1000 && c.xAbs2 == 4000 && c.y == 300 && c.y2 == 500,
+          "each separated dual body reaches its own teleport and retains its own exit X");
+    check(c.portalLatch.test(0) && c.portalLatch2.test(1),
+          "each body spends only its own teleport activation");
+    check(c.tpSkip == 1 && c.tpSkip2 == 1,
+          "each body's teleport arrival survives the dual merge");
+    dp::State swapped = c;
+    dp::swapHalves(swapped); dp::swapHalves(swapped);
+    check(swapped.xAbs == c.xAbs && swapped.xAbs2 == c.xAbs2,
+          "swapping dual bodies twice preserves both float positions exactly");
+    dp::State other = c; other.xAbs2 += 10;
+    const auto key = dp::keyOf(c, 1);
+    dp::SearchKey parsed;
+    check(key != dp::keyOf(other, 1) && dp::parseKeyText(dp::keyText(key), parsed) && parsed == key,
+          "full search keys distinguish independent secondary X and round-trip the new schema");
+    check(!dp::parseKeyText("v1:0", parsed), "legacy full keys cannot certify a new spatial state");
+    other = c; other.tpSkip2 = 0;
+    check(key != dp::keyOf(other, 1), "arrival history is part of physical search identity");
+    other = c; other.xAbs2 += 10;
+    dp::Fixup fix{};
+    fix.x = c.xAbs; fix.x2 = c.xAbs2; fix.y = c.y; fix.vy = c.vy;
+    fix.y2 = c.y2; fix.vy2 = c.vy2; fix.dual = 1;
+    fix.g = c.grounded; fix.flip = c.flip; fix.mode = c.mode; fix.mini = c.mini;
+    check(dp::fixupMatches(fix, c, 0) && !dp::fixupMatches(fix, other, 0),
+          "a learned transition cannot match another secondary position");
+    dp::Obj destination = a;
+    destination.uid = 30; destination.gpBit = 2;
+    destination.cx = 1000; destination.cy = 300;
+    destination.tpEx = 5000; destination.tpEy = 600;
+    level.portals.push_back(destination);
+    dp::XSlice destinationPorts(level.portals);
+    k.slices[1] = &destinationPorts;
+    primary = {&level.portals.back()};
+    k.t = 2; k.x = c.xAbs + c.dx; k.xPrev = c.xAbs;
+    const dp::State arrived = dp::stepBoth(c, 0, k, dead);
+    check(!dead && arrived.xAbs == 5000 && arrived.portalLatch.test(2),
+          "an unspent destination portal fires on the step after a spatial arrival");
+    dp::State spent = c;
+    spent.portalLatch.set(2);
+    const dp::State held = dp::stepBoth(spent, 0, k, dead);
+    check(held.xAbs != 5000 && held.tpSkip == 0 && held.tpSkip2 == 0,
+          "arrival cannot re-fire a spent portal and both one-tick flags expire");
+    level.portals.back().tpExitCount = 0;
+    const dp::State noExit = dp::stepBoth(c, 0, k, dead);
+    check(noExit.xAbs != 5000 && noExit.tpSkip == 1 && noExit.portalLatch.test(2),
+          "a portal without an exit still spends its activation and sets the native arrival byte");
+    const auto names = dp::histNamesFor(5);
+    check(std::string(names[9]) == "teleported" && std::string(names[10]) == "teleported2"
+          && dp::histNamesFor(4)[9] == nullptr,
+          "versioned history carries both arrival flags without changing older payloads");
+    dp::resetInvocationState();
+}
+
 // dptest --groups-corpus <file>...: the same comparison on real recordings.
 static int groupsCorpus(int argc, char** argv) {
     int bad = 0;
@@ -581,6 +799,11 @@ int main(int argc, char** argv) {
     activatorRoots();
     autoSwitches();
     keyHoldsDelayedSwitch();
+    teleportTargets();
+    teleportForces();
+    teleportColumns();
+    independentWindows();
+    teleportDualStep();
     std::printf(g_fail ? "FAILED\n" : "all ok\n");
     return g_fail;
 }

@@ -26,6 +26,15 @@ struct XSlice {
         }
         lo = a;
     }
+    // Independent body windows must not mutate the cursor shared by worker threads.
+    template <class F>
+    void forRangeAt(double x0, double x1, F&& f) const {
+        const auto first = std::lower_bound(v.begin(), v.end(), x0 - maxHw - 40.0,
+            [](const Obj& o, double x) { return o.cx < x; });
+        for (auto it = first; it != v.end() && it->cx <= x1 + maxHw + 40.0; ++it)
+            if (it->cx + it->hw + 40.0 >= x0 && it->cx - it->hw <= x1 + 40.0)
+                f(*it);
+    }
     // callers advance monotonically in x -- EXCEPT under reverse (State::rev),
     // where the travel coordinate DECREASES every tick. [2026-08-16]
     // The cursor only ever moved forward, so everything behind it became
@@ -371,11 +380,11 @@ struct State {
     // The channel being walked. Not derivable: it is whatever the last 2900
     // with `swarm` set pointed at.
     uint8_t rotChan = 0;
-    // --tpbandskip only (0 otherwise): a teleport fired on this tick, so the
+    // A teleport fired on this tick, so the
     // next tick's band clamps are skipped -- GD's player+0x560, set by
     // teleportPlayer (0x20fe02) and read-and-cleared at the head of
     // checkCollisions (0x21384e), which skips the band block while it is set.
-    // One tick of life; not carried by --start; a dual's two bodies share it.
+    // One tick of life, per body; carried by version-5 hist anchors.
     // (Here because rotChan leaves a byte of padding before rotRev.)
     uint8_t tpSkip = 0;
     // Per-channel reverse, one bit per channel. Also not derivable -- lv22's
@@ -1103,11 +1112,16 @@ struct State {
     // portal starts both at 0 (it is spawned upside down, in its own mode). Like flipT, not
     // carried by --start (255 = no grace). In the padding after dashing2, so sizeof is unchanged.
     uint8_t flipT2 = 255, modeT2 = 255;
+    // The second body's own teleport-arrival byte, in the padding before rot2.
+    uint8_t tpSkip2 = 0;
     float rot2 = 0.f, rotStep2 = 0.f;
     float dashSlope2 = 0.f;
     // Search-only route cost, not physical identity. The fixed prefix has the same cost
     // for every continuation, so an anchor starts at zero rather than needing a seed.
     uint32_t waveTurns = 0;
+    // p2 has its own position: teleportPlayer moves only the selected body.
+    // Seeded by the named position2 anchor; appended to preserve aggregate callers.
+    float xAbs2 = 0.f;
 };
 
 // THIS ASSERT IS A QUESTION, NOT A BUDGET. If you added a field and the build
@@ -1197,6 +1211,7 @@ struct State {
 // [2026-10-02] seatT2 (--dualseatt) landed in the padding after freeHalf: still 520. It accumulates
 // and is not seeded, as seatT is not.
 // [2026-10-04] 520 -> 528: waveTurns is search-only cost; an anchor's common prefix is omitted.
+// [2026-10-05] xAbs2 uses the tail padding (still 528); seeded by position2 and printed by seeddump.
 constexpr size_t kStateBytes =
     (528u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
           + (sizeof(TouchMask) - sizeof(uint32_t))

@@ -129,6 +129,9 @@ struct StepCtx {
     // --solidorder: `near` in GD's solid order (descending uid), built once where `near` is
     // built. Null elsewhere -- the collision loops then sort a copy themselves.
     const std::vector<const Obj*>* nearSolid = nullptr;
+    // Immutable static indexes plus the group's already-placed dynamic geometry.
+    std::array<const XSlice*, 6> slices{};
+    const Dynamics* dyn = nullptr;
 };
 
 // slopeVetoesSolid for the element `o` of K.near, through the group's index
@@ -1090,11 +1093,17 @@ inline int applyRotation(State& c, double uPrev, double dxUsed, long long t,
     const bool reTap = (input == 1 && c.mode == 6 && wasGrounded);
     if (reTap && havePrevY) YSET(c.y) = (float)sPrevY;
     double X, Y;
+    double X2 = 0.0, Y2 = 0.0;
+    if (c.dual) fromFrame(f0, c.xAbs2, c.y2, X2, Y2);
     fromFrame(f0, (double)c.xAbs, (double)c.y, X, Y);
     double nu, nv;
     toFrame(nf, X, Y, nu, nv);            // no origin correction is needed
     c.xAbs = (float)nu;
     YSET(c.y) = (float)nv;
+    if (c.dual) {
+        toFrame(nf, X2, Y2, nu, nv);
+        c.xAbs2 = (float)nu; c.y2 = (float)nv;
+    }
     // ---- vy hand-over [2026-08-19 settled -- replaces the whole old kRotCarry set] --
     // Cross-checking the disassembly of PlayerObject::rotateGameplay (0x399d50)
     // against lv22's raw level data (keys 169/582/583/584 of the 2900s) closed all
@@ -1795,7 +1804,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // matches GD on the 1st tick only and diverges from the 2nd.
     c.xAbs = advanceX(s.xAbs,
                       (float)(useDx * tScale * (s.rev ? -1.0 : 1.0)));
-    const double x = (double)c.xAbs, xPrev = (double)s.xAbs;
+    double x = (double)c.xAbs;
+    const double xPrev = (double)s.xAbs;
     // LOCKED-TO-PLAYER GEOMETRY. While the lock its box opened is still running,
     // whatever that box locked moves with the player, so the state carries how
     // far it has come since it punched the box -- which is this tick's advance
@@ -2131,6 +2141,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // --teleoldpos: ...and where it was before it moved -- c.y and the pass's yFree at the
     // teleport -- for the smaller-uid portals the pass judged first (see the gate in the portal pass).
     float teleFromY = 0.f, teleFromYFree = 0.f;
+    double teleFromX = 0.0;
     // ...and where it landed (the portal seat's previous edge under --tponce, see there).
     double teleLandY = 0.0;
     // The SPIDER's tap moves y discontinuously, and GD's collision pass never
@@ -12404,10 +12415,14 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // the old position) is the same rule: tested at the old position, it does not fire.
         const bool oldPosHere = pport == 1 && teleportedThisTick && p->uid < teleUid;
         struct OldPosGuard {
-            State& st; float& yf; bool on; float y, f;
-            ~OldPosGuard() { if (on) { st.y = y; yf = f; } }
-        } oldPosGuard{c, yFree, oldPosHere, c.y, yFree};
-        if (oldPosHere) { c.y = teleFromY; yFree = teleFromYFree; }
+            State& st; float& yf; double& px; bool on; float y, f, sx; double x;
+            // Restore both axes after an earlier-uid object's old-position test.
+            ~OldPosGuard() { if (on) { st.y = y; yf = f; st.xAbs = sx; px = x; } }
+        } oldPosGuard{c, yFree, x, oldPosHere, c.y, yFree, c.xAbs, x};
+        if (oldPosHere) {
+            c.y = teleFromY; yFree = teleFromYFree;
+            x = teleFromX; c.xAbs = (float)x;
+        }
         // only the size portal has the smaller contact half (pHalfSize note)
         // ...only rotated objects use "the current box" (pHalfLive note).
         // Axis-aligned ones keep the entry snapshot.
@@ -12511,7 +12526,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // that existed then. Custom level I t=4,870: p2, born at 4,869 at the spot p1 teleported from,
         // takes the teleport on its first step (p2y 228.616 -> 242.000); the gate held it back.
         const bool bornLastTick = s.portSeen[0] == -2;
-        if (p->type == 28 && !bornLastTick
+        if (p->type == 28 && !bornLastTick && !s.tpSkip
             && portalWasInsideAtPrev(*p, xPrev, (double)s.y, pHalfP, pRotHere))
             continue;
         // --tplatch: ...and the part it leaves open, a body that leaves the box and comes back.
@@ -12527,9 +12542,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         // family, the closed tpY formula for id 747 -- see Obj::tpEx/tpEy.
         // lv22's uid 6437 sits AT its own tpy (1905) and read as inert while
         // GD drops the player to its orange half at 645.000.
-        const double tpTarg = (p->type == 28 && p->id != 747
-                               && (p->tpEx != 0.0 || p->tpEy != 0.0))
-                                  ? p->tpEy : p->tpY;
+        double tpX = x, tpTarg = c.y;
+        if (p->type == 28) teleportTarget(*p, c.frame, x, c.y, tpX, tpTarg);
         const bool changes =
             (p->type == 23 || p->type == 24)
                 ? (c.dual != (uint8_t)(p->type == 23 ? 1 : 0))
@@ -12537,8 +12551,10 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // target AND its gravity mode asks for nothing new (teleportPlayer
             // itself has no inertness check -- it always moves and applies
             // m_gravityMode, so "inert" is only ever true when both halves are)
-            : (p->type == 28) ? (std::fabs((double)c.y - tpTarg) > 0.01
+            : (p->type == 28) ? (std::fabs(x - tpX) > 0.01
+                                 || std::fabs((double)c.y - tpTarg) > 0.01
                                  || (p->tpGrav == 3)
+                                 || p->tpStaticForce || p->tpRedirectForce
                                  || (p->tpGrav == 1 && gdUpOf(c) != 0)
                                  || (p->tpGrav == 2 && gdUpOf(c) == 0))
             // Gravity portals state GD's `upsideDown`, which is NOT the model's
@@ -12826,6 +12842,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
         if (p->type == 28) {
             // --tplatch: teleportPlayer marks the portal whether or not it moves anything.
             if (p->gpBit >= 0) c.portalLatch.set(p->gpBit);
+            c.tpSkip = 1;   // teleportPlayer sets this even without a destination.
             if (!changes) continue;   // already at the target
             // The destination's PADS and ORBS do not fire on the arrival tick.
             // GD's checkCollisions has already run for this tick at the old
@@ -12839,11 +12856,13 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             // is the dangerous direction, and no measurement covers it.
             const double vIn = (double)c.vy;   // for `telefire` below
             teleportedThisTick = true;
-            c.tpSkip = 1;   // State::tpSkip
             if (g_touchCensus) g_tcBranch |= 4;
             teleUid = p->uid;      // uid-order gate (measured, see teleUid's decl.)
             teleFromY = c.y;       // --teleoldpos
             teleFromYFree = yFree;
+            teleFromX = x;
+            c.xAbs = (float)tpX;
+            x = (double)c.xAbs;
             YSET(c.y) = (float)tpTarg;   // exit half for 2902, closed tpY for 747
             teleLandY = (double)c.y;
             // A teleport is the one thing in the pass that MOVES the player for
@@ -12933,6 +12952,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 }
                 VYSET(c.vy) = (float)(gravChanged ? vTp * 0.5 : vTp);
             }
+            teleportForce(*p, c.frame, c.vy, c.boost);
             // `portfire` below CANNOT SEE THIS BRANCH -- it sits after the
             // `continue`, so every teleport is invisible to it while ordinary
             // portals print. Measured: an anchored lv22 run emits 39 portfire
@@ -13009,6 +13029,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 const uint8_t wantDual = (p->type == 23) ? 1 : 0;
                 if (c.dual == wantDual) continue;
                 if (wantDual) {
+                    c.xAbs2 = c.xAbs;
+                    c.tpSkip2 = 0;
                     c.y2 = yFree;
                     c.vy2 = -c.vy;
                     // born in whatever mode and size the first body is in right
@@ -16749,6 +16771,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
 // see different geometry, so nothing about the second can be derived from the
 // first once either of them touches anything.
 inline void swapHalves(State& s) {
+    std::swap(s.xAbs, s.xAbs2);
+    std::swap(s.tpSkip, s.tpSkip2);
     std::swap(s.y, s.y2);
     std::swap(s.vy, s.vy2);
     std::swap(s.slopeM, s.slopeM2);
@@ -16957,4 +16981,3 @@ inline void markTouched(State& c, const StepCtx& K, double preY, bool btnHeld) {
 }
 
 }  // namespace dp
-

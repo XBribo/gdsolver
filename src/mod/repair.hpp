@@ -64,7 +64,8 @@ struct AnchorRow {
     int flip = 0;            // m_isUpsideDown
     int mini = 0;            // vehicle size < 0.9 (a size portal has been passed)
     int dual = 0;
-    float y2 = 0.f, v2 = 0.f;
+    int teleported = 0, teleported2 = 0;   // per-player m_wasTeleported, hist version 5
+    float x2 = 0.f, y2 = 0.f, v2 = 0.f;
     // g2 / g2b are the SECOND body's two contact flags, kept raw exactly like p1's pair above
     // and filtered by groundedOf2() where the anchor is built.
     int f2 = 0, g2 = 0, g2b = 0;
@@ -277,7 +278,10 @@ inline void record(GJBaseGameLayer* l, long long t) {
     r.flip = p->m_isUpsideDown ? 1 : 0;
     r.mini = (p->m_vehicleSize < 0.9f) ? 1 : 0;
     r.dual = l->m_gameState.m_isDualMode ? 1 : 0;
+    r.teleported = p->m_wasTeleported ? 1 : 0;
+    r.teleported2 = (r.dual && l->m_player2 && l->m_player2->m_wasTeleported) ? 1 : 0;
     r.y2 = (r.dual && l->m_player2) ? l->m_player2->getPositionY() : 0.f;
+    r.x2 = (r.dual && l->m_player2) ? l->m_player2->getPositionX() : 0.f;
     r.v2 = (r.dual && l->m_player2) ? (float)l->m_player2->m_yVelocity : 0.f;
     r.f2 = (r.dual && l->m_player2 && l->m_player2->m_isUpsideDown) ? 1 : 0;
     r.g2 = (r.dual && l->m_player2 && l->m_player2->m_isOnGround) ? 1 : 0;
@@ -2864,6 +2868,8 @@ inline std::string portalPayload(long long t0) {
 //   slopeAge     (+0xaa0 - +0x598) in ticks, rounded, 0..255; -1 off a ramp
 //   slopeLanded  1 if a row since the ride's clock was stamped is grounded (groundedOf,
 //                the anchor's own test); -1 off a ramp
+// Version 5 also carries each body's m_wasTeleported (+0x560); disabled histRide
+// leaves all slope fields at -1 rather than inventing a ride.
 // The values are GD's, not the model's: which field an age goes into, and how the
 // clock's phase lines up with the model's counters, is decided in one place, dp's.
 inline std::string histPayload(long long t0) {
@@ -2875,15 +2881,14 @@ inline std::string histPayload(long long t0) {
     // the clock (none written this attempt) says nothing, and -1 leaves dp's default.
     const double since = r->totalTime - r->spiderStamp;
     const long long age = (since >= 0.0) ? std::llround(since * 240.0) : -1;
-    std::string s = std::string("owns=hist;hist=") + (g_cfg.histRide ? "4|9" : "3|4")
+    std::string s = std::string("owns=hist;hist=5|11")
          + "|pressSpent:" + std::to_string(ps)
          + ",pressSpent2:" + std::to_string(ps2)
          + ",freeMode:" + std::to_string(r->freeMode)
          + ",spiderJumpT:" + std::to_string(std::min<long long>(age, 255));
-    if (!g_cfg.histRide) return s;
     long long slopeAge = -1;
     int landed = -1;
-    if (r->onSlope) {
+    if (g_cfg.histRide && r->onSlope) {
         const double rs = r->totalTime - r->slopeStart;
         slopeAge = std::clamp<long long>(std::llround(rs * 240.0), 0, 255);
         // The ride's rows are the ones carrying its stamp: +0x598 is written only on the
@@ -2897,11 +2902,13 @@ inline std::string histPayload(long long t0) {
             if (groundedOf(*q)) { landed = 1; break; }
         }
     }
-    return s + ",slopeOn:" + std::to_string(r->onSlope)
-         + ",slopeUnder:" + std::to_string(r->slopeUnder)
-         + ",slopeUid:" + std::to_string(r->slopeUid)
+    return s + ",slopeOn:" + std::to_string(g_cfg.histRide ? r->onSlope : -1)
+         + ",slopeUnder:" + std::to_string(g_cfg.histRide ? r->slopeUnder : -1)
+         + ",slopeUid:" + std::to_string(g_cfg.histRide ? r->slopeUid : -1)
          + ",slopeAge:" + std::to_string(slopeAge)
-         + ",slopeLanded:" + std::to_string(landed);
+         + ",slopeLanded:" + std::to_string(landed)
+         + ",teleported:" + std::to_string(r->teleported)
+         + ",teleported2:" + std::to_string(r->teleported2);
 }
 
 // The payloads joined, so a call site asks once. Any part may be absent; `owns`
@@ -2915,6 +2922,8 @@ inline std::string anchorPayloadAll(long long t0) {
     add(g_cfg.touchPayload ? anchorPayload(t0) : std::string());
     add(g_cfg.portalPayload ? portalPayload(t0) : std::string());
     add(histPayload(t0));
+    if (const AnchorRow* r = anchors::row(t0); r && r->dual)
+        add("position2=" + num(r->x2) + "," + num(r->y2));
     return out;
 }
 
@@ -2980,7 +2989,7 @@ inline int g_fixupNoop = 0;
 // One row of the model's own trace: tick,x,y,vy,mode,grounded,dual,y2,vy2,flip2,act
 struct TraceRow {
     bool valid = false;
-    double x = 0, y = 0, vy = 0, y2 = 0, vy2 = 0;
+    double x = 0, y = 0, vy = 0, y2 = 0, vy2 = 0, x2 = 0;
     int mode = 0, grounded = 0, dual = 0, act = -1;
     // The MODEL's own flip and mini (trace columns 24 and 16; -1 = an old
     // trace without them). The fixup key must be built from these, not from
@@ -3168,6 +3177,7 @@ inline bool loadTrace(const std::string& path, std::map<long long, TraceRow>& ou
         r.classOk = (c.size() > maxClass);
         const long long t = (long long)num(c, "tick");
         r.x = num(c, "x");
+        r.x2 = num(c, "x2", r.x);
         r.y = num(c, "y");
         r.vy = num(c, "vy");
         r.mode = integer(c, "mode");
@@ -3203,7 +3213,7 @@ inline bool loadTrace(const std::string& path, std::map<long long, TraceRow>& ou
 // Everything the solver matches a record on (dp/fixup.hpp, fixupMatches). Kept as one struct so
 // that "would the solver treat these two as the same transition" is asked in one place.
 struct FixupKey {
-    double x = 0, y = 0, vy = 0, y2 = 0, vy2 = 0;
+    double x = 0, y = 0, vy = 0, y2 = 0, vy2 = 0, x2 = 0;
     int in = 0, mode = 0, mini = 0, flip = 0, g = 0, kill = 0, dual = 0;
 };
 
@@ -3220,6 +3230,9 @@ inline bool parseFixupKey(const std::string& line, FixupKey& k,
                     &dy, &dvy, &g2, &k.kill) < 12)
         return false;
     if (dyOut) *dyOut = dy;
+    k.x2 = k.x;
+    if (const size_t px = line.find(",x2="); px != std::string::npos)
+        std::sscanf(line.c_str() + px, ",x2=%lf", &k.x2);
     if (dvOut) *dvOut = dvy;
     const size_t p = line.find(",dual2=");
     if (p != std::string::npos) {
@@ -3247,7 +3260,8 @@ inline bool sameTransition(const FixupKey& a, const FixupKey& b) {
     if (std::fabs(a.x - b.x) > 1.2 || std::fabs(a.y - b.y) > 4.0
         || std::fabs(a.vy - b.vy) > 1.0)
         return false;
-    if (a.dual && (std::fabs(a.y2 - b.y2) > 4.0 || std::fabs(a.vy2 - b.vy2) > 1.0))
+    if (a.dual && (std::fabs(a.x2 - b.x2) > 1.2
+        || std::fabs(a.y2 - b.y2) > 4.0 || std::fabs(a.vy2 - b.vy2) > 1.0))
         return false;
     return true;
 }
@@ -3429,6 +3443,7 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
     key.kill = kill;
     key.dual = dual ? 1 : 0;
     key.y2 = mPrev->second.y2;
+    key.x2 = mPrev->second.x2;
     key.vy2 = mPrev->second.vy2;
     // ...and "covered" is refined by the solver's own answer, the only side that can see the
     // gate: covered by a record the solver keeps back is a model wall. It REPLACES FixupOnFile
@@ -3443,10 +3458,10 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
     if (dual) {
         // The second body's own before-state and GD's own deltas for it. Named tail, so a
         // reader that predates duals sees a record it understands and treats as single-body.
-        snprintf(dual2, sizeof(dual2), ",dual2=%.4f,%.4f,%.4f,%.4f,%d",
+        snprintf(dual2, sizeof(dual2), ",dual2=%.4f,%.4f,%.4f,%.4f,%d,x2=%.4f",
                  mPrev->second.y2, mPrev->second.vy2,
                  gCur ? gCur->y2 - gPrev->y2 : 0.0, gCur ? gCur->v2 - gPrev->v2 : 0.0,
-                 (flying || !gCur) ? 255 : (gCur->g2 ? 1 : 0));
+                 (flying || !gCur) ? 255 : (gCur->g2 ? 1 : 0), mPrev->second.x2);
     }
     char line[700];
     snprintf(line, sizeof(line),
@@ -3906,6 +3921,7 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
             r.grounded = groundedOf(*a);
             r.dual = a->dual;
             r.y2 = a->y2;
+            r.x2 = a->x2;
             r.vy2 = a->v2;
             r.act = -1;    // no transition ENDS at t0, so no input is attributed to it
             // model == GD at t0 by construction, so GD's flags stand in for the
@@ -3941,12 +3957,15 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
         const bool pair = (it->second.dual != 0 && gr->dual != 0);
         const double dy2 = pair ? it->second.y2 - gr->y2 : 0.0;
         const double dv2 = pair ? it->second.vy2 - gr->v2 : 0.0;
+        const double dx2 = pair ? it->second.x2 - gr->x2 : 0.0;
         if (std::fabs(dy) <= kDivergeEps && std::fabs(dv) <= kDivergeEps
-            && std::fabs(dy2) <= kDivergeEps && std::fabs(dv2) <= kDivergeEps) continue;
-        if (std::fabs(it->second.x - gr->x) > kForkX) {
+            && std::fabs(dy2) <= kDivergeEps && std::fabs(dv2) <= kDivergeEps
+            && std::fabs(it->second.x - gr->x) <= kForkX && std::fabs(dx2) <= kForkX) continue;
+        if (std::fabs(it->second.x - gr->x) > kForkX || std::fabs(dx2) > kForkX) {
             char b[200];
             snprintf(b, sizeof(b), "dpsolve:   [fixup] t=%lld is an x fork (%.1f px) - "
-                     "not a transition a delta can carry", t, it->second.x - gr->x);
+                     "not a transition a delta can carry", t,
+                     std::fabs(dx2) > kForkX ? dx2 : it->second.x - gr->x);
             writeResult(b);
             return made;
         }
@@ -4021,7 +4040,8 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
                 gapY2 = std::fabs(mp->second.y2 - gp->y2);
                 gapVy2 = std::fabs(mp->second.vy2 - gp->v2);
                 if (agreedAtDeath)
-                    agreedAtDeath = gapY2 <= kDivergeEps && gapVy2 <= kDivergeEps;
+                    agreedAtDeath = gapY2 <= kDivergeEps && gapVy2 <= kDivergeEps
+                        && std::fabs(mp->second.x2 - gp->x2) <= kForkX;
             }
         }
     }

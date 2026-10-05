@@ -304,8 +304,7 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
     //   value, not an offset). tpg=m_gravityMode (1=force normal 2=force flipped
     //   3=toggle 0=unchanged), tpix/tpiy=m_ignoreX/Y. Fires on a plain rect
     //   overlap; vy/x are unchanged.
-    //   m_saveOffset (prop 351) is not emitted (leveldp warns if a level using
-    //   it shows up)
+    //   m_saveOffset (prop 351) and the real entry point are emitted below.
     //   [2026-08-18 correction] The closed form for tpy is for id 747 ONLY.
     //   When m_orangePortal (portal+0x748) is linked, teleportPlayer overwrites
     //   m_teleportYOffset on the spot with "exit.y − entry.y" (0x20fe44), and
@@ -368,7 +367,8 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
     //   it is read at a literal offset, as the field probe in hooks_player.cpp
     //   already does.
           "editvel,vmodx,vmody,ovrvel,force,free,touch,spawn,chan,axis,exstat,rev,"
-          "nocol\n";
+          "nocol,tpentryx,tpentryy,tpsave,tpexits,"
+          "tpf,tpfv,tpfadd,tpangle,tpr,tprmod,tprmin,tprmax,tprdash\n";
     // PlayLayer's anti-cheat spike (id 8, created last, at 0,105) sits in m_objects but never
     // collides: GD only hands it to destroyPlayer as a check (hooks_playlayer.cpp). Written out,
     // the model read it as a hazard on the spawn point and a ship or ball start died on tick 2
@@ -389,13 +389,29 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
         }
         double tpy = 0.0, tpex = 0.0, tpey = 0.0;
         int tpg = 0, tpix = 0, tpiy = 0;
+        double tpentryx = 0.0, tpentryy = 0.0;
+        int tpsave = 0, tpexits = 0;
+        int tpf = 0, tpfadd = 0, tpr = 0, tprdash = 0;
+        float tpfv = 0.f, tpangle = 0.f, tprmod = 1.f, tprmin = 0.f, tprmax = 0.f;
         if ((int)obj->m_objectType == 28) {
             auto* tp = static_cast<TeleportPortalObject*>(obj);
+            const auto entry = obj->getRealPosition();
+            tpentryx = entry.x; tpentryy = entry.y;
+            tpsave = tp->m_saveOffset ? 1 : 0;
+            tpf = tp->m_staticForceEnabled ? 1 : 0;
+            tpfv = tp->m_staticForce;
+            tpfadd = tp->m_staticForceAdditive ? 1 : 0;
+            tpr = tp->m_redirectForceEnabled ? 1 : 0;
+            tprmod = tp->m_redirectForceMod;
+            tprmin = tp->m_redirectForceMin; tprmax = tp->m_redirectForceMax;
+            tprdash = tp->m_redirectDash ? 1 : 0;
+            GameObject* exitObject = tp->m_orangePortal;
             tpy = obj->getRealPosition().y + tp->m_teleportYOffset;
             tpg = tp->m_gravityMode;
             tpix = tp->m_ignoreX ? 1 : 0;
             tpiy = tp->m_ignoreY ? 1 : 0;
             if (tp->m_orangePortal) {
+                tpexits = 1;
                 auto ep = tp->m_orangePortal->getRealPosition();
                 tpex = ep.x;
                 tpey = ep.y;
@@ -408,8 +424,10 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
                 // decorations uid 6435/6436).
                 auto* grp = l->getGroup(tp->m_targetGroupID);
                 const int n = grp ? (int)grp->count() : 0;
+                tpexits = n;
                 if (n >= 1) {
                     auto* ex = static_cast<GameObject*>(grp->objectAtIndex(0));
+                    exitObject = ex;
                     auto ep = ex->getRealPosition();
                     tpex = ep.x;
                     tpey = ep.y;
@@ -419,6 +437,13 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
                               "members (random exit - NOT deterministic)",
                               obj->m_uniqueID, tp->m_targetGroupID, n);
             }
+            // Native vtable+0x4e8 is isFlipX (0x1981a0), not isFacingDown.
+            GameObject* bearing = exitObject ? exitObject : obj;
+            const int eid = bearing->m_objectID;
+            const float base = !exitObject ? 0.f
+                : (eid == 38 || eid == 747 || eid == 749 || eid == 2064 || eid == 2902)
+                    ? 180.f : 90.f;
+            tpangle = base - bearing->getRotation() + (bearing->isFlipX() ? 180.f : 0.f);
         }
         double tw = 0.0;
         if (obj->m_objectID == 1935)
@@ -534,6 +559,9 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
            << "," << freem << "," << touch << "," << spawn << "," << chan
            << "," << axis << "," << exstat << "," << rev
            << "," << (int)(unsigned char)reinterpret_cast<const char*>(obj)[gdoff::kObjPassable]
+           << "," << tpentryx << "," << tpentryy << "," << tpsave << "," << tpexits
+           << "," << tpf << "," << tpfv << "," << tpfadd << "," << tpangle
+           << "," << tpr << "," << tprmod << "," << tprmin << "," << tprmax << "," << tprdash
            << "\n";
     }
 }

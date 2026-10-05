@@ -123,6 +123,17 @@ struct Obj {
     // 1905.000, exactly its unexported orange half. 0,0 = column absent or no
     // linked exit (old dumps); the teleport block falls back to tpY and warns.
     double tpEx = 0.0, tpEy = 0.0;
+    // Entry's real-position offset from the hitbox centre, in this frame.
+    double tpEntryDx = 0.0, tpEntryDy = 0.0;
+    // Original world target for an unlinked 747; tpY is the legacy framed value.
+    double tpWorldY = 0.0;
+    uint8_t tpIgnoreX = 0, tpIgnoreY = 0, tpSaveOffset = 0;
+    // -1 = legacy dump; 0 = no destination; >1 = random, still unsupported.
+    int tpExitCount = -1;
+    // teleportPlayer uses the exit's bearing (entry bearing if no exit exists).
+    float tpForceAngle = 0.f, tpForce = 0.f;
+    float tpRedirectMod = 1.f, tpRedirectMin = 0.f, tpRedirectMax = 0.f;
+    uint8_t tpStaticForce = 0, tpForceAdditive = 0, tpRedirectForce = 0, tpRedirectDash = 0;
     // getFlipY(). Used only for the blue (gravity) pad's gate -- see
     // objFacingDown(). objrects' 31st column (flipy). Falls back to 0 in an old
     // export that lacks the column.

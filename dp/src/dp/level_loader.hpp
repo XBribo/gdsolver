@@ -312,6 +312,9 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
     // old behaviour instead of silently reading a neighbour.
     int colFree = -1, colTouch = -1, colSpawn = -1, colChan = -1;
     int colAxis = -1, colExStat = -1, colRev = -1, colNoCol = -1;
+    int colTpEntryX = -1, colTpEntryY = -1, colTpSave = -1, colTpExits = -1;
+    int colTpForce = -1, colTpForceV = -1, colTpForceAdd = -1, colTpAngle = -1;
+    int colTpRedirect = -1, colTpMod = -1, colTpMin = -1, colTpMax = -1, colTpDash = -1;
     {
         std::stringstream hs(line);
         std::string name;
@@ -327,6 +330,19 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             else if (name == "exstat") colExStat = i;
             else if (name == "rev") colRev = i;
             else if (name == "nocol") colNoCol = i;
+            else if (name == "tpentryx") colTpEntryX = i;
+            else if (name == "tpentryy") colTpEntryY = i;
+            else if (name == "tpsave") colTpSave = i;
+            else if (name == "tpexits") colTpExits = i;
+            else if (name == "tpf") colTpForce = i;
+            else if (name == "tpfv") colTpForceV = i;
+            else if (name == "tpfadd") colTpForceAdd = i;
+            else if (name == "tpangle") colTpAngle = i;
+            else if (name == "tpr") colTpRedirect = i;
+            else if (name == "tprmod") colTpMod = i;
+            else if (name == "tprmin") colTpMin = i;
+            else if (name == "tprmax") colTpMax = i;
+            else if (name == "tprdash") colTpDash = i;
         }
     }
     // Counted per load, not per invocation: loadLevelFrom runs again for each
@@ -1323,25 +1339,43 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             o.tpGrav = f[18].empty() ? 0 : (uint8_t)std::atoi(f[18].c_str());
             o.tpEx = f[34].empty() ? 0.0 : std::atof(f[34].c_str());
             o.tpEy = f[35].empty() ? 0.0 : std::atof(f[35].c_str());
-            const bool igx = (!f[19].empty() && std::atoi(f[19].c_str()));
-            const bool igy = (!f[20].empty() && std::atoi(f[20].c_str()));
-            // m_ignoreX keeps the PLAYER's x -- which is what this model does
-            // for every teleport anyway (x is the DP's clock), so it IS
-            // modelled now. The two remaining inexpressible shapes stay loud:
-            // an x-moving exit (non-747, exit x away from the portal, ignoreX
-            // off) and m_ignoreY (keep player y).
-            if (o.id != 747 && (o.tpEx != 0.0 || o.tpEy != 0.0)
-                && !igx && std::fabs(o.tpEx - o.cx) > 0.5)
-                loadPrintf("teleport: uid %d at (%.0f,%.0f) moves x to %.0f "
-                           "- NOT modelled\n", o.uid, o.cx, o.cy, o.tpEx);
-            if (igy)
-                loadPrintf("teleport: uid %d at (%.0f,%.0f) uses ignoreY "
-                           "- NOT modelled\n", o.uid, o.cx, o.cy);
+            o.tpWorldY = o.tpY;
+            o.tpIgnoreX = (!f[19].empty() && std::atoi(f[19].c_str()));
+            o.tpIgnoreY = (!f[20].empty() && std::atoi(f[20].c_str()));
+            if (colTpEntryX >= 0 && colTpEntryX < kObjFields)
+                o.tpEntryDx = std::atof(f[colTpEntryX].c_str()) - o.cx;
+            if (colTpEntryY >= 0 && colTpEntryY < kObjFields)
+                o.tpEntryDy = std::atof(f[colTpEntryY].c_str()) - o.cy;
+            if (colTpSave >= 0 && colTpSave < kObjFields)
+                o.tpSaveOffset = (uint8_t)(std::atoi(f[colTpSave].c_str()) != 0);
+            if (colTpExits >= 0 && colTpExits < kObjFields)
+                o.tpExitCount = std::atoi(f[colTpExits].c_str());
+            auto tpValue = [&](int col, float fallback) {
+                return col >= 0 && col < kObjFields && !f[col].empty()
+                    ? (float)std::atof(f[col].c_str()) : fallback;
+            };
+            o.tpStaticForce = (uint8_t)(tpValue(colTpForce, 0.f) != 0.f);
+            o.tpForce = tpValue(colTpForceV, 0.f);
+            o.tpForceAdditive = (uint8_t)(tpValue(colTpForceAdd, 0.f) != 0.f);
+            o.tpForceAngle = tpValue(colTpAngle, 0.f);
+            o.tpRedirectForce = (uint8_t)(tpValue(colTpRedirect, 0.f) != 0.f);
+            o.tpRedirectMod = tpValue(colTpMod, 1.f);
+            o.tpRedirectMin = tpValue(colTpMin, 0.f);
+            o.tpRedirectMax = tpValue(colTpMax, 0.f);
+            o.tpRedirectDash = (uint8_t)(tpValue(colTpDash, 0.f) != 0.f);
+            if (o.tpExitCount > 1)
+                L.unsupported = "teleport uid " + std::to_string(o.uid)
+                    + " has random destinations";
+            if (o.tpRedirectDash)
+                L.unsupported = "teleport uid " + std::to_string(o.uid)
+                    + " redirects a dash (not modelled)";
+            L.spatialTeleport = L.spatialTeleport
+                || ((!o.tpIgnoreX && o.id != 747) || o.tpSaveOffset);
             // A non-747 teleport resolves its target from the linked exit half
             // (m_orangePortal), NOT the tpy closed formula -- an old dump
             // without the tpex/tpey columns plans against a target measured
             // wrong on lv22 (705 saved vs 1905 real). Refresh objrects.
-            if (o.id != 747 && o.tpEx == 0.0 && o.tpEy == 0.0)
+            if (o.id != 747 && o.tpExitCount < 0 && o.tpEx == 0.0 && o.tpEy == 0.0)
                 loadPrintf("teleport: uid %d id %d at (%.0f,%.0f) has NO exit "
                            "columns (old objrects dump) - target unreliable, "
                            "refresh objrects\n", o.uid, o.id, o.cx, o.cy);
@@ -2030,6 +2064,13 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             bool anyRev = false;
             for (const Obj& o : L.objs) anyRev = anyRev || o.rev;
             for (const Obj& o : L.portals) anyRev = anyRev || o.rev;
+            // A position jump can revisit a spent portal even without reversal.
+            for (const Obj& o : L.portals)
+                anyRev = anyRev || (o.type == 28
+                    && ((o.id != 747 && !o.tpIgnoreX) || o.tpSaveOffset));
+            for (const Obj& o : L.dyn.objs)
+                anyRev = anyRev || (o.type == 28
+                    && ((o.id != 747 && !o.tpIgnoreX) || o.tpSaveOffset));
             for (const Obj& o : L.orbs) anyRev = anyRev || o.rev;
             for (const Obj& o : L.pads) anyRev = anyRev || o.rev;
             std::vector<Obj*> grav;
@@ -2074,6 +2115,10 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
                 }
             loadPrintf("tplatch: %d of %d teleport portals latched (bits %d..%d)\n", nTp, nTpAll,
                        nGrav, next - 1);
+            if (L.spatialTeleport && nTp < nTpAll)
+                L.unsupported = "spatial teleports need independent activation bits: "
+                                + std::to_string(nTpAll) + " portals, "
+                                + std::to_string(nTp) + " bits available";
         }
         // --slopedbg: the uid -> bit map. Nothing else can report it, and
         // without it a portalLatch mask is unreadable from outside: rebuilding
