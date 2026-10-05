@@ -1,5 +1,6 @@
 #pragma once
 #include "dp/groups.hpp"
+#include "dp/items.hpp"
 #include <tuple>
 
 namespace dp {
@@ -114,6 +115,7 @@ struct TouchTrig {
     // goes to the ring, so the grounded jump or tap it would have made does not happen
     // (step.hpp, `ringTookPress`).
     bool spawnRing = false;
+    int itemNode = -1;   // Item program's press source, separate from geometry's controls
     // ---- a COUNT trigger rather than a box (1611 / 1811) ------------------
     // Same chain, same bit, same fire tick -- only the firing CONDITION
     // differs: not "the player entered this rect" but "the item counter has
@@ -245,6 +247,13 @@ struct PressWin {
     int bit;
 };
 inline std::vector<PressWin> g_pressWin;
+// Numeric rings are admitted after geometry, so their input-sensitive windows need rebuilding.
+inline void buildPressWindows() {
+    g_pressWin.clear();
+    for (size_t b = 0; b < g_touch.size(); ++b) if (g_touch[b].press)
+        g_pressWin.push_back({g_touch[b].cx - g_touch[b].hw - 35.0,
+                             g_touch[b].cx + g_touch[b].hw + 15.0, (int)b});
+}
 // ...and the bits of every ACTIVATOR box (TouchTrig::activator: a pickup or a toggle block that
 // switches its group on). Under --coins the alive cap's water-fill treats "which of these has
 // fired" as a class of its own (cli.hpp classOf), the same way it treats the collected coins: the
@@ -569,6 +578,14 @@ struct TrigRow {
     // A toggle ring's (1594) m_isSpawnOnly, the 59th column: 1 = pressing it SPAWNS the
     // target group rather than toggling it. 0 on everything else and on dumps that predate it.
     int sponly = 0;
+    double tolerance = 0.0;
+    int round1 = 0, round2 = 0, sign1 = 0, sign2 = 0, targetMode = 1;
+    bool itemCols = false, timerCols = false, globalsCols = false;
+    double timerStart = 0.0, timerTarget = 0.0, levelTime = 0.0;
+    float timerRate = 1.f;
+    int timerControl = 0, points = 0, attempts = 1;
+    bool timerStop = false, timerKeep = false, timerIgnore = false;
+    bool timerPaused = false, timerMulti = false;
 };
 
 
@@ -617,6 +634,12 @@ inline bool loadTrigRows(const std::string& path,
     if (!in) return false;
     std::string line;
     std::getline(in, line);   // header
+    std::unordered_map<std::string, size_t> columns;
+    {
+        std::stringstream header(line);
+        std::string column;
+        while (std::getline(header, column, ',')) columns.emplace(column, columns.size());
+    }
     while (std::getline(in, line)) {
         TrigRow r{};
         const int n = std::sscanf(
@@ -736,8 +759,41 @@ inline bool loadTrigRows(const std::string& path,
                     r.res1 = r1;
                     r.res2 = r2;
                     r.res3 = r3;
+                    r.targetMode = tm;
                 }
             }
+        }
+        {
+            std::vector<std::string> fields;
+            std::stringstream row(line);
+            std::string field;
+            while (std::getline(row, field, ',')) fields.push_back(field);
+            auto number = [&](const char* name, double fallback = 0.0) {
+                const auto c = columns.find(name);
+                return c != columns.end() && c->second < fields.size()
+                    ? std::atof(fields[c->second].c_str()) : fallback;
+            };
+            auto complete = [&](std::initializer_list<const char*> names) {
+                for (const char* name : names) {
+                    const auto col = columns.find(name);
+                    if (col == columns.end() || col->second >= fields.size() || fields[col->second].empty()) return false;
+                }
+                return true;
+            };
+            r.itemCols = complete({"tol", "rnd1", "rnd2", "sgn1", "sgn2", "tgtmode"});
+            r.tolerance = number("tol");
+            r.round1 = (int)number("rnd1"); r.round2 = (int)number("rnd2");
+            r.sign1 = (int)number("sgn1"); r.sign2 = (int)number("sgn2");
+            r.timerCols = complete({"tmstart", "tmtarget", "tmstop", "tmkeep", "tmignore",
+                "tmrate", "tmpaused", "tmmulti", "tmcontrol"});
+            r.timerStart = number("tmstart"); r.timerTarget = number("tmtarget");
+            r.timerStop = number("tmstop") != 0; r.timerKeep = number("tmkeep") != 0;
+            r.timerIgnore = number("tmignore") != 0; r.timerRate = (float)number("tmrate", 1);
+            r.timerPaused = number("tmpaused") != 0; r.timerMulti = number("tmmulti") != 0;
+            r.timerControl = (int)number("tmcontrol");
+            r.globalsCols = complete({"gattempts", "gpoints", "gtime"});
+            r.attempts = (int)number("gattempts", 1); r.points = (int)number("gpoints");
+            r.levelTime = number("gtime");
         }
         trig[r.uid] = r;
     }
@@ -818,7 +874,8 @@ inline void loadPlayerTriggers(Level& L, const std::string& trigPath,
     for (const auto& e : L.playerEffects) effects.emplace(e.teleport.uid, &e);
     std::vector<PlayerTriggerMeta> roots;
     for (const auto& p : L.playerSources)
-        if (!p.second.spawn || p.second.touch) roots.push_back(p.second);
+        if ((p.second.id == 1268 || p.second.id == 2066 || p.second.id == 3022)
+            && (!p.second.spawn || p.second.touch)) roots.push_back(p.second);
     std::sort(roots.begin(), roots.end(), [](const auto& a, const auto& b) {
         return std::tie(a.order, a.cx, a.uid) < std::tie(b.order, b.cx, b.uid);
     });

@@ -1,4 +1,5 @@
 #pragma once
+#include "solver/item_state.hpp"
 
 namespace solver {
 
@@ -377,8 +378,10 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
     // (two custom levels).
     PlayLayer* const pl = typeinfo_cast<PlayLayer*>(l);
     GameObject* const anticheat = pl ? pl->m_anticheatSpike : nullptr;
+    g_itemMechanism = false;
     for (auto* obj : CCArrayExt<GameObject*>(l->m_objects)) {
         if (!obj || obj == anticheat) continue;
+        g_itemMechanism |= obj->m_objectID == 3620;
         auto r = obj->getObjectRect();
         double sy0 = 0.0, sy1 = 0.0;
         int shz = 0, sdir = 0, sup = 0;
@@ -971,7 +974,8 @@ inline void buildPois(GJBaseGameLayer* l) {
               //               group instead of toggling it (the second slot of the
               //               layer's +0x198 handler, taken when ring+0x741 is set).
               //               0 on everything that is not a RingObject.
-              "sponly\n";
+              "sponly,tmstart,tmtarget,tmstop,tmkeep,tmignore,tmrate,tmpaused,tmmulti,tmcontrol,"
+              "gpoints,gattempts,gtime\n";
         // uid → groups it belongs to. One object can belong to several groups,
         // so the mapping is many-to-many
         std::ofstream gf(std::string(DATA_DIR) + "/objgroups.txt", std::ios::trunc);
@@ -1043,7 +1047,10 @@ inline void buildPois(GJBaseGameLayer* l) {
                     << (e->m_subtractCount ? 1 : 0) << "\n";
                 ++nItem;
             }
-            if (!e || e->m_targetGroupID == 0) continue;
+            const int objectID = obj->m_objectID;
+            const bool numeric = objectID == 3619 || objectID == 3620 || objectID == 3614
+                || objectID == 3615 || objectID == 3617;
+            if (!e || (e->m_targetGroupID == 0 && !numeric)) continue;
             auto tr = obj->getObjectRect();
             tf << obj->m_uniqueID << "," << obj->m_objectID << ","
                << (tr.origin.x + tr.size.width * 0.5f) << ","
@@ -1126,7 +1133,25 @@ inline void buildPois(GJBaseGameLayer* l) {
                 else
                     tf << ",-1,-1,-1,0,0,-1,-1,-1,0,-1,-1,-1,-1";
                 auto* ring = geode::cast::typeinfo_cast<RingObject*>(obj);
-                tf << "," << ((ring && ring->m_isSpawnOnly) ? 1 : 0) << "\n";
+                tf << "," << ((ring && ring->m_isSpawnOnly) ? 1 : 0);
+                if (auto* timer = geode::cast::typeinfo_cast<TimerTriggerGameObject*>(obj))
+                    tf << std::setprecision(17) << "," << timer->m_startTime << "," << timer->m_targetTime << ","
+                       << timer->m_stopTimeEnabled << "," << timer->m_dontOverride << ","
+                       << timer->m_ignoreTimeWarp << "," << timer->m_timeMod << ","
+                       << timer->m_startPaused << "," << timer->m_multiActivate << "," << timer->m_controlType
+                       << std::setprecision(6);
+                else tf << ",0,0,0,0,0,1,0,0,0";
+#ifdef GEODE_IS_WINDOWS
+                // getItemValue's sources in 2.2081: points +0x864, attempts +0x3084, time +0x3560.
+                auto* base = reinterpret_cast<char const*>(l);
+                tf << "," << *reinterpret_cast<int const*>(base + 0x864)
+                   << "," << *reinterpret_cast<int const*>(base + 0x3084)
+                   << "," << std::setprecision(17) << *reinterpret_cast<double const*>(base + 0x3560)
+                   << std::setprecision(6);
+#else
+                tf << ",0,-1,0";   // unmeasured global-value layouts stay on replay fallback
+#endif
+                tf << "\n";
             }
             ++nTrig;
         }

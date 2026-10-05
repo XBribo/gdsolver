@@ -3309,6 +3309,8 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             for (const auto& tb : *K.trigs) {
                 const TouchTrig* T = tb.first;
                 if (!T->spawnRing || (s.trig & tb.second)) continue;
+                if (T->itemNode >= 0 && s.dashing) continue;
+                if (T->itemNode >= 0 && T->playerBody && T->playerBody != g_halfNow + 1) continue;
                 if (std::fabs(x - T->cx) < T->hw + half
                     && std::fabs((double)s.y - T->cy) < T->hh + half) {
                     ringTookPress = true;
@@ -16765,6 +16767,23 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // this is the spawn ring's own timing, not a pad rule. Put in the model's terms: the press
     // tick leaves vy = impulse + one gravity step, the next tick's gravity takes that step back
     // off, and the move carries the full impulse.
+    // Native ringJump's custom-ring branch has no mode gate or impulse. Flying, robot and
+    // spider inputs keep their normal movement; only the Item group's press edge is recorded.
+    if (s.item && !dead && s.mode != 0 && s.mode != 2 && input && !s.action && !s.dashing && K.trigs) {
+        const double half = playerHalf(s.mode, s.mini != 0);
+        for (const auto& tb : *K.trigs) {
+            const TouchTrig* T = tb.first;
+            if (T->itemNode < 0 || !T->spawnRing || (s.trig & tb.second)
+                || (T->playerBody && T->playerBody != g_halfNow + 1)) continue;
+            if (std::fabs(x - T->cx) >= T->hw + half
+                || std::fabs((double)s.y - T->cy) >= T->hh + half) continue;
+            c.trig |= tb.second;
+            c.trigT = (int32_t)K.t;
+            const int b = touchBitIndex(tb.second);
+            c.fireB[b] = (uint16_t)K.t;
+            break;
+        }
+    }
     if (spawnRingJumpNow && !dead && c.mode == 0) {
         const double vRing = kOrbYellow * ringScaleFor(useDx) * (c.mini ? kMiniImpulse : 1.0);
         const double gMag = c.gravityMod == 1.f ? std::fabs(cubePhysFor(useDx).g)
@@ -16925,7 +16944,7 @@ inline void markTouched(State& c, const StepCtx& K, double preY, bool btnHeld) {
         // wherever the player happens to be (cli.hpp's item test). Nor does a
         // TAP trigger: the press fires that one, once its x is behind.
         if (T->count >= 0 || T->tap || T->playerOnly || T->playerAuto
-            || !T->playerActions.empty()) continue;   // playerTriggerTick owns their source clock
+            || !T->playerActions.empty() || T->itemNode >= 0) continue;   // VM owns these source clocks
         // ...and a toggle block needs the button down while the boxes overlap.
         if (T->press && !btnHeld) continue;
         // --p2touch: WOULD THE SECOND PLAYER HAVE ENTERED THIS BOX.

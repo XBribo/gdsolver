@@ -1,6 +1,7 @@
 #pragma once
 #include "dp/level_loader.hpp"
 #include "dp/wave_policy.hpp"
+#include "dp/item_program.hpp"
 
 namespace dp {
 
@@ -350,6 +351,9 @@ struct State {
     // width -- but it is the largest single addition the struct has taken, and
     // the cost lands in the cold loop rather than in any replay harness.
     uint16_t fireB[kTouchBits] = {};
+    // Immutable, interned Item memory: ordinary levels allocate no snapshots.
+    const ItemMemory* item = nullptr;
+    double itemClock = 0.0;
     // How far this state has travelled since it punched the locked box
     // (g_lockBox), while that lock is open. The lock makes an object's x the
     // player's own, offset by wherever both were when it fired:
@@ -1220,8 +1224,9 @@ struct State {
 // [2026-10-05] xAbs2 uses the tail padding (still 528); seeded by position2 and printed by seeddump.
 // [2026-10-05] 528 -> 544: per-body gravity and the cube's retained spin multiplier;
 // seeded by gravity/spin and printed by seeddump. Pending player events reuse fireB.
+// [2026-10-05] 544 -> 560: immutable Item snapshot and native level clock; restored by itemstate.
 constexpr size_t kStateBytes =
-    (544u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
+    (560u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
           + (sizeof(TouchMask) - sizeof(uint32_t))
           + 2u * (sizeof(GravLatch) - sizeof(Bits<128>)) + 7u) / 8u * 8u;
 static_assert(sizeof(State) == kStateBytes,

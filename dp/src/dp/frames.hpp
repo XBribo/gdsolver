@@ -873,7 +873,7 @@ inline std::string g_anchorState;
 // says. Declaring ownership keeps "replaces wholesale" true WITHIN a
 // subsystem and leaves the others honestly alone.
 inline const char* const kAnchorKeys[] = {"owns", "touch", "portal", "portal2",
-                                          "hist", "position2", "gravity", "spin", "player"};
+                                          "hist", "position2", "gravity", "spin", "player", "itemstate"};
 
 // Parse a complete finite pair for position and per-body physics anchors.
 inline bool parseFinitePair(const std::string& value, double& a, double& b) {

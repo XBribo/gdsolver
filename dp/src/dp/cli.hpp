@@ -1539,6 +1539,10 @@ inline int cliMainOnce(int argc, char** argv) {
                 }
                 if (const char* d = std::strstr(ln.c_str(), ",gravity="))
                     std::sscanf(d, ",gravity=%f/%f", &f.gravityMod, &f.gravityMod2);
+                if (const size_t p = ln.find(",itemanchor="); p != std::string::npos)
+                    f.itemAnchor = ln.substr(p + 12);
+                if (const char* d = std::strstr(ln.c_str(), ",itemtick="))
+                    std::sscanf(d, ",itemtick=%lld", &f.itemTick);
                 g_fixups.push_back(f);
             }
             for (const Fixup& fx : g_fixups)
@@ -2131,12 +2135,9 @@ inline int cliMainOnce(int argc, char** argv) {
         // ...and "is the button down near a toggle block" (g_pressWin). 15 is the largest
         // half any mode has, 20 more covers a tick's travel at the fastest speed, since the
         // box reads the PARENT's button and so the held parent has to survive the tick before.
-        g_pressWin.clear();
+        buildPressWindows();
         g_actMask = TouchMask{};
         for (size_t b = 0; b < g_touch.size() && b < (size_t)kTouchBits; ++b) {
-            if (g_touch[b].press)
-                g_pressWin.push_back({g_touch[b].cx - g_touch[b].hw - 35.0,
-                                      g_touch[b].cx + g_touch[b].hw + 15.0, (int)b});
             if (g_touch[b].activator) g_actMask |= touchBit((int)b);
         }
         g_autoTrig = loadAutoTriggers(trigPath, grpPath);
@@ -2189,14 +2190,40 @@ inline int cliMainOnce(int argc, char** argv) {
     long long tEnd = (long long)std::ceil(goalX / kDx) + 2;
     if (t0 > 0) tEnd = std::max(tEnd, t0 + 8000);
     // Decide before attaching source bits or reading history; fallback keeps geometry's map.
-    if (!L.playerEffects.empty() && L.playerFallback.empty() && tEnd >= 65535)
+    const auto itemGeometryTouch = g_touch;
+    const bool itemProgram = loadItemProgram(L, trigPath, grpPath, t0, g_anchorState);
+    if (!itemProgram && !L.playerEffects.empty() && L.playerFallback.empty() && tEnd >= 65535)
         L.playerFallback = "player trigger run exceeds the 16-bit source clock";
-    loadPlayerTriggers(L, trigPath, grpPath);
+    if (!itemProgram) loadPlayerTriggers(L, trigPath, grpPath);
+    const State itemSeedBase = init;
+    init.item = initialItems();
+    if (init.item && t0 > 0) {
+        std::vector<std::pair<std::string, std::string>> fields;
+        std::string unknown, native;
+        if (parseAnchorState(g_anchorState, fields, unknown))
+            for (const auto& p : fields) if (p.first == "itemstate") native = p.second;
+        if (!restoreItems(init, native, {}, t0)) {
+            g_itemProgram = {}; g_touch = itemGeometryTouch; g_playerRoots.clear(); init = itemSeedBase;
+            buildPressWindows();
+            L.playerFallback = "native Item anchor contains an unmodelled callback or invalid numeric state";
+        }
+    }
+    if (init.item) for (auto* fixups : {&g_fixups, &g_fixupKills, &g_fixupDeltas}) {
+        for (auto& f : *fixups) {
+            State witness = init;
+            if (f.itemTick >= 0 && restoreItems(witness, f.itemAnchor, {}, f.itemTick)) {
+                f.itemWitness = witness.item; f.itemClock = witness.itemClock;
+            }
+        }
+    }
+    if (init.item)
+        std::printf("Item program: %zu nodes, %zu sources, %zu typed values\n",
+                    g_itemProgram.nodes.size(), g_itemProgram.roots.size(), g_itemProgram.values.size());
     g_outcome.playerFallback = L.playerFallback;
     if (!L.playerFallback.empty())
         std::printf("player trigger fallback: %s; continuing search with native replay repair\n",
                     L.playerFallback.c_str());
-    if (!g_playerRoots.empty()) {
+    if (!g_playerRoots.empty() || init.item) {
         // Player-only roots append slots after the geometry population was measured.
         unsigned long long h = 1469598103934665603ull;
         for (const auto& source : g_touch) {
@@ -2515,6 +2542,7 @@ inline int cliMainOnce(int argc, char** argv) {
     // payload written against a wider window than this one's 32.
     std::vector<std::pair<int, int>> payloadTouch;
     std::vector<PlayerFire> payloadPlayer;
+    std::string payloadItems;
     bool sawGravityKey = false, sawSpinKey = false, sawPlayerKey = false;
     std::vector<int> payloadPortal, payloadPortal2;
     std::vector<std::pair<std::string, int>> payloadHist;
@@ -2627,6 +2655,8 @@ inline int cliMainOnce(int argc, char** argv) {
                     }
                     sawSpinKey = true;
                 }
+            } else if (p.first == "itemstate") {
+                payloadItems = p.second;
             } else if (p.first == "player") {
                 if (!parsePlayerHistory(p.second, t0, payloadPlayer)) {
                     std::printf("seed payload rejected: player must be unique uid/body:tick events within the anchor\n");
@@ -3416,6 +3446,10 @@ inline int cliMainOnce(int argc, char** argv) {
             std::printf("dyndbg: uid=%d is NOT in dyn (static grid)\n", g_dynDbg);
     }
     if (t0 > 0 && sawPlayerKey) {
+        if (init.item && !restoreItems(init, payloadItems, payloadPlayer, t0)) {
+            std::printf("seed payload rejected: invalid native Item state\n");
+            return 2;
+        }
         // Apply after all recording heuristics; player-source dates are native observations.
         for (int b : g_playerRoots) {
             init.trig &= ~touchBit(b); init.fireB[b] = 0;
@@ -5239,7 +5273,7 @@ inline int cliMainOnce(int argc, char** argv) {
               // `fxblk`: the moving object that kept a MATCHING fixup from
               // firing on the step into this row, -1 if none (fixup.hpp,
               // g_fxBlockedUid). The recorder's third answer.
-              ",fxblk,x2,gravity,gravity2\n";
+              ",fxblk,x2,gravity,gravity2,itemkey\n";
         // Make --snaplog usable in replay too (it used to exist only on the
         // SOLVE side, so a known plan's stair snaps could never be checked
         // against GD's snaptrace).
@@ -5522,6 +5556,7 @@ inline int cliMainOnce(int argc, char** argv) {
                 // +0xa1c (State::a1cLatch, bit 1 = the second body): printed, not seeded -- the
                 // dump has no column for it, so an anchor starts it at 0
                 std::printf("seed: t=%lld a1cLatch=%d\n", t, (int)s.a1cLatch);
+                if (s.item) std::printf("seed: t=%lld itemkey=%s\n", t, keyText(keyOf(s, t)).c_str());
                 std::printf("seed: t=%lld x2=%.9g teleported=%d/%d\n", t,
                             (double)s.xAbs2, (int)s.tpSkip, (int)s.tpSkip2);
                 std::printf("seed: t=%lld gravity=%.9g/%.9g\n", t,
@@ -5716,6 +5751,7 @@ inline int cliMainOnce(int argc, char** argv) {
                << ',' << g_fxBlockedUid
                << ',' << wX2
                << ',' << s.gravityMod << ',' << s.gravityMod2
+               << ',' << (s.item ? keyText(keyOf(s, t)) : std::string())
                << "\n";
             if (rdead) {
                 // --replayon (diagnostic): note the first death and walk on, the

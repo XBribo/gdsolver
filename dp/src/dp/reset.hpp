@@ -503,6 +503,9 @@ inline void resetInvocationState() {
         g_refKidKey[i] = {};
         g_refKidState[i] = State{};
     }
+    g_itemProgram = {};
+    g_itemMemories.clear();
+    g_itemParsedKeys.clear();
 }
 
 }  // namespace dp

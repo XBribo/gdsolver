@@ -3,6 +3,8 @@
 #include <Geode/modify/EndTriggerGameObject.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/SpawnTriggerGameObject.hpp>
+#include <Geode/modify/ItemTriggerGameObject.hpp>
+#include <Geode/modify/TimerTriggerGameObject.hpp>
 
 using namespace p1;
 
@@ -25,6 +27,24 @@ class $modify(PlayerSpawnTrace, SpawnTriggerGameObject) {
     }
 };
 
+class $modify(PlayerItemTrace, ItemTriggerGameObject) {
+    // Item overrides EffectGameObject; observe its real invocation before arithmetic runs.
+    void triggerObject(GJBaseGameLayer* layer, int playerID, gd::vector<int> const* remapKeys) {
+        playerseed::g_first.emplace(std::make_pair(m_uniqueID,
+            m_isTouchTriggered && !m_isSinglePTouch ? playerID : 0), (int)g_tick);
+        ItemTriggerGameObject::triggerObject(layer, playerID, remapKeys);
+    }
+};
+
+class $modify(PlayerTimerTrace, TimerTriggerGameObject) {
+    // Timer callbacks and source latches must survive a solver re-anchor independently.
+    void triggerObject(GJBaseGameLayer* layer, int playerID, gd::vector<int> const* remapKeys) {
+        playerseed::g_first.emplace(std::make_pair(m_uniqueID,
+            m_isTouchTriggered && !m_isSinglePTouch ? playerID : 0), (int)g_tick);
+        TimerTriggerGameObject::triggerObject(layer, playerID, remapKeys);
+    }
+};
+
 class $modify(PadTraceGameObject, EnhancedGameObject) {
     void activatedByPlayer(PlayerObject* p) {
         // THE ANCHOR PAYLOAD'S SOURCE. This is the only setter of the flag the
@@ -34,6 +54,11 @@ class $modify(PadTraceGameObject, EnhancedGameObject) {
         // m_isTouchTriggered is EffectGameObject's, and this hook is on its
         // base -- which is exactly why the hook sees triggers at all.
         auto* eff = typeinfo_cast<EffectGameObject*>(this);
+        if (eff && m_objectID == 1594) {
+            auto* layer = GJBaseGameLayer::get();
+            playerseed::g_first.emplace(std::make_pair(m_uniqueID,
+                eff->m_isSinglePTouch ? 0 : (layer && p == layer->m_player1 ? 1 : 2)), (int)g_tick);
+        }
         if (eff && eff->m_isTouchTriggered) {
             ++touchseed::g_calls;
             auto* l = GJBaseGameLayer::get();

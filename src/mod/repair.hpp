@@ -121,6 +121,7 @@ struct AnchorRow {
     // items 1 and 2). A Count trigger compares these, so an anchored search that
     // is not told them plans a world where that gate never opens. -1 = none.
     int item1 = -1, cnt1 = 0, item2 = -1, cnt2 = 0;
+    std::shared_ptr<const std::string> itemState;
     // The slope ride, raw 2.2081 facts for the anchor seeding: +0x9b0 is on a
     // ramp, +0x9b8 the underside branch, +0x678 the ramp (its uid, -1 for none)
     // and +0x598 the ride's start stamp, with +0xaa0 (the attempt clock) beside it
@@ -272,6 +273,12 @@ inline void record(GJBaseGameLayer* l, long long t) {
     auto* p = l->m_player1;
     const auto pos = p->getPosition();
     r.valid = true;
+    const std::string items = solver::itemStatePayload(l, playerseed::g_first);
+    if (!items.empty()) {
+        const auto* prior = t > 0 ? &g_live[(size_t)t - 1] : nullptr;
+        r.itemState = prior && prior->itemState && *prior->itemState == items
+            ? prior->itemState : std::make_shared<const std::string>(items);
+    } else r.itemState.reset();
     r.x = pos.x;
     r.y = pos.y;
     r.vy = (float)p->m_yVelocity;
@@ -2949,6 +2956,8 @@ inline std::string anchorPayloadAll(long long t0) {
         playerHistory += (playerHistory.empty() ? "" : ",") + std::to_string(event.first.first)
             + "/" + std::to_string(event.first.second) + ":" + std::to_string(event.second);
     add("player=" + (playerHistory.empty() ? std::string("-") : playerHistory));
+    if (const AnchorRow* r = anchors::row(t0); r && r->itemState)
+        add("itemstate=" + *r->itemState);
     return out;
 }
 
@@ -3244,6 +3253,7 @@ struct FixupKey {
     double x = 0, y = 0, vy = 0, y2 = 0, vy2 = 0, x2 = 0;
     double gravityMod = 1, gravityMod2 = 1;
     int in = 0, mode = 0, mini = 0, flip = 0, g = 0, kill = 0, dual = 0;
+    std::string itemAnchor;
 };
 
 // Read a record back into its key. `dual` is not a column -- the second body rides in a named
@@ -3264,6 +3274,8 @@ inline bool parseFixupKey(const std::string& line, FixupKey& k,
         std::sscanf(line.c_str() + px, ",x2=%lf", &k.x2);
     if (const size_t pg = line.find(",gravity="); pg != std::string::npos)
         std::sscanf(line.c_str() + pg, ",gravity=%lf/%lf", &k.gravityMod, &k.gravityMod2);
+    if (const size_t p = line.find(",itemanchor="); p != std::string::npos)
+        k.itemAnchor = line.substr(p + 12);
     if (dvOut) *dvOut = dvy;
     const size_t p = line.find(",dual2=");
     if (p != std::string::npos) {
@@ -3285,6 +3297,7 @@ inline bool parseFixupKey(const std::string& line, FixupKey& k,
 // three ticks (t=8,567..8,569) were refused every pass for the whole budget because x, y and vy
 // matched an entry whose mode, gravity or second body did not.
 inline bool sameTransition(const FixupKey& a, const FixupKey& b) {
+    if (a.itemAnchor != b.itemAnchor) return false;
     if (a.in != b.in || a.kill != b.kill || a.mode != b.mode || a.mini != b.mini
         || a.flip != b.flip || a.g != b.g || a.dual != b.dual)
         return false;
@@ -3480,6 +3493,7 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
     key.vy2 = mPrev->second.vy2;
     key.gravityMod = mPrev->second.gravityMod;
     key.gravityMod2 = mPrev->second.gravityMod2;
+    if (gPrev && gPrev->itemState) key.itemAnchor = *gPrev->itemState;
     // ...and "covered" is refined by the solver's own answer, the only side that can see the
     // gate: covered by a record the solver keeps back is a model wall. It REPLACES FixupOnFile
     // and nothing else, so every other outcome -- a refined record written over a disagreeing
@@ -3508,7 +3522,10 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
     {
         std::ofstream f(noop ? g_fixupNoopPath : g_fixupPath, std::ios::app);
         if (!f) return FixupIoError;
-        f << line << "\n";
+        f << line;
+        if (gPrev && gPrev->itemState)
+            f << ",itemtick=" << t - 1 << ",itemanchor=" << *gPrev->itemState;
+        f << "\n";
     }
     // 800, not 600: the line now carries e2 (48) + gd (128) + md (224) of named
     // tails on top of its own text, and snprintf truncates in silence. What it
@@ -5774,7 +5791,7 @@ inline void prepareFirstStart() {
     g_firstStart.clear();
     g_firstBand.clear();
     const AnchorRow& r = g_spawnRow;
-    if (!r.valid || spawnIsModelDefault(r)) return;
+    if (!r.valid || (spawnIsModelDefault(r) && !r.itemState)) return;
     g_firstStart = startArg(1, r, 0);
     if (r.pmax > r.pmin) g_firstBand = num(r.pmin) + "," + num(r.pmax);
     char b[400];
@@ -5791,6 +5808,10 @@ inline void addFirstStart(std::vector<std::string>& a) {
     if (g_firstStart.empty()) return;
     a.push_back("--start");
     a.push_back(g_firstStart);
+    if (g_spawnRow.itemState) {
+        a.push_back("--anchor-state");
+        a.push_back("itemstate=" + *g_spawnRow.itemState + ";player=-");
+    }
     if (!g_firstBand.empty()) {
         a.push_back("--startband");
         a.push_back(g_firstBand);

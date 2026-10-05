@@ -1263,6 +1263,246 @@ static int groupsCorpus(int argc, char** argv) {
     return bad;
 }
 
+// Native Item arithmetic has distinct Edit/Compare operator positions and float boundaries.
+static void itemArithmeticRules() {
+    using namespace dp;
+    auto read = [](int mode, int id) { return mode == 1 ? (id == 2 ? 7.0 : 3.0) : 12.5; };
+    ItemExpr e;
+    e.item = 2; e.mod1 = 1; e.mod2 = 6; e.op1 = e.op2 = 3; e.op3 = 1;
+    check(itemCompare(e, read), "native uid 95521 is counter 2 > 6, not >= 6");
+    e.mod2 = 7;
+    check(!itemCompare(e, read), "strict comparison does not fire at six/equal threshold");
+    for (int op = 0; op < 6; ++op) {
+        e.op3 = op;
+        const bool expected[] = {true, false, true, false, true, false};
+        check(itemCompare(e, read) == expected[op], "all six comparison operators preserve equality boundaries");
+    }
+    e.op3 = 1; e.tolerance = .001f;
+    check(itemCompare(e, read), "comparison adds authored tolerance on the greater-than side");
+    check(itemModifier(1.23456f) == (double)(std::round(1.23456f * 1000.f) / 1000.f),
+          "modifiers round in float before widening to double");
+    check(itemArithmetic(9, 0, 4) == 0 && itemArithmetic(9, 2, 99) == 0,
+          "zero denominators and unknown arithmetic operators return native zero");
+    check(itemTransform(-2.5, 1, 1) == 3 && itemTransform(-2.5, 2, 2) == -3
+          && itemTransform(-2.5, 3, 0) == -2, "round, floor, ceil and signs execute in native order");
+    e = {}; e.target = 2; e.mod1 = 1; e.op1 = 1; e.op2 = 3; e.op3 = 3;
+    check(itemEdit(e, read) == 8, "native uid 95518 adds constant one despite absent input modes");
+    e.mod1 = 0; e.op1 = 0;
+    check(itemEdit(e, read) == 0, "native uid 95519 assigns zero rather than adding it");
+    e.mode2 = 1; e.item2 = 2; e.mod1 = 2;
+    check(itemEdit(e, read) == 14, "an absent first Edit operand promotes the second operand");
+    e.mode1 = 1; e.item = 1; e.op2 = 1;
+    check(itemEdit(e, read) == 20, "Edit combines inputs before modifier and destination operations");
+    e.mode1 = 4; e.mode2 = 0; e.item = 0;
+    check(itemEdit(e, read) == 25, "the time source accepts item ID zero");
+    check(!itemOperand(5, 0) && itemOperand(5, 1), "optional attempt operands retain native ID admission");
+    check(itemInteger(3.9) == 3 && itemInteger(-3.9) == -3
+          && itemInteger(2147483648.0) == INT32_MIN,
+          "integer stores truncate and reproduce native overflow");
+}
+
+// Per-route stores, delayed groups and native anchors must agree with their semantic search keys.
+static void itemRuntimeRules() {
+    using namespace dp;
+    resetInvocationState();
+    ItemNode edit; edit.kind = ItemKind::Edit; edit.meta.uid = 11; edit.meta.multi = true;
+    edit.expr.target = 2; edit.expr.mod1 = 1; edit.expr.op1 = 1;
+    ItemNode compare; compare.kind = ItemKind::Compare; compare.meta.uid = 12;
+    compare.expr.item = 2; compare.expr.mod1 = 1; compare.expr.mod2 = 6; compare.expr.op3 = 1;
+    compare.yes = {2}; compare.no = {3};
+    ItemNode gravity; gravity.kind = ItemKind::Player; gravity.meta.uid = 13;
+    gravity.effect.teleport.id = 2066; gravity.effect.player1 = 1; gravity.effect.gravity = 3;
+    ItemNode other = gravity; other.meta.uid = 14; other.effect.gravity = -2;
+    ItemNode spawn; spawn.kind = ItemKind::Spawn; spawn.meta.uid = 15; spawn.meta.multi = true;
+    spawn.delay = 2; spawn.yes = {0};
+    g_itemProgram.nodes = {edit, compare, gravity, other, spawn};
+    g_itemProgram.values = {{1, 2}};
+    for (size_t i = 0; i < g_itemProgram.nodes.size(); ++i)
+        g_itemProgram.byUid[g_itemProgram.nodes[i].meta.uid] = (int)i;
+    State base{}; base.item = initialItems();
+    ItemMemory m = *base.item;
+    State changed = base;
+    for (int i = 0; i < 7; ++i) executeItem(changed, m, 0, i + 1, 0);
+    changed.item = saveItems(m);
+    check(readItem(*base.item, 0, 1, 2) == 0 && readItem(*changed.item, 0, 1, 2) == 7,
+          "immutable Item snapshots do not leak writes between search routes");
+    check(keyOf(base, 7) != keyOf(changed, 7), "equal player positions with different counters are distinct search states");
+    SearchKey parsed;
+    const auto text = keyText(keyOf(changed, 7));
+    check(text.starts_with("v4:") && parseKeyText(text, parsed) && parsed == keyOf(changed, 7),
+          "full Item semantic keys survive text round trips without pointer identity");
+    check(keyText(keyOf(State{}, 7)).starts_with("v3:"), "ordinary levels keep the legacy key format");
+    executeItem(changed, m, 1, 8, 0);
+    check(changed.gravityMod == 3, "a true Item Compare synchronously executes its player-effect group");
+    ItemMemory fals = *base.item;
+    executeItem(base, fals, 1, 8, 0);
+    check(base.gravityMod == -2, "a false Item Compare executes its separate false group");
+    State delayed{}; delayed.item = initialItems();
+    ItemMemory q = *delayed.item;
+    executeItem(delayed, q, 4, 8, 0); executeItem(delayed, q, 4, 8, 0);
+    delayed.item = saveItems(q);
+    StepCtx k{}; k.t = 9;
+    itemPendingTick(delayed, k);
+    check(readItem(*delayed.item, 0, 1, 2) == 0, "delayed Spawn does not write early");
+    k.t = 10; itemPendingTick(delayed, k);
+    check(readItem(*delayed.item, 0, 1, 2) == 2 && delayed.item->pending.empty(),
+          "duplicate delayed Spawn invocations remain separate scheduled events");
+    State anchor{}; anchor.item = initialItems();
+    check(restoreItems(anchor, "1|0|0|1|1:2:7:0:0:0:1:0:-1:1,|||11/0:1", {}, 7)
+          && anchor.item->words == changed.item->words,
+          "native anchor restores counters and source latches without replaying arithmetic");
+    check(!restoreItems(anchor, "1|nan|0|1||||-", {}, 7)
+          && !restoreItems(anchor, "1|0|0|1|1:2:7junk:0:0:0:1:0:-1:1,|||-", {}, 7),
+          "malformed native Item anchors reject nonfinite and partial numeric fields");
+    Fixup f{}; f.itemWitness = changed.item;
+    f.x = changed.xAbs; f.y = changed.y; f.vy = changed.vy;
+    f.gravityMod = changed.gravityMod; f.gravityMod2 = changed.gravityMod2;
+    f.mode = changed.mode; f.mini = changed.mini; f.flip = changed.flip; f.g = changed.grounded;
+    State different = changed; different.item = base.item;
+    check(fixupMatches(f, changed, 0) && !fixupMatches(f, different, 0),
+          "replay corrections cannot cross Item histories with identical physical coordinates");
+    resetInvocationState();
+    check(g_itemProgram.nodes.empty() && g_itemMemories.empty(), "the next invocation cannot inherit an Item program or store");
+}
+
+// Timer sources and numeric writes retain their native precision and callback lifecycle.
+static void itemTimerRules() {
+    using namespace dp;
+    resetInvocationState();
+    ItemNode start; start.kind = ItemKind::TimerStart; start.meta.uid = 21;
+    start.row.item = 4; start.row.timerStart = 1; start.row.timerTarget = 1.01;
+    start.row.timerRate = 2; start.row.timerStop = true; start.yes = {1};
+    ItemNode edit; edit.kind = ItemKind::Edit; edit.meta.uid = 22; edit.meta.multi = true;
+    edit.expr.target = 2; edit.expr.mod1 = 1; edit.expr.op1 = 1;
+    ItemNode watch; watch.kind = ItemKind::TimerEvent; watch.meta.uid = 23;
+    watch.row.item = 4; watch.row.timerTarget = 1.005; watch.yes = {1};
+    ItemNode write; write.kind = ItemKind::Edit; write.meta.uid = 24; write.meta.multi = true;
+    write.expr.target = 4; write.expr.targetMode = 2; write.expr.mod1 = 5.5;
+    g_itemProgram.nodes = {start, edit, watch, write};
+    g_itemProgram.values = {{1, 2}, {2, 4}, {3, 0}, {4, 0}, {5, 0}};
+    g_itemProgram.points = 9; g_itemProgram.attempts = 3; g_itemProgram.clock = true;
+    for (size_t i = 0; i < g_itemProgram.nodes.size(); ++i)
+        g_itemProgram.byUid[g_itemProgram.nodes[i].meta.uid] = (int)i;
+    State s{}; s.item = initialItems();
+    check(readItem(*s.item, 12.5, 3, 0) == 9 && readItem(*s.item, 12.5, 4, 0) == 12.5
+          && readItem(*s.item, 12.5, 5, 1) == 3, "points, time and attempts are distinct native numeric sources");
+    ItemMemory m = *s.item;
+    executeItem(s, m, 0, 0, 0); executeItem(s, m, 2, 0, 0);
+    s.item = saveItems(m);
+    StepCtx k{}; k.t = 1; itemPendingTick(s, k);
+    check(readItem(*s.item, 0, 2, 4) == 1.0 + (double)(float)((float)(1.0 / 240.0) * 2.f)
+          && readItem(*s.item, 0, 1, 2) == 1 && s.item->watches.empty(),
+          "timer increments round in float and one-shot Timer Event callbacks are removed");
+    k.t = 2; itemPendingTick(s, k);
+    check(readItem(*s.item, 0, 2, 4) == (double)(float)1.01
+          && !s.item->values[1].active && readItem(*s.item, 0, 1, 2) == 2,
+          "timer bounds clamp exactly, stop the timer and execute the bound group");
+    State anchor{}; anchor.item = initialItems();
+    check(restoreItems(anchor, "1|0.5|9|3|2:4:1.01:0:0:1:2:1.01:21:1,||23:1.01,|21/0:0,23/0:0", {}, 2)
+          && readItem(*anchor.item, anchor.itemClock, 4, 0) == .5
+          && anchor.item->watches.size() == 1, "native timer anchors restore configuration and watcher crossing memory");
+    State created{}; created.item = initialItems();
+    m = *created.item; executeItem(created, m, 3, 0, 0);
+    check(itemValue(m, 2, 4)->value == 5.5 && itemValue(m, 2, 4)->present
+          && !itemValue(m, 2, 4)->active, "Item Edit creates missing timers paused and preserves double values");
+    resetInvocationState();
+}
+
+// Exercise the actual button transition, not a fabricated press notification.
+static void itemPressRules() {
+    using namespace dp;
+    resetInvocationState();
+    ItemNode press; press.kind = ItemKind::Press; press.meta.uid = 31;
+    press.meta.touch = true; press.meta.singleTouch = true; press.pressBit[0] = 0; press.yes = {1};
+    ItemNode edit; edit.kind = ItemKind::Edit; edit.meta.uid = 32; edit.meta.multi = true;
+    edit.expr.target = 2; edit.expr.mod1 = 1; edit.expr.op1 = 1;
+    g_itemProgram.nodes = {press, edit}; g_itemProgram.values = {{1, 2}}; g_itemProgram.roots = {0};
+    g_itemProgram.byUid = {{31, 0}, {32, 1}};
+    TouchTrig t{}; t.uid = 31; t.id = 1594; t.cx = 101.6; t.cy = 300; t.hw = t.hh = 15;
+    t.itemNode = 0; t.spawnRing = t.press = t.playerOnly = true;
+    g_touch.push_back(t);
+    std::vector<std::pair<const TouchTrig*, TouchMask>> trigs{{&g_touch[0], touchBit(0)}};
+    Level l;
+    XSlice near(l.objs), ports(l.portals), pads(l.pads), orbs(l.orbs), slopes(l.slopes), speeds(l.speeds);
+    std::vector<const Obj*> empty;
+    const auto ship = gdapprox::ShipParams::normal(), shipMini = gdapprox::ShipParams::mini();
+    const auto ufo = gdapprox::UfoParams::normal(), ufoMini = gdapprox::UfoParams::mini();
+    StepCtx k{101.6, 100, 1.6f, 1, &empty, &empty, &empty, &empty, &empty, &empty,
+        &ship, &shipMini, &ufo, &ufoMini};
+    k.slices = {&near, &ports, &pads, &orbs, &slopes, &speeds}; k.dyn = &l.dyn; k.trigs = &trigs;
+    State s{}; s.xAbs = 100; s.y = 300; s.dx = 1.6f; s.gravityMod = 0; s.item = initialItems();
+    bool dead = false;
+    const auto idle = stepBoth(s, 0, k, dead);
+    check(readItem(*idle.item, 0, 1, 2) == 0, "overlapping a Spawn Only ring without pressing does not write counters");
+    const auto clicked = stepBoth(s, 1, k, dead);
+    check(readItem(*clicked.item, 0, 1, 2) == 1 && clicked.pressSpent,
+          "pressing a Spawn Only ring invokes its Item Edit through the real search transition");
+    const auto again = stepBoth(clicked, 0, k, dead);
+    check(readItem(*again.item, 0, 1, 2) == 1, "a one-shot press source does not increment again while overlapping");
+    bool allModes = true;
+    for (int mode : {1, 3, 4, 5, 6, 7}) {
+        State other = s; other.mode = (uint8_t)mode;
+        const auto moved = stepBoth(other, 1, k, dead);
+        allModes &= !dead && readItem(*moved.item, 0, 1, 2) == 1;
+    }
+    check(allModes, "fresh presses activate Item groups in ship, UFO, wave, robot, spider and swing");
+    State dashing = s; dashing.mode = 1; dashing.dashing = 1;
+    const auto dash = stepBoth(dashing, 1, k, dead);
+    check(readItem(*dash.item, 0, 1, 2) == 0, "native dashing gate prevents custom-ring Item writes");
+    resetInvocationState();
+}
+
+// Compile exported rows and ensure new press sources participate in search-input admission.
+static void itemProgramRules() {
+    using namespace dp;
+    resetInvocationState();
+    const std::string header =
+        "uid,id,cx,cy,w,h,target,center,touch,spawn,dur,ox,oy,ease,erate,lockx,locky,grav,"
+        "gravmod,deg,ord,chan,sord,sordd,t360,lockrot,sdelay,mvtgt,mvaxis,tmodctr,dirsnap,"
+        "dirdist,dynmode,silent,togon,remap,item,item2,count,subcount,actgrp,thold,ttog,tdual,"
+        "cmode,i1mode,i2mode,tgtmode,mod1,mod2,res1,res2,res3,tol,rnd1,rnd2,sgn1,sgn2,sponly\n";
+    // Reuse the export-shaped geometry row, then set the numeric fields explicitly by index.
+    auto row = [&](int uid, int id, int target, bool spawn) {
+        auto fields = itemFields(trigRow(uid, id, 100, target, spawn, -1, 0, 0), ',');
+        fields.resize(59, "0");
+        for (int i = 36; i < 59; ++i) fields[(size_t)i] = "0";
+        fields[8] = id == 1594 ? "1" : "0";
+        fields[36] = id == 3620 ? "2" : "0";
+        fields[47] = "1"; fields[48] = "1";
+        fields[49] = "6"; fields[50] = "1"; fields[51] = "1";
+        fields[52] = id == 3620 ? "1" : "3";
+        fields[58] = id == 1594 ? "1" : "0";
+        std::ostringstream out;
+        for (size_t i = 0; i < fields.size(); ++i) out << (i ? "," : "") << fields[i];
+        return out.str() + "\n";
+    };
+    const auto triggers = writeTmp("dptest_item_program.txt", header + row(1, 1594, 10, false)
+        + row(2, 3619, 2, true) + row(3, 3620, 20, false) + row(4, 2066, 0, true));
+    const auto groups = writeTmp("dptest_item_groups.txt", "uid,groups\n2 10\n4 20\n");
+    Level l;
+    for (int uid : {1, 2, 3, 4}) {
+        PlayerTriggerMeta m; m.uid = uid;
+        m.id = uid == 1 ? 1594 : uid == 2 ? 3619 : uid == 3 ? 3620 : 2066;
+        m.cx = 100; m.cy = 315; m.hw = m.hh = 15;
+        m.spawn = uid == 2 || uid == 4; m.multi = uid == 2; m.touch = uid == 1;
+        m.singleTouch = true; l.playerSources.emplace(uid, m);
+    }
+    PlayerEffect effect; effect.teleport.uid = 4; effect.teleport.id = 2066;
+    effect.gravity = 2; l.playerEffects.push_back(effect);
+    const bool compiled = loadItemProgram(l, triggers, groups);
+    State s{}; s.xAbs = 100; s.y = 315; s.item = initialItems();
+    check(compiled && l.playerFallback.empty() && g_itemProgram.nodes.size() == 4
+          && g_pressWin.size() == 1 && nearPressBox(s),
+          "compiled Item press sources rebuild input windows after graph admission");
+    resetInvocationState();
+    g_touch.resize(kTouchBits - 1);
+    l.playerSources.at(1).singleTouch = false;
+    check(loadItemProgram(l, triggers, groups) && !l.playerFallback.empty()
+          && g_itemProgram.nodes.empty() && g_touch.size() == kTouchBits - 1,
+          "failed Item admission rolls back partially allocated press slots for replay repair");
+    resetInvocationState();
+}
+
 int main(int argc, char** argv) {
     if (argc > 2 && !std::strcmp(argv[1], "--groups-corpus")) return groupsCorpus(argc, argv);
     groupsParser();
@@ -1288,6 +1528,11 @@ int main(int argc, char** argv) {
     playerAnchorParsing();
     playerTouchLatches();
     levelWarnings();
+    itemArithmeticRules();
+    itemRuntimeRules();
+    itemTimerRules();
+    itemPressRules();
+    itemProgramRules();
     std::printf(g_fail ? "FAILED\n" : "all ok\n");
     return g_fail;
 }

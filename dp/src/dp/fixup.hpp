@@ -1,5 +1,6 @@
 #pragma once
 #include "dp/step.hpp"
+#include "dp/item_runtime.hpp"
 #include <optional>
 
 namespace dp {
@@ -47,6 +48,10 @@ struct Fixup {
     float y2 = 0, vy2 = 0, dy2 = 0, dvy2 = 0;
     float x2 = 0;   // named tail; legacy records inherit the primary X
     float gravityMod = 1.f, gravityMod2 = 1.f;
+    std::string itemAnchor;
+    long long itemTick = -1;
+    const ItemMemory* itemWitness = nullptr;
+    double itemClock = 0.0;
     // File position at load. The file is append-only within a run, so a
     // larger ord is a NEWER measurement -- the conflict filter (cli.hpp)
     // keeps the newest of two records that share a key but disagree.
@@ -110,6 +115,9 @@ inline int g_fixupCallRotSeen = 0;
 // Kills are also matched FIRST for the same reason: a verdict must not lose
 // to a trajectory patch from the neighbouring tick.
 inline bool fixupMatches(const Fixup& f, const State& s, int input) {
+    if (s.item && (!f.itemWitness || f.itemWitness->words != s.item->words
+        || itemBits(f.itemClock) != itemBits(s.itemClock))) return false;
+    if (!s.item && !f.itemAnchor.empty()) return false;
     if ((int)f.in != input || f.mode != s.mode || f.mini != s.mini
         || f.flip != s.flip || f.g != s.grounded)
         return false;
@@ -480,9 +488,10 @@ inline void playerTriggerTick(State& c, const StepCtx& K, PlayerPhase phase, dou
 
 inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bool& dead) {
     std::optional<State> queued;
-    if (!g_playerRoots.empty()) {
+    if (!g_playerRoots.empty() || entering.item) {
         queued.emplace(entering);
         applyPendingPlayerEffects(*queued, baseK.t);
+        itemPendingTick(*queued, baseK);
     }
     const State& s = queued ? *queued : entering;
     BodyWindow p1Window;
@@ -505,8 +514,10 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     const uint8_t beforeEffectFlip2 = c.flip2;
     const float beforeEffectVy2 = c.vy2;
     playerTriggerTick(c, K, PlayerPhase::TouchP1, touchPreY(s, c, preBtnSet, preBtnY));
+    itemSourceTick(c, s, K, 1, false, touchPreY(s, c, preBtnSet, preBtnY));
     if (!s.dual) {
         playerTriggerTick(c, K, PlayerPhase::Automatic);
+        itemSourceTick(c, s, K, 1, true);
         dead = d1;
         markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0);
         // No fixup of either kind applies near moving geometry (nearDynObject
@@ -530,6 +541,7 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     // AND the live flag after p1's collision pass before advancing p2.
     if (!c.dual) {
         playerTriggerTick(c, K, PlayerPhase::Automatic);
+        itemSourceTick(c, s, K, 1, true);
         dead = d1;
         markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0);
         if (!g_fixups.empty()) applyFixup(s, input, c, dead);
@@ -744,7 +756,9 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
         }
     }
     playerTriggerTick(c, K, PlayerPhase::TouchP2, p2TouchY);
+    itemSourceTick(c, s, K, 2, false, p2TouchY);
     playerTriggerTick(c, K, PlayerPhase::Automatic);
+    itemSourceTick(c, s, K, 1, true);
     // --repelland: the dual balls' repel, decided where GD decides it. checkRepellPlayer
     // (0x2398d0) runs from GJBaseGameLayer::update (0x238845) after both players' collisions and
     // rotation, and the taps come from the next step's processQueuedButtons -- in a model tick,

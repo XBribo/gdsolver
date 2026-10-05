@@ -1392,7 +1392,8 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
                 loadPrintf("teleport: uid %d at (%.0f,%.0f) sets gravity mode %d\n",
                            o.uid, o.cx, o.cy, (int)o.tpGrav);
         }
-        if (o.id == 3022 || o.id == 2066 || o.id == 1268) {
+        if (o.id == 3022 || o.id == 2066 || o.id == 1268 || o.id == 1594
+            || o.id == 3619 || o.id == 3620 || o.id == 3614 || o.id == 3615 || o.id == 3617) {
             auto pv = [&](int p, double fallback = 0.0) {
                 const int col = playerCol[(size_t)p];
                 return col >= 0 && col < kObjFields && !f[col].empty()
@@ -1414,7 +1415,7 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             m.noTouch = colNoTouch >= 0 && colNoTouch < kObjFields
                 && std::atoi(f[colNoTouch].c_str()) != 0;
             L.playerSources.emplace(o.uid, m);
-            if (o.id != 1268) {
+            if (o.id == 3022 || o.id == 2066) {
                 if (playerCol[0] < 0 || playerCol[12] < 0 || colTouch < 0 || colSpawn < 0)
                     L.playerFallback = "player trigger uid " + std::to_string(o.uid)
                         + " needs a refreshed objrects export";

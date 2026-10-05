@@ -115,6 +115,13 @@ inline uint8_t gdUpOf(const State& s) {
 // the windows are frame-0 x ranges, and the one block that needs this (SubZero 4003's uid 4001)
 // sits in frame 0.
 inline bool nearPressBox(const State& s) {
+    if (s.item && s.frame != 0) for (int index : g_itemProgram.roots) {
+        const auto& n = g_itemProgram.nodes[(size_t)index];
+        if (n.kind != ItemKind::Press) continue;
+        double x, y; fromFrame(s.frame, s.xAbs, s.y, x, y);
+        if (std::fabs(x - n.meta.cx) <= n.meta.hw + 35.0
+            && std::fabs(y - n.meta.cy) <= n.meta.hh + 35.0) return true;
+    }
     if (g_pressWin.empty() || s.frame != 0) return false;
     const double x = (double)s.xAbs;
     for (const PressWin& w : g_pressWin)
@@ -152,6 +159,8 @@ struct SearchKey {
     uint64_t pressFired = 0, pressHeld = 0;
     // Zero means at rest; a live bucket is fireB/4 + 1, including tick zero.
     std::array<uint16_t, kTouchBits> movingFire{};
+    const std::vector<uint64_t>* itemWords = nullptr;
+    uint64_t itemClock = 0;
 
     // Keep comparison, hashing and trace encoding on the same field list.
     template <class Self>
@@ -170,11 +179,19 @@ struct SearchKey {
                         k.pressFired, k.pressHeld, k.movingFire);
     }
     // Compare all canonical dimensions, not the storage representation.
-    bool operator==(const SearchKey& b) const { return fields(*this) == fields(b); }
+    bool operator==(const SearchKey& b) const {
+        return fields(*this) == fields(b) && itemClock == b.itemClock
+            && (itemWords == b.itemWords || (itemWords && b.itemWords && *itemWords == *b.itemWords));
+    }
     // Negate the same complete equality used by the dedupe tables.
     bool operator!=(const SearchKey& b) const { return !(*this == b); }
     // Order full keys for the cell-cap and clearance diagnostics.
-    bool operator<(const SearchKey& b) const { return fields(*this) < fields(b); }
+    bool operator<(const SearchKey& b) const {
+        if (fields(*this) != fields(b)) return fields(*this) < fields(b);
+        if (itemClock != b.itemClock) return itemClock < b.itemClock;
+        if (!itemWords || !b.itemWords) return !itemWords && b.itemWords;
+        return *itemWords < *b.itemWords;
+    }
 };
 
 // Visit integer fields and array elements without inspecting padding.
@@ -199,6 +216,10 @@ struct SearchKeyHash {
             x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
             h = (h ^ (x ^ (x >> 31))) * 0x100000001B3ull;
         });
+        if (k.itemWords) {
+            h = (h ^ k.itemClock) * 0x100000001B3ull;
+            for (uint64_t v : *k.itemWords) h = (h ^ v) * 0x100000001B3ull;
+        }
         return (size_t)h;
     }
 };
@@ -206,8 +227,12 @@ struct SearchKeyHash {
 // Versioned full keys let rejoinfull reject legacy digest-only traces.
 inline std::string keyText(const SearchKey& k) {
     std::ostringstream out;
-    out << "v3" << std::hex;
+    out << (k.itemWords ? "v4" : "v3") << std::hex;
     keyWords(k, [&](auto v) { out << ':' << (uint64_t)v; });
+    if (k.itemWords) {
+        out << ':' << k.itemClock;
+        for (uint64_t v : *k.itemWords) out << ':' << v;
+    }
     return out.str();
 }
 
@@ -215,7 +240,8 @@ inline std::string keyText(const SearchKey& k) {
 inline bool parseKeyText(const std::string& text, SearchKey& result) {
     std::istringstream in(text);
     std::string word;
-    if (!std::getline(in, word, ':') || word != "v3") return false;
+    if (!std::getline(in, word, ':') || (word != "v3" && word != "v4")) return false;
+    const bool items = word == "v4";
     SearchKey k;
     bool ok = true;
     keyWords(k, [&](auto& v) {
@@ -225,7 +251,22 @@ inline bool parseKeyText(const std::string& text, SearchKey& result) {
         if (r.ec != std::errc{} || r.ptr != word.data() + word.size()) { ok = false; return; }
         v = (std::remove_reference_t<decltype(v)>)n;
     });
-    if (!ok || keyText(k) != text) return false;
+    if (!ok) return false;
+    if (items) {
+        auto words = std::make_unique<std::vector<uint64_t>>();
+        bool first = true;
+        while (std::getline(in, word, ':')) {
+            uint64_t n = 0;
+            const auto r = std::from_chars(word.data(), word.data() + word.size(), n, 16);
+            if (word.empty() || r.ec != std::errc{} || r.ptr != word.data() + word.size()) return false;
+            if (first) { k.itemClock = n; first = false; }
+            else words->push_back(n);
+        }
+        if (first || words->empty()) return false;
+        k.itemWords = words.get();
+        g_itemParsedKeys.push_back(std::move(words));
+    }
+    if (keyText(k) != text) return false;
     result = k;
     return true;
 }
@@ -233,6 +274,7 @@ inline bool parseKeyText(const std::string& text, SearchKey& result) {
 // Preserve the existing grid and conditional dimensions; t is the owning layer.
 inline SearchKey keyOf(const State& s, long long t) {
     SearchKey k;
+    if (s.item) { k.itemWords = &s.item->words; k.itemClock = itemBits(s.itemClock); }
     std::memcpy(&k.gravity, &s.gravityMod, sizeof(k.gravity));
     std::memcpy(&k.gravity2, &s.gravityMod2, sizeof(k.gravity2));
     if (s.mode == 0) std::memcpy(&k.spin, &s.spinMod, sizeof(k.spin));
