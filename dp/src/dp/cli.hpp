@@ -2183,7 +2183,19 @@ inline int cliMainOnce(int argc, char** argv) {
         }
     }
     prepMark(3);
+    const double goalX = L.maxX + 60.0;
+    // Slow sections can outlive the base-speed budget. Late anchors need at least
+    // 8,000 more ticks (the 6,000-tick repair horizon plus slack), as before.
+    long long tEnd = (long long)std::ceil(goalX / kDx) + 2;
+    if (t0 > 0) tEnd = std::max(tEnd, t0 + 8000);
+    // Decide before attaching source bits or reading history; fallback keeps geometry's map.
+    if (!L.playerEffects.empty() && L.playerFallback.empty() && tEnd >= 65535)
+        L.playerFallback = "player trigger run exceeds the 16-bit source clock";
     loadPlayerTriggers(L, trigPath, grpPath);
+    g_outcome.playerFallback = L.playerFallback;
+    if (!L.playerFallback.empty())
+        std::printf("player trigger fallback: %s; continuing search with native replay repair\n",
+                    L.playerFallback.c_str());
     if (!g_playerRoots.empty()) {
         // Player-only roots append slots after the geometry population was measured.
         unsigned long long h = 1469598103934665603ull;
@@ -3873,7 +3885,6 @@ inline int cliMainOnce(int argc, char** argv) {
                         (int)init.frame, (int)init.armT);
         }
     }
-    const double goalX = L.maxX + 60.0;
     g_goalX = goalX;   // --goalspare (speed.hpp)
     // ---- --coins: route through the level's coins as well as to its end -----
     //
@@ -4678,21 +4689,6 @@ inline int cliMainOnce(int argc, char** argv) {
                 g_topAhead[i] = std::max(g_topAhead[i], g_topAhead[i + 1]);
         }
     }
-    // The tick budget is the count "from x=0 to goalX at the base speed". A
-    // LEVEL WITH SLOW SECTIONS EXCEEDS IT: lv22 has sections where x barely
-    // advances (rotation / reverse), so for a t=18,600 anchor tEnd came out
-    // as 18,602 and both the replay and the DP ENDED AFTER 1 TICK (SURVIVED
-    // to t=18601 / maxAlive=1). The late-game wall that looked like a
-    // coordinate-system problem was this. Starting from an anchor, allow at
-    // least 8,000 ticks beyond it (max horizon 6,000 + slack). A run from the
-    // start (t0=0) is as before.
-    long long tEnd = (long long)std::ceil(goalX / kDx) + 2;
-    if (t0 > 0) tEnd = std::max(tEnd, t0 + 8000);
-    if (!g_playerRoots.empty() && tEnd >= 65535) {
-        std::printf("unsupported: player trigger run exceeds the 16-bit source clock\n");
-        return 2;
-    }
-
     const gdapprox::ShipParams SP = gdapprox::ShipParams::normal();
     const gdapprox::ShipParams SPmini = gdapprox::ShipParams::mini();
     const gdapprox::UfoParams UP = gdapprox::UfoParams::normal();

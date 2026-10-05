@@ -845,6 +845,17 @@ void playerEffectColumns() {
     check(level.unsupported.empty() && level.playerEffects.size() == 1 && level.portals.empty()
         && level.playerEffects[0].teleport.tpEx == 1000 && level.spatialTeleport,
         "ID 3022 resolves an exit but is never routed as an ordinary portal");
+    v[53] = "2";
+    std::istringstream random(text());
+    level = dp::loadLevelFrom(random);
+    check(level.unsupported.empty() && level.playerFallback.find("random destinations") != std::string::npos,
+          "a random teleport trigger defers to replay without refusing the level");
+    v[53] = "1"; v[62] = "1";
+    std::istringstream dash(text());
+    level = dp::loadLevelFrom(dash);
+    check(level.unsupported.empty() && level.playerFallback.find("redirects a dash") != std::string::npos,
+          "a dash-redirecting teleport trigger defers to replay without refusing the level");
+    v[62] = "0";
     v[0] = "1268"; v[71] = ".125"; v[72] = ".25"; v[73] = "1";
     std::istringstream sp(text());
     level = dp::loadLevelFrom(sp);
@@ -853,8 +864,11 @@ void playerEffectColumns() {
           "Spawn scheduling reads its own delay, range and ordered flag, not dur");
     std::istringstream old(std::string(kObjHeader) + "\n"
         "2066,20,100,300,30,30,0,42\n");
-    check(dp::loadLevelFrom(old).unsupported.find("refreshed") != std::string::npos,
-          "old exports cannot silently drop player effect metadata");
+    level = dp::loadLevelFrom(old);
+    dp::loadPlayerTriggers(level, "", "");
+    check(level.unsupported.empty() && level.playerFallback.find("refreshed") != std::string::npos
+          && dp::g_playerRoots.empty(),
+          "old player exports warn and defer to replay without refusing the level");
     dp::resetInvocationState();
 }
 
@@ -936,7 +950,7 @@ void playerTriggerClocks() {
           "a second solver invocation inherits no player sources or pending actions");
 }
 
-// The graph uses measured Spawn metadata, and refuses schedules not represented by a clock.
+// Unsupported player graphs roll back their attachments and leave geometry searchable.
 void playerSpawnGraph() {
     dp::resetInvocationState();
     const std::string tr = writeTmp("dptest_player_trig.txt", "header\n"
@@ -968,33 +982,98 @@ void playerSpawnGraph() {
     check(l.unsupported.empty() && dp::g_touch[0].playerActions[0].delay == 12,
           "a float 0.05-second delay fires at 12 ticks, not ceil(float delay * 240) = 13");
     l.playerSources[2].delayRange = .1;
+    dp::resetInvocationState();
     dp::loadPlayerTriggers(l, tr, gr);
-    check(l.unsupported.find("random") != std::string::npos,
-          "random Spawn delays are refused instead of being treated as deterministic");
-    l.unsupported.clear(); l.playerSources[2].delayRange = 0;
+    check(l.unsupported.empty() && l.playerFallback.find("random") != std::string::npos
+          && dp::g_playerRoots.empty() && dp::g_touch.empty(),
+          "random Spawn delays warn without installing deterministic actions");
+    l.playerFallback.clear(); l.playerSources[2].delayRange = 0;
     l.playerSources[1].multi = true;
     dp::loadPlayerTriggers(l, tr, gr);
-    check(l.unsupported.find("repeating") != std::string::npos,
+    check(l.unsupported.empty() && l.playerFallback.find("repeating") != std::string::npos,
           "a repeated source cannot overwrite its only event clock silently");
-    l.unsupported.clear(); l.playerSources[1].multi = false;
+    l.playerFallback.clear(); l.playerSources[1].multi = false;
     dp::loadPlayerTriggers(l, "", "");
-    check(l.unsupported.find("no modelled Spawn source") != std::string::npos,
-          "a spawned player effect without the graph export is explicitly unsupported");
-    dp::resetInvocationState(); l.unsupported.clear();
+    check(l.unsupported.empty() && l.playerFallback.find("no modelled Spawn source") != std::string::npos,
+          "an unmodelled activation source falls back to native replay rather than refusing search");
+    dp::resetInvocationState(); l.playerFallback.clear();
     dp::g_timeWarps.push_back({0, .5});
     dp::loadPlayerTriggers(l, tr, gr);
-    check(l.unsupported.find("game-time event clock") != std::string::npos,
+    check(l.unsupported.empty() && l.playerFallback.find("game-time event clock") != std::string::npos,
           "TimeWarp cannot silently turn a tick clock into a real-time Spawn timer");
-    dp::resetInvocationState(); l.unsupported.clear();
+    dp::resetInvocationState(); l.playerFallback.clear();
     dp::g_rotTrig.push_back({});
     dp::loadPlayerTriggers(l, tr, gr);
-    check(l.unsupported.find("rotation queue") != std::string::npos,
-          "unmodelled autonomous queue interleaving is explicitly refused");
+    check(l.unsupported.empty() && l.playerFallback.find("rotation queue") != std::string::npos,
+          "unmodelled autonomous queue interleaving falls back to native replay");
     dp::resetInvocationState();
-    l.unsupported.clear(); l.playerSources[1].disabled = true;
+    l.playerFallback.clear(); l.playerSources[1].disabled = true;
     dp::loadPlayerTriggers(l, tr, gr);
-    check(l.unsupported.find("disabled or NoTouch") != std::string::npos,
+    check(l.unsupported.empty() && l.playerFallback.find("disabled or NoTouch") != std::string::npos,
           "a disabled source cannot silently fire its player effects");
+    dp::resetInvocationState();
+    l.playerFallback.clear(); l.playerSources[1].disabled = false;
+    dp::TouchTrig geometry{};
+    geometry.uid = 1; geometry.press = true; geometry.togOnUids = {123};
+    geometry.ctl.push_back({});
+    dp::g_touch.push_back(geometry);
+    auto direct = c;
+    direct.uid = 4; direct.spawn = false;
+    auto orphan = c;
+    orphan.uid = 5;
+    l.playerSources.emplace(4, direct);
+    l.playerSources.emplace(5, orphan);
+    e.teleport.uid = 4; l.playerEffects.push_back(e);
+    e.teleport.uid = 5; l.playerEffects.push_back(e);
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(l.unsupported.empty() && !l.playerFallback.empty() && dp::g_playerRoots.empty()
+          && dp::g_touch.size() == 1 && dp::g_touch[0].uid == 1
+          && dp::g_touch[0].playerActions.empty() && !dp::g_touch[0].playerAuto
+          && !dp::g_touch[0].playerOnly && dp::g_touch[0].press
+          && dp::g_touch[0].ctl.size() == 1 && dp::g_touch[0].togOnUids == std::vector<int>{123},
+          "a late unmodelled effect rolls back reused and appended slots, preserving geometry");
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(dp::g_playerRoots.empty() && dp::g_touch.size() == 1,
+          "a fallback level cannot reinstall a partial player graph on another preparation");
+    dp::resetInvocationState();
+}
+
+// A fallback must publish its reason through the outcome while still searching and writing a plan.
+void playerFallbackSearch() {
+    const std::string path = writeTmp("dptest_player_fallback.csv", "");
+    const std::string out = writeTmp("dptest_player_fallback.plan.txt", "");
+    std::vector<std::string> fields(52, "0");
+    fields[0] = "2066"; fields[1] = "20"; fields[2] = "30"; fields[3] = "300";
+    fields[4] = fields[5] = "30"; fields[7] = "42"; fields[44] = "1";
+    fields[50] = fields[51] = "1";
+    auto csv = [&]() {
+        std::string text = std::string(kObjHeader) + ",pgrav,psingle\n";
+        for (size_t i = 0; i < fields.size(); ++i) text += (i ? "," : "") + fields[i];
+        return text + "\n";
+    };
+    auto solve = [&](const std::string& text) {
+        writeTmp("dptest_player_fallback.csv", text);
+        std::vector<std::string> args = {"dptest", path, "--out", out,
+            "--threads", "1", "--cap", "100", "--horizon", "2"};
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        return dp::cliMain((int)argv.size(), argv.data());
+    };
+    check(solve(csv()) == 0 && dp::g_outcome.unsupported.empty()
+          && dp::g_outcome.playerFallback.find("no modelled Spawn source") != std::string::npos
+          && dp::g_outcome.planWritten && dp::g_outcome.workStates > 0
+          && dp::g_playerRoots.empty(),
+          "an unmodelled player graph publishes a warning, searches and emits a replayable prefix");
+    fields[44] = "0";
+    check(solve(csv()) == 0 && dp::g_outcome.playerFallback.empty()
+          && dp::g_outcome.planWritten && !dp::g_playerRoots.empty(),
+          "the next supported invocation clears the fallback and retains its player model");
+    check(solve(csv() + "1,0,100000,1000,30,30,0,99\n") == 0
+          && dp::g_outcome.unsupported.empty()
+          && dp::g_outcome.playerFallback.find("16-bit source clock") != std::string::npos
+          && dp::g_outcome.planWritten && dp::g_outcome.workStates > 0
+          && dp::g_playerRoots.empty(),
+          "a player clock overflow falls back before history seeding instead of refusing search");
     dp::resetInvocationState();
 }
 
@@ -1204,6 +1283,7 @@ int main(int argc, char** argv) {
     playerEffectColumns();
     playerTriggerClocks();
     playerSpawnGraph();
+    playerFallbackSearch();
     gravityMultiplierPhysics();
     playerAnchorParsing();
     playerTouchLatches();

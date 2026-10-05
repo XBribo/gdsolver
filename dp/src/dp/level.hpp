@@ -65,6 +65,8 @@ struct Level {
     // solver runs on a detached thread there, and exit() from it is an abort in
     // the host process (0xC0000409), with no log line to say why.
     std::string unsupported;
+    // Non-fatal: omit the player-trigger graph and let native replay repair the model.
+    std::string playerFallback;
     // Spatial teleports can separate the frontier into distant travel windows.
     bool spatialTeleport = false;
     std::vector<PlayerEffect> playerEffects;

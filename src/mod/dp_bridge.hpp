@@ -27,6 +27,8 @@ struct LevelStats {
     // Non-empty when the parser refused the level (dp Level::unsupported, e.g. more
     // gravity portals than the latch holds). Nothing may be solved on it then.
     std::string unsupported;
+    // Player-trigger metadata is incomplete; this does not refuse the level.
+    std::string playerFallback;
 };
 
 // Parse a CSV held in memory (the same bytes that go into objrects.txt).
@@ -154,6 +156,8 @@ struct SolveOutcome {
     // The load refused the level (dp Level::unsupported); the call returned 2 and
     // searched nothing. Empty otherwise.
     std::string unsupported;
+    // Player-trigger graph was omitted, but the search was allowed to run.
+    std::string playerFallback;
     // The cap ladder's account of the call (dp progress.hpp SearchOutcome::ladder): its
     // attempts, how many never bound their cap, the plain search's plan hash and the chosen
     // plan's. Empty for a call that was not a ladder.

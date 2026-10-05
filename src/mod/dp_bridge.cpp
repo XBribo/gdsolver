@@ -70,6 +70,7 @@ LevelStats statsFromCsv(const std::string& csv) {
     s.moving = L.dyn.size();
     s.maxX = L.maxX;
     s.unsupported = L.unsupported;
+    s.playerFallback = L.playerFallback;
     return s;
 }
 
@@ -191,6 +192,7 @@ void adoptOutcome(const SolveOutcome& s) {
     o.trigMaxKeptX = s.trigMaxKeptX;
     o.trigMapSig = s.trigMapSig;
     o.unsupported = s.unsupported;
+    o.playerFallback = s.playerFallback;
 }
 
 bool besideStart(const std::vector<std::string>& argv) {
@@ -320,6 +322,7 @@ std::string outcomeDiff(const SolveOutcome& a, const SolveOutcome& b) {
           && a.trigDroppedAhead == b.trigDroppedAhead && a.trigMaxKeptX == b.trigMaxKeptX
           && a.trigMapSig == b.trigMapSig, "trig");
     f(a.unsupported == b.unsupported, "unsupported");
+    f(a.playerFallback == b.playerFallback, "playerFallback");
     return d;
 }
 

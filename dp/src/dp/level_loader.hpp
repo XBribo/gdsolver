@@ -1373,10 +1373,10 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             o.tpRedirectMax = tpValue(colTpMax, 0.f);
             o.tpRedirectDash = (uint8_t)(tpValue(colTpDash, 0.f) != 0.f);
             if (o.tpExitCount > 1)
-                L.unsupported = "teleport uid " + std::to_string(o.uid)
+                (o.id == 3022 ? L.playerFallback : L.unsupported) = "teleport uid " + std::to_string(o.uid)
                     + " has random destinations";
             if (o.tpRedirectDash)
-                L.unsupported = "teleport uid " + std::to_string(o.uid)
+                (o.id == 3022 ? L.playerFallback : L.unsupported) = "teleport uid " + std::to_string(o.uid)
                     + " redirects a dash (not modelled)";
             L.spatialTeleport = L.spatialTeleport
                 || ((!o.tpIgnoreX && o.id != 747) || o.tpSaveOffset);
@@ -1416,7 +1416,7 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             L.playerSources.emplace(o.uid, m);
             if (o.id != 1268) {
                 if (playerCol[0] < 0 || playerCol[12] < 0 || colTouch < 0 || colSpawn < 0)
-                    L.unsupported = "player trigger uid " + std::to_string(o.uid)
+                    L.playerFallback = "player trigger uid " + std::to_string(o.uid)
                         + " needs a refreshed objrects export";
                 PlayerEffect e;
                 e.teleport = o;
@@ -1425,12 +1425,12 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
                 e.player2 = (uint8_t)(pv(2) != 0);
                 e.triggeringPlayer = (uint8_t)(pv(3) != 0);
                 if (o.id == 2066 && pv(3) < 0)
-                    L.unsupported = "gravity trigger role layout has not been measured on this platform";
+                    L.playerFallback = "gravity trigger role layout has not been measured on this platform";
                 if (!std::isfinite(e.gravity))
-                    L.unsupported = "gravity trigger uid " + std::to_string(o.uid)
+                    L.playerFallback = "gravity trigger uid " + std::to_string(o.uid)
                         + " has a non-finite multiplier";
                 if (o.id == 3022 && o.tpExitCount > 0 && m.exitUid < 0)
-                    L.unsupported = "teleport trigger uid " + std::to_string(o.uid)
+                    L.playerFallback = "teleport trigger uid " + std::to_string(o.uid)
                         + " needs a refreshed exit UID export";
                 L.playerEffects.push_back(e);
                 continue;   // A trigger is not a collision portal, even with type 28.

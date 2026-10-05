@@ -5957,6 +5957,9 @@ inline void start(GJBaseGameLayer* l) {
             endSession("unsupported_level");
             return;
         }
+        if (!st.playerFallback.empty())
+            writeResult("dpsolve: player trigger fallback - " + st.playerFallback
+                        + "; continuing search with native replay repair");
     }
     loadModePortals(g_csv);    // where the mode portals are; see missedPortalTick
     loadRotObjs(g_csv);        // ...and the 2900s, for --spentrot (see spentRotArg)
@@ -8513,6 +8516,9 @@ inline void poll() {
                             : g_plan.empty() ? " (a plan that never presses - flying it)" : "");
     writeResult(b);
     g_dpSolving = false;
+    if (g_iter == 0 && !dpbridge::outcome().playerFallback.empty())
+        writeResult("dpsolve: player trigger fallback - " + dpbridge::outcome().playerFallback
+                    + "; continuing search with native replay repair");
     // Only a missing plan stops here. An EMPTY one is an answer ("never press"), and the game
     // is the one to say whether it is right -- see the first solve's acceptance in spawn().
     if (!g_haveNewPlan) {

@@ -39,5 +39,6 @@ o.trigDroppedAhead = dp::g_outcome.trigDroppedAhead;
 o.trigMaxKeptX = dp::g_outcome.trigMaxKeptX;
 o.trigMapSig = dp::g_outcome.trigMapSig;
 o.unsupported = dp::g_outcome.unsupported;
+o.playerFallback = dp::g_outcome.playerFallback;
 o.ladder = dp::g_outcome.ladder;
 return o;

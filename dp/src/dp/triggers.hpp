@@ -800,11 +800,18 @@ inline const std::unordered_map<int, std::vector<int>>* groupMembersCached(
     return &c.byGroup;
 }
 
-// Attach bounded, acyclic Spawn chains without changing geometry's trigger population.
+// Attach bounded Spawn chains transactionally; unsupported graphs defer to native replay.
 inline void loadPlayerTriggers(Level& L, const std::string& trigPath,
                                const std::string& groupPath) {
     g_playerRoots.clear();
-    if (L.playerEffects.empty() || !L.unsupported.empty()) return;
+    if (L.playerEffects.empty() || !L.unsupported.empty() || !L.playerFallback.empty()) return;
+    const auto geometryTouch = g_touch;
+    // A later unsupported root must undo earlier attachments, including reused geometry slots.
+    auto fallback = [&](std::string reason) {
+        L.playerFallback = std::move(reason);
+        g_touch = geometryTouch;
+        g_playerRoots.clear();
+    };
     const auto* rows = trigPath.empty() ? nullptr : trigRowsCached(trigPath);
     const auto* groups = groupPath.empty() ? nullptr : groupMembersCached(groupPath);
     std::unordered_map<int, const PlayerEffect*> effects;
@@ -882,18 +889,18 @@ inline void loadPlayerTriggers(Level& L, const std::string& trigPath,
                 bad = "disabled or NoTouch player source/effect (not modelled)";
         }
         if (!bad.empty() || root.multi || root.onExit || root.channel < 0 || root.channel > 15) {
-            L.unsupported = "player trigger source uid " + std::to_string(root.uid) + ": "
-                + (!bad.empty() ? bad : "repeating, exit or invalid-channel source");
+            fallback("player trigger source uid " + std::to_string(root.uid) + ": "
+                + (!bad.empty() ? bad : "repeating, exit or invalid-channel source"));
             return;
         }
         if (!root.touch && !g_rotTrig.empty()) {
-            L.unsupported = "autonomous player source uid " + std::to_string(root.uid)
-                + " shares the gameplay-rotation queue (not modelled)";
+            fallback("autonomous player source uid " + std::to_string(root.uid)
+                + " shares the gameplay-rotation queue (not modelled)");
             return;
         }
         if (!g_timeWarps.empty() && std::any_of(actions.begin(), actions.end(),
                 [](const auto& a) { return a.delay > 0; })) {
-            L.unsupported = "delayed player effects with TimeWarp need a game-time event clock";
+            fallback("delayed player effects with TimeWarp need a game-time event clock");
             return;
         }
         // No snapshot approximation for sources/effects/exits controlled by another trigger.
@@ -913,8 +920,8 @@ inline void loadPlayerTriggers(Level& L, const std::string& trigPath,
                     affected |= std::find(gi->second.begin(), gi->second.end(), meta.exitUid) != gi->second.end();
             }
             if (affected) {
-                L.unsupported = "player trigger source uid " + std::to_string(root.uid)
-                    + " has a group-controlled source, effect or exit (not modelled)";
+                fallback("player trigger source uid " + std::to_string(root.uid)
+                    + " has a group-controlled source, effect or exit (not modelled)");
                 return;
             }
         }
@@ -930,8 +937,8 @@ inline void loadPlayerTriggers(Level& L, const std::string& trigPath,
                 }
             if (bit < 0) {
                 if (g_touch.size() >= (size_t)kTouchBits) {
-                    L.unsupported = "player triggers exceed the shared " + std::to_string(kTouchBits)
-                        + " source slots";
+                    fallback("player triggers exceed the shared " + std::to_string(kTouchBits)
+                        + " source slots");
                     return;
                 }
                 TouchTrig t{};
@@ -952,8 +959,8 @@ inline void loadPlayerTriggers(Level& L, const std::string& trigPath,
     for (const auto& e : L.playerEffects) {
         const auto& m = L.playerSources.at(e.teleport.uid);
         if (m.spawn && !m.silent && !reached.count(m.uid)) {
-            L.unsupported = "player trigger uid " + std::to_string(m.uid)
-                + " has no modelled Spawn source (export triggers and objgroups)";
+            fallback("player trigger uid " + std::to_string(m.uid)
+                + " has no modelled Spawn source (export triggers and objgroups)");
             return;
         }
     }
@@ -962,14 +969,14 @@ inline void loadPlayerTriggers(Level& L, const std::string& trigPath,
         const auto& t = g_touch[(size_t)b];
         if (!t.playerAuto && !t.playerBody && std::any_of(t.playerActions.begin(),
                 t.playerActions.end(), [](const auto& a) { return a.delay > 0; })) {
-            L.unsupported = "shared-touch delayed player source has ambiguous queue ordering";
+            fallback("shared-touch delayed player source has ambiguous queue ordering");
             return;
         }
     }
     // A malformed graph must not disappear merely because it produced no leaf actions.
     for (const auto& root : roots)
         if (root.id != 1268 && !root.silent && !reached.count(root.uid)) {
-            L.unsupported = "player trigger uid " + std::to_string(root.uid) + " is unreachable";
+            fallback("player trigger uid " + std::to_string(root.uid) + " is unreachable");
             return;
         }
     buildTouchMoveTicks();
