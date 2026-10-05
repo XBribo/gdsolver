@@ -115,6 +115,14 @@ static_assert(kObjAreaMoveSkip == offsetof(GameObject, m_unk508));
 static_assert(kRingClaimTouch == offsetof(RingObject, m_claimTouch));
 static_assert(kCheckpointObject == offsetof(CheckpointObject, m_physicalCheckpointObject));
 
+#if defined(GEODE_IS_WINDOWS)
+// EffectGameObject::triggerObject case 2066 reads these fields in GD 2.2081 (0x4a5f30).
+static_assert(offsetof(EffectGameObject, m_targetPlayer1) == 0x6a4);
+static_assert(offsetof(EffectGameObject, m_targetPlayer2) == 0x6a5);
+static_assert(offsetof(EffectGameObject, m_followCPP) == 0x6a6);
+static_assert(offsetof(EffectGameObject, m_gravityValue) == 0x6d8);
+#endif
+
 static_assert(kEnterStartAngle == offsetof(EnterEffectObject, m_startAngle));
 static_assert(kEnterAnglePosition == offsetof(EnterEffectObject, m_anglePosition));
 static_assert(kEnterRelative == offsetof(EnterEffectObject, m_relative));

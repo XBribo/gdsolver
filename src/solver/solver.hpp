@@ -544,14 +544,12 @@ inline void writeObjRects(std::ostream& rf, GJBaseGameLayer* l) {
             pgrav = e->m_gravityValue;
             // EffectGameObject::triggerObject, 2.2081 0x4a5f30 case 2066:
             // +0x6a4/+0x6a5 exclude the OTHER player; +0x6a6 selects the caller.
-            // Two bytes are typed; the caller flag is unnamed Windows padding.
-            ptarget1 = e->m_rotateFollowP1 ? 1 : 0;
-            ptarget2 = e->m_rotateFollowP2 ? 1 : 0;
+            // These are the target-player flags (properties 138/200/201), not rotation follow.
+            ptarget1 = e->m_targetPlayer1 ? 1 : 0;
+            ptarget2 = e->m_targetPlayer2 ? 1 : 0;
             ptrigger = -1;   // an unmeasured layout must not export a guessed role
 #if defined(GEODE_IS_WINDOWS)
-            const auto* bytes = reinterpret_cast<const unsigned char*>(e);
-            if (reinterpret_cast<const unsigned char*>(&e->m_rotateFollowP1) - bytes == 0x6a4)
-                ptrigger = bytes[0x6a6] != 0;
+            ptrigger = e->m_followCPP ? 1 : 0;
 #endif
             multi = e->m_isMultiTriggered ? 1 : 0;
             trigexit = e->m_triggerOnExit ? 1 : 0;

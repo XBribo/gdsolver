@@ -5952,7 +5952,8 @@ inline void start(GJBaseGameLayer* l) {
                         + ". Nothing was searched and no plan was produced.");
             notify::show("gdsolver: unsupported level - " + st.unsupported,
                          NotificationIcon::Error, 6.f);
-            g_paused = true;
+            g_hudPhase = "unsupported: " + st.unsupported;
+            g_paused = false;   // a refusal has no search to wait for
             endSession("unsupported_level");
             return;
         }
@@ -7207,6 +7208,8 @@ inline void fileCoinMissEarly(long long dt) {
 
 inline void onDeath(long long dt, float deathX,
                     solver::AttemptEndKind kind = solver::AttemptEndKind::Collision) {
+    // A refused or finished session cannot start a repair job from subsequent normal deaths.
+    if (!g_started || g_sessionOver) return;
     const auto endPolicy = solver::attemptEndPolicy(kind);
     const bool noCollision = !endPolicy.learnCollision;
     // Consumed first, whichever way this returns, so a coin miss cannot leak into a later death.
@@ -8515,6 +8518,16 @@ inline void poll() {
     if (!g_haveNewPlan) {
         if (hadFlight) g_cfg.inputs = g_plan;   // never leave a flight installed as the plan
         g_paused = false;      // never leave the game frozen because the solve failed
+        // Graph-level refusals are discovered by the first worker, after the CSV preflight.
+        if (g_iter == 0 && !dpbridge::outcome().unsupported.empty()) {
+            const std::string why = dpbridge::outcome().unsupported;
+            g_stop = true;
+            g_hudPhase = "unsupported: " + why;
+            writeResult("dpsolve: unsupported level - " + why);
+            notify::show("gdsolver: unsupported level - " + why, NotificationIcon::Error, 6.f);
+            endSession("unsupported_level");
+            return;
+        }
         // A repeated, game-refuted answer needs another strategy, not another identical flight.
         if (g_repeatRejected && g_cfg.dpSecAuto && !g_autoPinOut && !g_autoRecordThenRung
             && autoFire("the ladder exhausted after rejecting game-refuted repeats")) return;
