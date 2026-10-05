@@ -1898,9 +1898,18 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
                            "objrects is older than the 2026-08-14 dump, "
                            "IGNORED\n", o.uid, o.cx);
             } else {
-                g_timeWarps.push_back({o.cx, tw});
-                loadPrintf("timewarp: uid %d at x=%.0f mod=%.4f\n",
-                           o.uid, o.cx, tw);
+                const bool conditional = (colTouch >= 0 && std::atoi(f[colTouch].c_str()) != 0)
+                    || (colSpawn >= 0 && std::atoi(f[colSpawn].c_str()) != 0);
+                // EffectGameObject::triggerObject writes the multiplier only when activated.
+                // A Spawn-only row behind On Death must not slow a surviving branch at its cx.
+                g_timeWarps.push_back({o.cx, tw, !conditional});
+                if (conditional)
+                    loadPrintf("timewarp: uid %d at x=%.0f mod=%.4f has Touch/Spawn activation "
+                               "NOT modelled; excluded from x crossings, continuing replay repair\n",
+                               o.uid, o.cx, tw);
+                else
+                    loadPrintf("timewarp: uid %d at x=%.0f mod=%.4f\n",
+                               o.uid, o.cx, tw);
             }
         }
         else if (o.id == 2866) {

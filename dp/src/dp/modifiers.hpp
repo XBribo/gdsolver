@@ -424,16 +424,17 @@ inline double forceFieldAcc(double x, double y, double pHalf) {
 //                                0.086 -> 0.129 ...; 0.216*0.2 = 0.0432 and the
 //                                0.001 grid is applied to each STEP, not to the
 //                                accumulated exact value)
-// Fires on the player's centre crossing the trigger's cx, effect from the next
-// tick -- the same rule as every other autotrigger. The partner at x=4,615
+// Ordinary (neither Touch nor Spawn) rows fire on the player's centre crossing cx,
+// effect from the next tick -- the same rule as every other autotrigger. The partner at x=4,615
 // carries tw=1.0 and restores it.
-struct TimeWarp { double cx, mod; };
+// Conditional rows stay in the list for the event-clock admission checks, not x activation.
+struct TimeWarp { double cx, mod; bool crossing = true; };
 inline std::vector<TimeWarp> g_timeWarps;   // sorted by cx at load
 inline double timeWarpAt(double x) {
     double m = 1.0;
     for (const auto& w : g_timeWarps) {
         if (w.cx > x) break;
-        m = w.mod;
+        if (w.crossing) m = w.mod;
     }
     return m;
 }

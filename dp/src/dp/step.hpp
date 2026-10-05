@@ -1743,9 +1743,9 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // TIME WARP (id 1935). A pure TIMESCALE, not a speed: the x advance, the y
     // integration and the velocity increment are all multiplied by the same
     // factor, while the dump's `speed` column does not move at all. Read off x
-    // rather than carried in the state -- it is a monotone function of x and
-    // the level's warps sit outside the rotated section, so there is nothing to
-    // remember. `xPrev` because the effect starts the tick AFTER the crossing,
+    // rather than carried in the state for ordinary crossings only. The measured
+    // lv22 warps sit outside the rotated section; conditional Touch/Spawn rows
+    // do not enter this x timeline. `xPrev` because the effect starts the tick AFTER the crossing,
     // the same +1 every autotrigger has (measured on lv22: the player crosses
     // cx=4,535 during t=3,131 and t=3,132 is the first slowed tick; the
     // partner at cx=4,615 is crossed during t=3,335 and t=3,336 is normal

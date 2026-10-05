@@ -683,6 +683,66 @@ void teleportColumns() {
     dp::resetInvocationState();
 }
 
+// Conditional Time Warp rows must not overwrite an ordinary warp merely by crossing their X.
+void timeWarpActivation() {
+    dp::resetInvocationState();
+    // Serialize the native export columns, including independent Touch and Spawn flags.
+    auto row = [](int uid, double x, double factor, int touch, int spawn) {
+        std::vector<std::string> fields(50, "0");
+        fields[0] = "1935"; fields[1] = "20"; fields[2] = std::to_string(x);
+        fields[3] = "-375"; fields[4] = fields[5] = "30";
+        fields[7] = std::to_string(uid); fields[21] = std::to_string(factor);
+        fields[43] = std::to_string(touch); fields[44] = std::to_string(spawn);
+        std::ostringstream out;
+        for (size_t i = 0; i < fields.size(); ++i) out << (i ? "," : "") << fields[i];
+        return out.str() + "\r\n";
+    };
+    for (int flags = 1; flags < 4; ++flags) {
+        std::istringstream in(std::string(kObjHeader) + "\r\n"
+            + row(1, 100, .2, 0, 0) + row(2, 200, .01, flags & 1, flags >> 1)
+            + row(3, 300, 1, 0, 0));
+        const auto level = dp::loadLevelFrom(in);
+        check(level.unsupported.empty() && dp::g_timeWarps.size() == 3
+              && dp::g_timeWarps[0].crossing && !dp::g_timeWarps[1].crossing
+              && dp::g_timeWarps[2].crossing,
+              "Touch/Spawn warps remain visible to clock checks without refusing search");
+        check(dp::timeWarpAt(99) == 1 && dp::timeWarpAt(100) == .2
+              && dp::timeWarpAt(200) == .2 && dp::timeWarpAt(300) == 1,
+              "only ordinary warp crossings change the multiplier, including restoration");
+    }
+    std::istringstream conditional(std::string(kObjHeader) + "\n"
+        + row(94959, 23085, .01, 0, 1));
+    dp::loadLevelFrom(conditional);
+    check(dp::timeWarpAt(27341.2324) == 1,
+          "crossing an On Death group's Spawn-only warp cannot slow a surviving tail");
+    dp::LoadLevelWrites saved;
+    saved.take();
+    std::istringstream ordinary(std::string(kObjHeader) + "\n" + row(4, 100, .5, 0, 0));
+    dp::loadLevelFrom(ordinary);
+    check(dp::g_timeWarps.size() == 1 && dp::timeWarpAt(27341.2324) == .5,
+          "another level load replaces, rather than inherits, the warp activation table");
+    saved.put();
+    check(dp::g_timeWarps.size() == 1 && !dp::g_timeWarps[0].crossing
+          && dp::timeWarpAt(27341.2324) == 1,
+          "cached level restoration preserves conditional warp admission");
+    std::vector<const dp::Obj*> empty;
+    const auto ship = gdapprox::ShipParams::normal(), mini = gdapprox::ShipParams::mini();
+    const auto ufo = gdapprox::UfoParams::normal(), ufoMini = gdapprox::UfoParams::mini();
+    dp::State s{};
+    s.xAbs = 27341.2324f; s.y = 183.773407f; s.vy = -4.53599977f; s.dx = 1.29825f;
+    dp::StepCtx k{(double)s.xAbs + s.dx, s.xAbs, s.dx, 14393,
+        &empty, &empty, &empty, &empty, &empty, &empty, &ship, &mini, &ufo, &ufoMini};
+    bool dead = false;
+    const auto moved = dp::stepBoth(s, 0, k, dead);
+    dp::g_timeWarps.clear();
+    const auto normal = dp::stepBoth(s, 0, k, dead);
+    check(moved.xAbs == normal.xAbs && moved.y == normal.y && moved.vy == normal.vy
+          && moved.xAbs - s.xAbs > 1,
+          "the real transition advances normally beyond a conditional .01 warp, not at 1% speed");
+    dp::resetInvocationState();
+    check(dp::g_timeWarps.empty(), "a new solver invocation retains no conditional warp rows");
+}
+
 // A remote body's read-only query must neither move a group cursor nor lose wide rectangles.
 void independentWindows() {
     std::vector<dp::Obj> objects(3);
@@ -1001,6 +1061,10 @@ void playerSpawnGraph() {
     dp::loadPlayerTriggers(l, tr, gr);
     check(l.unsupported.empty() && l.playerFallback.find("game-time event clock") != std::string::npos,
           "TimeWarp cannot silently turn a tick clock into a real-time Spawn timer");
+    l.playerFallback.clear(); dp::g_timeWarps[0].crossing = false;
+    dp::loadPlayerTriggers(l, tr, gr);
+    check(l.unsupported.empty() && l.playerFallback.find("game-time event clock") != std::string::npos,
+          "excluding a conditional warp from crossings does not admit an unmeasured Spawn clock");
     dp::resetInvocationState(); l.playerFallback.clear();
     dp::g_rotTrig.push_back({});
     dp::loadPlayerTriggers(l, tr, gr);
@@ -1217,6 +1281,14 @@ void levelWarnings() {
     check(supported.newer && supported.newerCount.at(3022) == 1
           && supported.newerCount.at(2066) == 1,
           "newer-mechanic diagnostics remain separate from unsupported warnings");
+    check(levelwarn::scan("header;1,1935;1,1935,11,0,62,0;", false).unmodelled == 0,
+          "ordinary Time Warp rows do not produce an unsupported warning");
+    for (const char* flags : {"11,1", "62,1", "11,1,62,1"}) {
+        const auto warp = levelwarn::scan(std::string("header;1,1935,") + flags + ";", false);
+        check(warp.unmodelled == levelwarn::kConditionalTimeWarp
+              && levelwarn::describe(warp.unmodelled) == "touch/spawn-activated time warp",
+              "conditional Time Warp menu diagnostics match the core's remaining limitation");
+    }
     for (int id : {2902, 3022}) {
         const auto random = levelwarn::scan("header;1," + std::to_string(id)
             + ",51,9;1,1,57,9;1,1,57,9;", false);
@@ -1517,6 +1589,7 @@ int main(int argc, char** argv) {
     teleportTargets();
     teleportForces();
     teleportColumns();
+    timeWarpActivation();
     independentWindows();
     teleportDualStep();
     playerEffectRoles();

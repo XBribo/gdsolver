@@ -52,6 +52,8 @@ enum : uint32_t {
     kPlatformer = 1u << 9,
     // TeleportPortalObject::m_redirectDash (key 591) is still refused by the core.
     kTeleportDash = 1u << 10,
+    // Conditional Time Warp rows are excluded from the core's ordinary x-crossing table.
+    kConditionalTimeWarp = 1u << 11,
 };
 
 // The phrase each bit is shown as, in bit order.
@@ -67,6 +69,7 @@ inline const char* const kUnmodelledNames[] = {
     "triggers that count attempts",
     "platformer mode",
     "teleports that redirect a dash",
+    "touch/spawn-activated time warp",
 };
 
 // Objects added in 2.0 or later that are not a recolour of an older one. Derived, not listed by
@@ -263,6 +266,10 @@ inline Findings scan(std::string_view all, bool platformer) {
                 }
                 break;
             case 3027: r.unmodelled |= kTeleportOrb; break;
+            case 1935:
+                if (isOn(field(obj, "11")) || isOn(field(obj, "62")))
+                    r.unmodelled |= kConditionalTimeWarp;
+                break;
             // 2066 and ordinary 3022 effects are modelled. Unsupported schedules are diagnosed
             // by the core after the Spawn graph and native metadata have been exported.
             case 3641: r.unmodelled |= kAttemptDependent; break;
