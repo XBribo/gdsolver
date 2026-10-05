@@ -18,6 +18,7 @@
 #include <string>
 
 #include "dp/cli.hpp"
+#include "../../src/mod/level_warnings.hpp"
 
 namespace {
 
@@ -1126,6 +1127,50 @@ void playerTouchLatches() {
     dp::resetInvocationState();
 }
 
+// Menu diagnostics must match supported teleports without hiding real restrictions.
+void levelWarnings() {
+    const auto supported = levelwarn::scan("header;"
+        "1,747,2,100,345,1,353,1;"
+        "1,2902,2,100,51,9,352,0,353,1,345,1,347,1,351,1;"
+        "1,1,2,900,57,9;1,3022,2,200;1,2066,2,300;", false);
+    check(supported.unmodelled == 0 && levelwarn::describe(supported.unmodelled) == "",
+          "supported sideways, height-preserving and force teleports emit no red warning");
+    check(supported.newer && supported.newerCount.at(3022) == 1
+          && supported.newerCount.at(2066) == 1,
+          "newer-mechanic diagnostics remain separate from unsupported warnings");
+    for (int id : {2902, 3022}) {
+        const auto random = levelwarn::scan("header;1," + std::to_string(id)
+            + ",51,9;1,1,57,9;1,1,57,9;", false);
+        check(random.unmodelled == levelwarn::kTeleportSeveralExits,
+              "random exit groups still warn for portals and teleport triggers");
+    }
+    for (int id : {747, 2902, 3022}) {
+        const auto dash = levelwarn::scan("header;1," + std::to_string(id) + ",591,1;", false);
+        check(dash.unmodelled == levelwarn::kTeleportDash
+              && levelwarn::describe(dash.unmodelled) == "teleports that redirect a dash",
+              "dash redirection retains a specific unsupported warning");
+    }
+    const auto combined = levelwarn::scan("header;1,2902,51,9,591,1;"
+        "1,1,57,9;1,1,57,9;1,3027;", false);
+    check(combined.unmodelled == (levelwarn::kTeleportSeveralExits | levelwarn::kTeleportOrb
+          | levelwarn::kTeleportDash)
+          && levelwarn::describe(combined.unmodelled)
+              == "teleports with several exits, teleport orbs and 1 more",
+          "remaining unsupported teleport features produce the correct combined menu text");
+    check(levelwarn::scan("header;1,3641;1,3619,476,5;", true).unmodelled
+          == (levelwarn::kAttemptDependent | levelwarn::kPlatformer),
+          "attempt-dependent and platformer warnings are unaffected");
+    std::string crowded = "header;";
+    for (int n = 0; n < 129; ++n)
+        crowded += "1,10,2," + std::to_string(n * 1000) + ";";
+    check(levelwarn::scan(crowded, false).unmodelled == 0
+          && levelwarn::scan(crowded + "1,2902;", false).unmodelled == levelwarn::kGravityPortals,
+          "spatial portals retain the real gravity-latch overflow warning, not a sideways warning");
+    check(levelwarn::describeAll(levelwarn::kSidewaysTeleport | levelwarn::kTeleportPush)
+          == "teleports that move you sideways; teleports that push you",
+          "legacy warning bit numbers and descriptions remain readable");
+}
+
 // dptest --groups-corpus <file>...: the same comparison on real recordings.
 static int groupsCorpus(int argc, char** argv) {
     int bad = 0;
@@ -1162,6 +1207,7 @@ int main(int argc, char** argv) {
     gravityMultiplierPhysics();
     playerAnchorParsing();
     playerTouchLatches();
+    levelWarnings();
     std::printf(g_fail ? "FAILED\n" : "all ok\n");
     return g_fail;
 }

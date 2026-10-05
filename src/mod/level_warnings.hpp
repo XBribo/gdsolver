@@ -25,18 +25,12 @@
 namespace levelwarn {
 
 enum : uint32_t {
-    // A teleport portal (2902) whose exit is away from it in x, with ignoreX off: x is the model's
-    // clock, so an exit elsewhere is a jump it cannot take (dp level_loader: "moves x to ... - NOT
-    // modelled"). A 747 puts its exit above or below itself and is modelled.
+    // Legacy bits retained for old diagnostics; spatial targets, ignoreY and classic forces
+    // are now modelled, so scan no longer emits these three warnings.
     kSidewaysTeleport = 1u << 0,
-    // ignoreY (key 353, TeleportPortalObject::m_ignoreY): keep the player's height -- "uses ignoreY -
-    // NOT modelled" in the same loader.
     kTeleportKeepsHeight = 1u << 1,
-    // A static force (key 345) or a redirected one (key 347): the portal sets the player's
-    // velocity. Neither the level export nor dp reads either field.
     kTeleportPush = 1u << 2,
-    // A 2902 whose target group holds more than one object: teleportPlayer (0x20fdb0) draws one of
-    // them from the seed at 0x6c2ef8. The export takes the first; the model has no draw.
+    // A group-targeted teleport with several exits draws one randomly; the core refuses it.
     kTeleportSeveralExits = 1u << 3,
     // The teleport orb (3027, GameObjectType::TeleportOrb) remains unmodelled.
     kTeleportOrb = 1u << 4,
@@ -56,6 +50,8 @@ enum : uint32_t {
     // solution replayed as a session's first attempt meets a different level.
     kAttemptDependent = 1u << 8,
     kPlatformer = 1u << 9,
+    // TeleportPortalObject::m_redirectDash (key 591) is still refused by the core.
+    kTeleportDash = 1u << 10,
 };
 
 // The phrase each bit is shown as, in bit order.
@@ -70,6 +66,7 @@ inline const char* const kUnmodelledNames[] = {
     "too many gravity portals",
     "triggers that count attempts",
     "platformer mode",
+    "teleports that redirect a dash",
 };
 
 // Objects added in 2.0 or later that are not a recolour of an older one. Derived, not listed by
@@ -236,8 +233,7 @@ inline bool gravityPortalsRefused(std::vector<GravPortal> g, bool reversal) {
 inline Findings scan(std::string_view all, bool platformer) {
     Findings r;
     if (platformer) r.unmodelled |= kPlatformer;
-    struct Portal { double x; int group; bool keepX; };
-    std::vector<Portal> portals;
+    std::vector<int> exitGroups;
     std::vector<GravPortal> gravity;
     bool reversal = false;
     forEachObject(all, [&](std::string_view obj) {
@@ -254,16 +250,20 @@ inline Findings scan(std::string_view all, bool platformer) {
                 if (!isOn(field(obj, "121")))
                     gravity.push_back({toNum(field(obj, "2")), gravPortalHalfWidth(obj)});
                 break;
-            case 747: case 2902:
-                if (isOn(field(obj, "345")) || isOn(field(obj, "347"))) r.unmodelled |= kTeleportPush;
-                if (isOn(field(obj, "353"))) r.unmodelled |= kTeleportKeepsHeight;
-                if (id == 2902) {
+            case 747: case 2902: case 3022:
+                if (isOn(field(obj, "591"))) r.unmodelled |= kTeleportDash;
+                // A spatial portal can revisit spent gravity portals, so overflow bits
+                // cannot be shared even though the teleport itself is modelled.
+                if (id != 3022 && !isOn(field(obj, "121"))
+                    && ((id != 747 && !isOn(field(obj, "352"))) || isOn(field(obj, "351"))))
+                    reversal = true;
+                if (id != 747) {
                     const int g = toInt(field(obj, "51"));
-                    if (g > 0) portals.push_back({toNum(field(obj, "2")), g, isOn(field(obj, "352"))});
+                    if (g > 0) exitGroups.push_back(g);
                 }
                 break;
             case 3027: r.unmodelled |= kTeleportOrb; break;
-            // 3022/2066 are modelled player effects. Unsupported schedules are diagnosed
+            // 2066 and ordinary 3022 effects are modelled. Unsupported schedules are diagnosed
             // by the core after the Spawn graph and native metadata have been exported.
             case 3641: r.unmodelled |= kAttemptDependent; break;
             case 3619: case 3620:
@@ -274,11 +274,10 @@ inline Findings scan(std::string_view all, bool platformer) {
         }
     });
     if (gravityPortalsRefused(std::move(gravity), reversal)) r.unmodelled |= kGravityPortals;
-    if (portals.empty()) return r;
+    if (exitGroups.empty()) return r;
     // The exits: every object in a portal's target group (key 57, '.'-separated).
-    struct Exits { int n = 0; double x = 0.0; };
-    std::unordered_map<int, Exits> exits;
-    for (const auto& p : portals) exits.emplace(p.group, Exits{});
+    std::unordered_map<int, int> exits;
+    for (int g : exitGroups) exits.emplace(g, 0);
     forEachObject(all, [&](std::string_view obj) {
         const auto groups = field(obj, "57");
         size_t p = 0;
@@ -286,17 +285,13 @@ inline Findings scan(std::string_view all, bool platformer) {
             const size_t d = groups.find('.', p);
             const auto one = groups.substr(p, d == std::string_view::npos ? std::string_view::npos
                                                                           : d - p);
-            if (auto it = exits.find(toInt(one)); it != exits.end() && it->second.n++ == 0)
-                it->second.x = toNum(field(obj, "2"));
+            if (auto it = exits.find(toInt(one)); it != exits.end()) ++it->second;
             if (d == std::string_view::npos) break;
             p = d + 1;
         }
     });
-    for (const auto& p : portals) {
-        const Exits& e = exits[p.group];
-        if (e.n > 1) r.unmodelled |= kTeleportSeveralExits;
-        else if (e.n == 1 && !p.keepX && std::fabs(e.x - p.x) > 0.5) r.unmodelled |= kSidewaysTeleport;
-    }
+    for (const auto& e : exits)
+        if (e.second > 1) r.unmodelled |= kTeleportSeveralExits;
     return r;
 }
 
