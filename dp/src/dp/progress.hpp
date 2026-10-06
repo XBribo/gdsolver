@@ -296,6 +296,8 @@ struct SearchOutcome {
     std::string unsupported;
     // Non-fatal player model omission; search and native replay still run.
     std::string playerFallback;
+    // Unmodelled portals were omitted; search and native replay still run.
+    std::string replayFallback;
     // The cap ladder's own account of the call (cli.hpp cliMain), written as it returns; empty
     // for a call that was not a ladder. `attempts=N idle=K plain=<hash> chosen=<hash> via=<how>`:
     // idle = the attempts whose alive cap never bound, the hashes FNV-1a over the plan file's
@@ -332,6 +334,7 @@ struct SearchOutcome {
         trigMapSig = 0;
         unsupported.clear();
         playerFallback.clear();
+        replayFallback.clear();
         ladder.clear();
         planWritten = false;
     }

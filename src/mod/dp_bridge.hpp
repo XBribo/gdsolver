@@ -29,6 +29,8 @@ struct LevelStats {
     std::string unsupported;
     // Player-trigger metadata is incomplete; this does not refuse the level.
     std::string playerFallback;
+    // Portal effects are omitted for native replay, without disabling player-trigger modelling.
+    std::string replayFallback;
 };
 
 // Parse a CSV held in memory (the same bytes that go into objrects.txt).
@@ -158,6 +160,8 @@ struct SolveOutcome {
     std::string unsupported;
     // Player-trigger graph was omitted, but the search was allowed to run.
     std::string playerFallback;
+    // Unmodelled portal effects were omitted, but the search was allowed to run.
+    std::string replayFallback;
     // The cap ladder's account of the call (dp progress.hpp SearchOutcome::ladder): its
     // attempts, how many never bound their cap, the plain search's plan hash and the chosen
     // plan's. Empty for a call that was not a ladder.

@@ -128,7 +128,7 @@ struct Obj {
     // Original world target for an unlinked 747; tpY is the legacy framed value.
     double tpWorldY = 0.0;
     uint8_t tpIgnoreX = 0, tpIgnoreY = 0, tpSaveOffset = 0;
-    // -1 = legacy dump; 0 = no destination; >1 = random, still unsupported.
+    // -1 = legacy dump; 0 = no destination; >1 = random, deferred to native replay.
     int tpExitCount = -1;
     // teleportPlayer uses the exit's bearing (entry bearing if no exit exists).
     float tpForceAngle = 0.f, tpForce = 0.f;

@@ -5981,6 +5981,9 @@ inline void start(GJBaseGameLayer* l) {
         if (!st.playerFallback.empty())
             writeResult("dpsolve: player trigger fallback - " + st.playerFallback
                         + "; continuing search with native replay repair");
+        if (!st.replayFallback.empty())
+            writeResult("dpsolve: portal fallback - " + st.replayFallback
+                        + "; omitting unmodelled portal effects and continuing search with native replay repair");
     }
     loadModePortals(g_csv);    // where the mode portals are; see missedPortalTick
     loadRotObjs(g_csv);        // ...and the 2900s, for --spentrot (see spentRotArg)
@@ -8540,6 +8543,9 @@ inline void poll() {
     if (g_iter == 0 && !dpbridge::outcome().playerFallback.empty())
         writeResult("dpsolve: player trigger fallback - " + dpbridge::outcome().playerFallback
                     + "; continuing search with native replay repair");
+    if (g_iter == 0 && !dpbridge::outcome().replayFallback.empty())
+        writeResult("dpsolve: portal fallback - " + dpbridge::outcome().replayFallback
+                    + "; omitting unmodelled portal effects and continuing search with native replay repair");
     // Only a missing plan stops here. An EMPTY one is an answer ("never press"), and the game
     // is the one to say whether it is right -- see the first solve's acceptance in spawn().
     if (!g_haveNewPlan) {

@@ -30,7 +30,7 @@ enum : uint32_t {
     kSidewaysTeleport = 1u << 0,
     kTeleportKeepsHeight = 1u << 1,
     kTeleportPush = 1u << 2,
-    // A group-targeted teleport with several exits draws one randomly; the core refuses it.
+    // A group-targeted teleport with several exits draws one randomly; native replay handles it.
     kTeleportSeveralExits = 1u << 3,
     // The teleport orb (3027, GameObjectType::TeleportOrb) remains unmodelled.
     kTeleportOrb = 1u << 4,
@@ -50,7 +50,7 @@ enum : uint32_t {
     // solution replayed as a session's first attempt meets a different level.
     kAttemptDependent = 1u << 8,
     kPlatformer = 1u << 9,
-    // TeleportPortalObject::m_redirectDash (key 591) is still refused by the core.
+    // TeleportPortalObject::m_redirectDash (key 591) still requires native replay.
     kTeleportDash = 1u << 10,
     // Conditional Time Warp rows are excluded from the core's ordinary x-crossing table.
     kConditionalTimeWarp = 1u << 11,

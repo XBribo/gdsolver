@@ -2220,9 +2220,13 @@ inline int cliMainOnce(int argc, char** argv) {
         std::printf("Item program: %zu nodes, %zu sources, %zu typed values\n",
                     g_itemProgram.nodes.size(), g_itemProgram.roots.size(), g_itemProgram.values.size());
     g_outcome.playerFallback = L.playerFallback;
+    g_outcome.replayFallback = L.replayFallback;
     if (!L.playerFallback.empty())
         std::printf("player trigger fallback: %s; continuing search with native replay repair\n",
                     L.playerFallback.c_str());
+    if (!L.replayFallback.empty())
+        std::printf("portal fallback: %s; omitting unmodelled portal effects and continuing search "
+                    "with native replay repair\n", L.replayFallback.c_str());
     if (!g_playerRoots.empty() || init.item) {
         // Player-only roots append slots after the geometry population was measured.
         unsigned long long h = 1469598103934665603ull;
@@ -3730,8 +3734,10 @@ inline int cliMainOnce(int argc, char** argv) {
         const double pH = init.mini ? kMiniHalf : kCubeHalf;
         for (const Obj& sp : L.slopes) {
             const double sx0 = sp.cx - sp.hw, sx1 = sp.cx + sp.hw;
+            // Hidden zero-size ramps export undefined corners; they cannot seed a support.
+            if (sx1 <= sx0) continue;
             const double m = (sp.sy1 - sp.sy0) / (sx1 - sx0);
-            if (m == 0.0) continue;
+            if (!std::isfinite(m) || m == 0.0) continue;
             // Which corner of the box touches the line is decided in the
             // player's OWN gravity frame, so a hanging body takes the offset on
             // the other side -- the same mirror the hang-side rules make about

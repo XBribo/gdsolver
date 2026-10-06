@@ -1373,13 +1373,14 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
             o.tpRedirectMax = tpValue(colTpMax, 0.f);
             o.tpRedirectDash = (uint8_t)(tpValue(colTpDash, 0.f) != 0.f);
             if (o.tpExitCount > 1)
-                (o.id == 3022 ? L.playerFallback : L.unsupported) = "teleport uid " + std::to_string(o.uid)
+                (o.id == 3022 ? L.playerFallback : L.replayFallback) = "teleport uid " + std::to_string(o.uid)
                     + " has random destinations";
             if (o.tpRedirectDash)
-                (o.id == 3022 ? L.playerFallback : L.unsupported) = "teleport uid " + std::to_string(o.uid)
+                (o.id == 3022 ? L.playerFallback : L.replayFallback) = "teleport uid " + std::to_string(o.uid)
                     + " redirects a dash (not modelled)";
             L.spatialTeleport = L.spatialTeleport
-                || ((!o.tpIgnoreX && o.id != 747) || o.tpSaveOffset);
+                || ((o.tpExitCount <= 1 && !o.tpRedirectDash)
+                    && ((!o.tpIgnoreX && o.id != 747) || o.tpSaveOffset));
             // A non-747 teleport resolves its target from the linked exit half
             // (m_orangePortal), NOT the tpy closed formula -- an old dump
             // without the tpex/tpey columns plans against a target measured
@@ -1664,6 +1665,9 @@ inline Level loadLevelFrom(std::istream& inRaw, const GroupTimeline* gt = nullpt
         // change though; see Obj::tpY and the teleport block in stepOne.
                  || type == 28
                  || type == 23 || type == 24) {
+            // Unknown destinations and dash redirection are native replay's job, not a refusal.
+            // maxX was already recorded; do not latch or simulate an arbitrary first exit.
+            if (type == 28 && (o.tpExitCount > 1 || o.tpRedirectDash)) continue;
             // Say which portals will not write the band, and say it with the
             // portal's own numbers next to it -- a silent gate is how a rule
             // ends up "dead from the day it was written".

@@ -646,7 +646,7 @@ void teleportColumns() {
     values[50] = "97"; values[51] = "207"; values[52] = "1"; values[53] = "1";
     values[54] = "1"; values[55] = "20"; values[56] = "1"; values[57] = "90";
     values[58] = "1"; values[59] = "2"; values[60] = "3"; values[61] = "6";
-    values[62] = "1";
+    values[62] = "0";
     // Serialize exactly the CSV field boundaries used by objrects.
     auto row = [&]() {
         std::string out;
@@ -661,16 +661,24 @@ void teleportColumns() {
         check(p.tpEntryDx == -3 && p.tpEntryDy == 7 && p.tpSaveOffset && p.tpExitCount == 1
             && p.tpStaticForce && p.tpForce == 20 && p.tpForceAdditive && p.tpForceAngle == 90
             && p.tpRedirectForce && p.tpRedirectMod == 2 && p.tpRedirectMin == 3
-            && p.tpRedirectMax == 6 && p.tpRedirectDash && level.spatialTeleport,
+            && p.tpRedirectMax == 6 && !p.tpRedirectDash && level.spatialTeleport,
             "all geometry and force settings survive the complete export tail");
     }
-    check(level.unsupported.find("redirects a dash") != std::string::npos,
-          "unmodelled dash redirection is reported rather than silently dropped");
+    values[62] = "1";
+    std::istringstream dash(std::string(kObjHeader) + tail + "\n" + row());
+    const auto dashLevel = dp::loadLevelFrom(dash);
+    check(dashLevel.unsupported.empty() && dashLevel.portals.empty()
+          && dashLevel.replayFallback.find("redirects a dash") != std::string::npos,
+          "unmodelled dash redirection warns and defers to native replay without refusing search");
     values[62] = "0";
     values[53] = "2";
     std::istringstream random(std::string(kObjHeader) + tail + "\n" + row());
-    check(dp::loadLevelFrom(random).unsupported.find("random destinations") != std::string::npos,
-          "random multi-exit teleport is refused rather than choosing the first exit");
+    const auto randomLevel = dp::loadLevelFrom(random);
+    check(randomLevel.unsupported.empty() && randomLevel.portals.empty()
+          && randomLevel.playerFallback.empty() && !randomLevel.spatialTeleport
+          && randomLevel.maxX == 100
+          && randomLevel.replayFallback.find("random destinations") != std::string::npos,
+          "random multi-exit portals warn, preserve level extent and never choose an arbitrary exit");
     values[53] = "1";
     std::string crowded = std::string(kObjHeader) + tail + "\n";
     for (int i = 0; i <= dp::kGravPortalBits; ++i) {
@@ -1141,6 +1149,65 @@ void playerFallbackSearch() {
     dp::resetInvocationState();
 }
 
+// Portal fallback must keep both search and independently supported player effects alive.
+void portalFallbackSearch() {
+    const auto path = writeTmp("dptest_portal_fallback.csv", "");
+    const auto out = writeTmp("dptest_portal_fallback.plan.txt", "");
+    const std::string header = std::string(kObjHeader) + ",tpexits,tprdash,pgrav,psingle\n";
+    std::vector<std::string> portal(54, "0"), gravity(54, "0");
+    portal[0] = "2902"; portal[1] = "28"; portal[2] = "1"; portal[3] = "105";
+    portal[4] = "30"; portal[5] = "60"; portal[7] = "133543";
+    portal[34] = "1000"; portal[35] = "500"; portal[50] = "2";
+    gravity[0] = "2066"; gravity[1] = "20"; gravity[2] = "0";
+    gravity[3] = "1000"; gravity[4] = gravity[5] = "30"; gravity[7] = "42";
+    gravity[52] = "2"; gravity[53] = "1";
+    // Serialize independent rows so a portal omission cannot erase the supported source.
+    auto row = [](const std::vector<std::string>& fields) {
+        std::ostringstream text;
+        for (size_t i = 0; i < fields.size(); ++i) text << (i ? "," : "") << fields[i];
+        return text.str() + "\n";
+    };
+    // A bounded search at the omitted portal still writes a real replayable plan.
+    auto solve = [&](const std::string& text) {
+        writeTmp("dptest_portal_fallback.csv", text);
+        std::vector<std::string> args = {"dptest", path, "--out", out,
+            "--threads", "1", "--cap", "100", "--horizon", "3"};
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        return dp::cliMain((int)argv.size(), argv.data());
+    };
+    std::vector<std::string> hiddenSlope(54, "0");
+    hiddenSlope[0] = "327"; hiddenSlope[1] = "25"; hiddenSlope[2] = "960";
+    hiddenSlope[3] = "165"; hiddenSlope[7] = "1600";
+    hiddenSlope[10] = hiddenSlope[11] = "-nan(ind)";
+    const auto csv = header + row(portal) + row(gravity) + row(hiddenSlope)
+        + "1,0,600,1000,30,30,0,99\n";
+    check(solve(csv) == 0 && dp::g_outcome.unsupported.empty()
+          && dp::g_outcome.replayFallback.find("133543 has random destinations") != std::string::npos
+          && dp::g_outcome.playerFallback.empty() && dp::g_outcome.planWritten
+          && dp::g_outcome.workStates > 0 && !dp::g_playerRoots.empty(),
+          "random portal fallback searches, writes a plan and preserves the supported player graph");
+    std::ifstream trace(out + ".trace.csv");
+    std::string line;
+    std::getline(trace, line); std::getline(trace, line);
+    const auto fields = dp::itemFields(line, ',');
+    check(fields.size() > 21 && std::atof(fields[1].c_str()) < 10
+          && std::atof(fields[20].c_str()) == 2,
+          "the fallback neither takes the first teleport exit nor suppresses the gravity trigger");
+    check(fields.size() > 3 && fields[3].find("nan") == std::string::npos
+          && std::isfinite(std::atof(fields[3].c_str())),
+          "a distant hidden zero-size ramp cannot seed a support or poison the first velocity");
+    portal[50] = "1"; portal[51] = "1";
+    check(solve(header + row(portal) + row(gravity)) == 0
+          && dp::g_outcome.unsupported.empty() && dp::g_outcome.planWritten
+          && dp::g_outcome.replayFallback.find("redirects a dash") != std::string::npos,
+          "dash-redirecting collision portals also continue through native replay fallback");
+    check(solve(header + row(gravity)) == 0 && dp::g_outcome.replayFallback.empty()
+          && dp::g_outcome.planWritten,
+          "the next supported invocation clears the non-fatal portal warning");
+    dp::resetInvocationState();
+}
+
 // Gravity changes acceleration, not jump/flap targets, ship thrust or terminal velocities.
 void gravityMultiplierPhysics() {
     for (int mode : {0, 2, 5, 6, 7}) {
@@ -1561,11 +1628,14 @@ static void itemProgramRules() {
     }
     PlayerEffect effect; effect.teleport.uid = 4; effect.teleport.id = 2066;
     effect.gravity = 2; l.playerEffects.push_back(effect);
+    l.replayFallback = "teleport uid 133543 has random destinations";
     const bool compiled = loadItemProgram(l, triggers, groups);
     State s{}; s.xAbs = 100; s.y = 315; s.item = initialItems();
     check(compiled && l.playerFallback.empty() && g_itemProgram.nodes.size() == 4
           && g_pressWin.size() == 1 && nearPressBox(s),
           "compiled Item press sources rebuild input windows after graph admission");
+    check(compiled && !l.replayFallback.empty() && l.playerFallback.empty(),
+          "a portal replay warning does not disable an independently supported Item program");
     resetInvocationState();
     g_touch.resize(kTouchBits - 1);
     l.playerSources.at(1).singleTouch = false;
@@ -1597,6 +1667,7 @@ int main(int argc, char** argv) {
     playerTriggerClocks();
     playerSpawnGraph();
     playerFallbackSearch();
+    portalFallbackSearch();
     gravityMultiplierPhysics();
     playerAnchorParsing();
     playerTouchLatches();

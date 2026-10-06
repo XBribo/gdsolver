@@ -67,6 +67,8 @@ struct Level {
     std::string unsupported;
     // Non-fatal: omit the player-trigger graph and let native replay repair the model.
     std::string playerFallback;
+    // Non-fatal portal omission, independent of the supported player-trigger graph.
+    std::string replayFallback;
     // Spatial teleports can separate the frontier into distant travel windows.
     bool spatialTeleport = false;
     std::vector<PlayerEffect> playerEffects;
