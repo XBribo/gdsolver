@@ -1139,7 +1139,7 @@ inline void loadConfig() {
             auto comma = val.find(',');
             int at = 0;
             if (comma != std::string::npos && cfgNum(key, val.substr(0, comma), at)) {
-                g_cfg.inputs.push_back({ at, val.substr(comma + 1) == "1" });
+                g_cfg.inputs.push_back({ at, (uint8_t)(std::atoi(val.c_str() + comma + 1) & 3) });
             }
         }
     }

@@ -3,6 +3,9 @@
 
 namespace dp {
 
+inline bool g_twoPlayer = false;   // exported level setting, never inferred from a portal alone
+inline int g_minPulse = 0;         // input-history identity is conditional on this rule
+
 constexpr double kFloorY = 105.0;   // cube rest height on the ground line
 // ...which is a REST HEIGHT, not the ground. The ground plane is at 90 and the
 // rest height is 90 + the player's half, so a mini player rests at 99, not 105.

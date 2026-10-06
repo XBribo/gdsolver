@@ -2712,6 +2712,7 @@ inline bool loadLevelSettings(const std::string& path) {
         else if (k == "fixGravityBug")      g_fixGravityBug = v;
         else if (k == "fixNegativeScale")   g_fixNegativeScale = v;
         else if (k == "fixRobotJump")       g_fixRobotJump = v;
+        else if (k == "twoPlayerMode")      g_twoPlayer = v != 0;
         else if (k == "dynamicLevelHeight") g_dynamicLevelHeight = v;
     }
     return true;

@@ -1,6 +1,7 @@
 #pragma once
 // Session configuration (autorun.cfg keys), data root, shared session state.
 #include "mod/prelude.hpp"
+#include "dp/input.hpp"
 
 namespace p1 {
 
@@ -55,8 +56,30 @@ inline void updateWindowTitle();   // the definition comes after the g_cfg / g_s
 // of both, because psnap.hpp and repair.hpp (tidyPlayerModes) read it.
 inline bool g_psnapPlayerWritten = false;
 
-struct InputCmd { int step; bool down; };
+struct InputCmd { int step; uint8_t down; };   // input mask: P1 bit 0, independent P2 bit 1
+
+// Native physical press ledger, distinct from a jump buffer a ring can consume.
+inline int playerHeld(PlayerObject* p) {
+    if (!p) return 0;
+    const auto it = p->m_holdingButtons.find(1);
+    return it != p->m_holdingButtons.end() && it->second;
+}
+
+// Keep logical P1/P2 roles stable even when the user's keyboard controls are swapped.
+inline void injectInputMask(GJBaseGameLayer* layer, int mask, int previous) {
+    const bool two = layer->m_levelSettings && layer->m_levelSettings->m_twoPlayerMode;
+    const bool dual = layer->m_gameState.m_isDualMode;
+    mask = gdinput::canonical(mask, two, dual);
+    previous = gdinput::canonical(previous, two, dual);
+    const bool swap = !layer->m_isPlatformer && !layer->m_useReplay
+        && GameManager::sharedState()->getGameVariable("0010");
+    if (!two || (mask & 1) != (previous & 1) || mask == previous)
+        layer->handleButton((mask & 1) != 0, 1, gdinput::playerArgument(1, swap));
+    if (two && layer->m_gameState.m_isDualMode && (mask & 2) != (previous & 2))
+        layer->handleButton((mask & 2) != 0, 1, gdinput::playerArgument(2, swap));
+}
 struct ToggleCmd { int step; std::string mode; };
+inline thread_local int g_activeP2Collision = 0;
 
 // The glitch-avoid mode's margins when it is simply switched on (the play menu, `glitchavoid=1`),
 // each from an official solution the user named as a glitch: lv22's early dash release passes a

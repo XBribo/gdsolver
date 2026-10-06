@@ -89,6 +89,36 @@ inline std::vector<PlanEdge> planEdges(const std::vector<uint8_t>& lvl,
 // level, 4 the rest of the tables (to the --replay branch or the first layer), 5 the object
 // position table inside 2. -1 = not reached. Written on every call, read by the mod after it (cfg
 // dpphaseprof); nothing prints it here.
+// Emit each body's edges at its own latency, then merge them into legacy-compatible masks.
+inline std::vector<PlanEdge> maskedPlanEdges(const std::vector<uint8_t>& levels,
+        const std::vector<uint8_t>& modes, const std::vector<uint8_t>& modes2,
+        long long tick, const State& start) {
+    if (!g_twoPlayer) return planEdges(levels, modes, tick, start.held, start.mode, g_oldLatency);
+    struct Change { long long tick; int body, value; };
+    std::vector<Change> changes;
+    for (int body = 0; body < 2; ++body) {
+        std::vector<uint8_t> bits;
+        for (uint8_t mask : levels) bits.push_back((mask >> body) & 1);
+        for (const auto& e : planEdges(bits, body ? modes2 : modes, tick,
+                body ? start.held2 : start.held, body ? start.mode2 : start.mode, g_oldLatency))
+            changes.push_back({e.press, body, e.level});
+    }
+    std::stable_sort(changes.begin(), changes.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.tick, a.body) < std::tie(b.tick, b.body);
+    });
+    std::vector<PlanEdge> result;
+    int mask = start.held | (start.held2 << 1);
+    for (size_t i = 0; i < changes.size();) {
+        const long long t = changes[i].tick;
+        do {
+            const auto& e = changes[i++];
+            mask = (mask & ~(1 << e.body)) | (e.value << e.body);
+        } while (i < changes.size() && changes[i].tick == t);
+        result.push_back({t, mask});
+    }
+    return result;
+}
+
 inline double g_prepMark[6] = {-1, -1, -1, -1, -1, -1};
 
 // ---- parse caches for the in-process loop ----
@@ -1290,12 +1320,13 @@ inline int cliMainOnce(int argc, char** argv) {
         // --ctrlwin t0:t1,t0:t1,...: controls-disabled windows (both ends
         // inclusive). The caller builds them from the ctrlOff column of GD's
         // dump (history at g_ctrlWin's declaration).
-        if (!std::strcmp(argv[i], "--ctrlwin")) {
+        if (!std::strcmp(argv[i], "--ctrlwin") || !std::strcmp(argv[i], "--ctrlwin2")) {
+            auto& windows = !std::strcmp(argv[i], "--ctrlwin2") ? g_ctrlWin2 : g_ctrlWin;
             for (const char* p = argv[i + 1]; *p; ) {
                 long long a0 = std::atoll(p);
                 const char* col = std::strchr(p, ':');
                 long long a1 = col ? std::atoll(col + 1) : a0;
-                g_ctrlWin.push_back({a0, a1});
+                windows.push_back({a0, a1});
                 const char* c = std::strchr(p, ',');
                 if (!c) break;
                 p = c + 1;
@@ -1539,6 +1570,9 @@ inline int cliMainOnce(int argc, char** argv) {
                 }
                 if (const char* d = std::strstr(ln.c_str(), ",gravity="))
                     std::sscanf(d, ",gravity=%f/%f", &f.gravityMod, &f.gravityMod2);
+                if (const char* d = std::strstr(ln.c_str(), ",inputkey="))
+                    std::sscanf(d, ",inputkey=%llu,pm2=%d,pmini2=%d,pflip2=%d,pg2=%d",
+                        &f.inputKey, &f.mode2, &f.mini2, &f.flip2, &f.ground2);
                 if (const size_t p = ln.find(",itemanchor="); p != std::string::npos)
                     f.itemAnchor = ln.substr(p + 12);
                 if (const char* d = std::strstr(ln.c_str(), ",itemtick="))
@@ -1577,6 +1611,9 @@ inline int cliMainOnce(int argc, char** argv) {
                         const Fixup &p = g_fixupDeltas[a], &q = g_fixupDeltas[b];
                         if (p.in != q.in || p.mode != q.mode || p.mini != q.mini
                             || p.flip != q.flip || p.g != q.g || p.dual != q.dual
+                            || p.inputKey != q.inputKey
+                            || (p.inputKey && (p.mode2 != q.mode2 || p.mini2 != q.mini2
+                                || p.flip2 != q.flip2 || p.ground2 != q.ground2))
                             || (p.dual && std::fabs(p.x2 - q.x2) > 2.4f))
                             continue;
                         if (std::fabs(p.y - q.y) > 8.0f
@@ -2640,6 +2677,21 @@ inline int cliMainOnce(int argc, char** argv) {
                 double u, v;
                 toFrame(init.frame, wx, wy, u, v);
                 init.xAbs2 = (float)u; init.y2 = (float)v;
+            } else if (p.first == "aux2") {
+                double a, b;
+                if (!parseFinitePair(p.second, a, b) || a < 0 || a > 255 || b < 0 || b > 255) return 2;
+                if (g_twoPlayer && init.dual) { init.rHover2 = (uint8_t)a; init.spiderJumpT2 = (uint8_t)b; }
+            } else if (p.first == "buttons" || p.first == "buffers") {
+                double a, b;
+                if (!parseFinitePair(p.second, a, b) || (a != 0 && a != 1) || (b != 0 && b != 1)) return 2;
+                if (g_twoPlayer) {
+                    if (p.first == "buttons") {
+                        init.action = init.held = (uint8_t)a;
+                        init.action2 = init.held2 = init.dual ? (uint8_t)b : 0;
+                    } else {
+                        init.jumpBuf = (uint8_t)a; init.jumpBuf2 = init.dual ? (uint8_t)b : 0;
+                    }
+                }
             } else if (p.first == "gravity" || p.first == "spin") {
                 double a, b;
                 if (!parseFinitePair(p.second, a, b)
@@ -4746,8 +4798,9 @@ inline int cliMainOnce(int argc, char** argv) {
     // which is why it is a side vector and not three spare bits of Node: Node's parent field is
     // 31 bits wide and the arena has been measured at 147.9M nodes.
     const bool checkWanted = g_check.enabled.load(std::memory_order_relaxed);
-    std::vector<uint8_t> arenaMode;
+    std::vector<uint8_t> arenaMode, arenaMode2;
     if (checkWanted) arenaMode.push_back(0);   // the root, which no state owns
+    if (checkWanted && g_twoPlayer) arenaMode2.push_back(0);
     // This call's checkpoints, not the previous call's -- and cleared again on the way OUT, so a
     // finished call leaves nothing behind that still looks live, and a judgement that arrives for
     // it afterwards is refused (dp/progress.hpp SearchCheckpoints::pass).
@@ -5104,7 +5157,7 @@ inline int cliMainOnce(int argc, char** argv) {
     // an absorbing fixed point, so a dead lineage can look alive).
     prepMark(4);
     if (!replayPath.empty()) {
-        struct Edge { long long press; int v; };
+        struct Edge { long long press; int v; int body = -1; };
         std::vector<Edge> edges;
         {
             std::ifstream pf(replayPath);
@@ -5148,25 +5201,27 @@ inline int cliMainOnce(int argc, char** argv) {
         // move remains, but the correctness side (census) is closed by this.
         std::stable_sort(edges.begin(), edges.end(),
                          [](const Edge& a, const Edge& b) { return a.press < b.press; });
-        if (!g_ctrlWin.empty()) {
+        if (!g_ctrlWin.empty() || (g_twoPlayer && !g_ctrlWin2.empty())) {
             const size_t nOrig = edges.size();
-            for (const auto& w : g_ctrlWin) {
-                int heldBefore = 0, heldAfter = 0;
-                for (size_t k = 0; k < nOrig; ++k) {
-                    if (edges[k].press < w.second) heldBefore = edges[k].v;
-                    if (edges[k].press <= w.second) heldAfter = edges[k].v;
-                    else break;
-                }
-                if (heldBefore) {
-                    edges.push_back(Edge{w.second, 1});
-                    if (!heldAfter) {
-                        edges.push_back(Edge{w.second + 1, 0});
-                        // a buffered jump fires without holding ->
-                        // this jump does not hover (rePushNoHoverAt)
-                        g_winRePushJump.push_back(w.second + 1);
+            for (int body = 0; body < (g_twoPlayer ? 2 : 1); ++body) {
+                const auto& windows = body ? g_ctrlWin2 : g_ctrlWin;
+                for (const auto& w : windows) {
+                    int heldBefore = 0, heldAfter = 0;
+                    for (size_t k = 0; k < nOrig; ++k) {
+                        if (edges[k].press < w.second) heldBefore = edges[k].v;
+                        if (edges[k].press <= w.second) heldAfter = edges[k].v;
+                        else break;
                     }
-                    std::printf("REPLAY: ctrl re-push at t=%lld (held into "
-                                "window end)\n", w.second);
+                    if (heldBefore & (1 << body)) {
+                        edges.push_back(Edge{w.second, 1, g_twoPlayer ? body : -1});
+                        if (!(heldAfter & (1 << body))) {
+                            edges.push_back(Edge{w.second + 1, 0, g_twoPlayer ? body : -1});
+                            // A buffered re-push jump must not start a held Robot hover.
+                            (body ? g_winRePushJump2 : g_winRePushJump).push_back(w.second + 1);
+                        }
+                        std::printf("REPLAY: ctrl re-push at t=%lld (held into "
+                                    "window end)\n", w.second);
+                    }
                 }
             }
             // synthetic edges are appended and then stable-sorted again --
@@ -5212,8 +5267,30 @@ inline int cliMainOnce(int argc, char** argv) {
         // level derived here is by EFFECT tick and per-mode, which is the
         // quantity `action` actually means.
         int preLevel = 0;
+        int queuedMask = 0;
         bool preRise = false;   // the rising edge landed exactly ON t0
+        bool preRise2 = false;
         while (eIdx < edges.size() && edges[eIdx].press <= t0) {
+            if (g_twoPlayer) {
+                const Edge& edge = edges[eIdx];
+                const int nextMask = edge.body < 0 ? edge.v
+                    : (queuedMask & ~(1 << edge.body)) | (edge.v << edge.body);
+                for (int body = 0; body < 2; ++body) {
+                    const int bit = 1 << body;
+                    if (edge.body >= 0 ? edge.body != body : ((queuedMask ^ nextMask) & bit) == 0) continue;
+                    const int down = (nextMask >> body) & 1;
+                    const long long eff2 = edges[eIdx].press + latOf(body ? init.mode2 : init.mode);
+                    if (eff2 <= t0) {
+                        const bool rise = eff2 == t0 && down && !(preLevel & bit);
+                        if (body) preRise2 = rise; else preRise = rise;
+                        preLevel = (preLevel & ~bit) | (down << body);
+                    }
+                    else fx.push_back({eff2, ((body + 1) << 1) | down});
+                }
+                queuedMask = nextMask;
+                ++eIdx;
+                continue;
+            }
             const long long eff = edges[eIdx].press + latOf(init.mode);
             if (eff <= t0) {
                 preRise = (eff == t0) && edges[eIdx].v != 0 && preLevel == 0;
@@ -5223,7 +5300,9 @@ inline int cliMainOnce(int argc, char** argv) {
             }
             ++eIdx;
         }
-        init.action = (uint8_t)preLevel;
+        init.action = (uint8_t)(preLevel & 1);
+        if (g_twoPlayer) init.action2 = init.dual ? ((preLevel >> 1) & 1) : 0;
+        if (g_twoPlayer && init.dual && init.mode2 == 7 && preRise2) init.rHover2 = 1;
         // --spentaction (the hist seeding's note): ...but an edge whose press GD has already SPENT
         // before t0 -- a ring takes it on the press's own tick, a tick sooner than the flap's
         // latency 2 counts -- is not an edge any more when its counted effect tick arrives.
@@ -5279,7 +5358,9 @@ inline int cliMainOnce(int argc, char** argv) {
               // `fxblk`: the moving object that kept a MATCHING fixup from
               // firing on the step into this row, -1 if none (fixup.hpp,
               // g_fxBlockedUid). The recorder's third answer.
-              ",fxblk,x2,gravity,gravity2,itemkey\n";
+              ",fxblk,x2,gravity,gravity2,itemkey";
+        if (g_twoPlayer) tr << ",inputkey";
+        tr << "\n";
         // Make --snaplog usable in replay too (it used to exist only on the
         // SOLVE side, so a known plan's stair snaps could never be checked
         // against GD's snaptrace).
@@ -5326,8 +5407,15 @@ inline int cliMainOnce(int argc, char** argv) {
         long long lastT = t0;
         for (long long t = t0 + 1; t <= tEnd; ++t) {
             lastT = t;
-            while (fxIdx < fx.size() && fx[fxIdx].first <= t)
-                curIn = fx[fxIdx++].second;
+            while (fxIdx < fx.size() && fx[fxIdx].first <= t) {
+                const int value = fx[fxIdx++].second;
+                if (!g_twoPlayer) curIn = value;
+                else {
+                    const int body = (value >> 1) - 1;
+                    curIn = (curIn & ~(1 << body)) | ((value & 1) << body);
+                }
+            }
+            if (g_twoPlayer) curIn = gdinput::canonical(curIn, true, s.dual);
             // Under reverse (State::rev) x decreases. Apply the same sign
             // here as the DP side's group windows (if the replay / resim do
             // not match GD, every fixup comparison becomes a lie).
@@ -5505,9 +5593,8 @@ inline int cliMainOnce(int argc, char** argv) {
             const uint8_t wgPrev = s.action;
             State c = stepBoth(s, (uint8_t)curIn, K, rdead);
             if (g_waveStraight)
-                c.waveTurns = waveTurnCost(s.waveTurns, s.action, curIn,
-                                          waveActive(s.mode, s.dual, s.mode2));
-            c.action = (uint8_t)curIn;
+                c.waveTurns = inputTurnCost(s, curIn);
+            c.action = (uint8_t)(curIn & 1);
             s = c;
             // --seeddump <t>: the state's ACCUMULATED fields at one tick.
             //
@@ -5569,6 +5656,12 @@ inline int cliMainOnce(int argc, char** argv) {
                             (double)s.gravityMod, (double)s.gravityMod2);
                 std::printf("seed: t=%lld spin=%.9g/%.9g\n", t,
                             (double)s.spinMod, (double)s.spinMod2);
+                if (g_twoPlayer)
+                    std::printf("seed: t=%lld buttons=%d/%d action=%d/%d buffers=%d/%d edgeage2=%d latlock2=%d\n",
+                        t, s.held, s.held2, s.action, s.action2, s.jumpBuf, s.jumpBuf2, s.edgeAge2, s.latLock2);
+                if (g_twoPlayer)
+                    std::printf("seed: t=%lld aux2=%d/%d/%d/%d/%d/%d\n", t,
+                        s.rHover2, s.pFlap2, s.pNoTerm2, s.pSpiderTap2, s.ogLinger2, s.spiderJumpT2);
                 // ...and the same state as a READY-MADE --startrotq argument.
                 //
                 // rotSpent is a mask over g_rotQ, and the bit order is
@@ -5626,7 +5719,7 @@ inline int cliMainOnce(int argc, char** argv) {
                 const int rev0dbg = (int)s.rev;
                 const int f0dbg = (int)s.frame;
                 const int nf = applyRotation(s, xPrevR, (double)rDxUsed, t,
-                                             curIn, sPrevGrounded,
+                                             curIn & 1, sPrevGrounded,
                                              sPrevY, true);
                 if ((nf >= 0 && nf != f0dbg) || (int)s.rev != rev0dbg) {
                     if (nf >= 0 && nf != f0dbg) {
@@ -5647,7 +5740,7 @@ inline int cliMainOnce(int argc, char** argv) {
             // after the turn and only on a tick that did not turn -- the search's
             // gate. Without it this walk never fires a Count or a Tap trigger.
             if (coinOn && !rdead && (int)s.frame == wgFrame)
-                itemGates(s, wgPrev, curIn, K, wgFrame, (double)s.xAbs, (double)s.y,
+                itemGates(s, wgPrev, curIn & 1, K, wgFrame, (double)s.xAbs, (double)s.y,
                           hazardHalfFor(s.mode, s.mini != 0), t);
             // The trace is always WORLD coordinates -- that is what GD's dump
             // is, and a turned frame would otherwise read as a huge divergence.
@@ -5678,10 +5771,11 @@ inline int cliMainOnce(int argc, char** argv) {
                 && !s.pressSpent) {
                 int nextIn = curIn;
                 for (size_t j = fxIdx; j < fx.size() && fx[j].first <= t + 1; ++j)
-                    nextIn = fx[j].second;
-                if (!g_ctrlWin.empty() && ctrlOffAt(t + 1)) nextIn = 0;
+                    if (!g_twoPlayer) nextIn = fx[j].second;
+                    else if ((fx[j].second >> 1) == 1) nextIn = fx[j].second & 1;
+                if (ctrlOffAt(t + 1)) nextIn = 0;
                 const float ringDx = (s.dx > 0.f) ? s.dx : K.dxF;
-                const Obj* ring = nextIn
+                const Obj* ring = (nextIn & 1)
                     ? flyEarlyRing(s, K, (double)ringDx * timeWarpAt((double)s.xAbs)
                                              * (s.rev ? -1.0 : 1.0))
                     : nullptr;
@@ -5757,8 +5851,9 @@ inline int cliMainOnce(int argc, char** argv) {
                << ',' << g_fxBlockedUid
                << ',' << wX2
                << ',' << s.gravityMod << ',' << s.gravityMod2
-               << ',' << (s.item ? keyText(keyOf(s, t)) : std::string())
-               << "\n";
+               << ',' << (s.item ? keyText(keyOf(s, t)) : std::string());
+            if (g_twoPlayer) tr << ',' << inputKeyOf(s);
+            tr << "\n";
             if (rdead) {
                 // --replayon (diagnostic): note the first death and walk on, the
                 // way the witness resim does, so geometry after it can be read.
@@ -5772,9 +5867,22 @@ inline int cliMainOnce(int argc, char** argv) {
             }
             if ((double)s.xAbs >= goalX) break;
             while (eIdx < edges.size() && edges[eIdx].press == t) {
-                fx.push_back({t + latOf(s.mode), edges[eIdx].v});
+                if (!g_twoPlayer) fx.push_back({t + latOf(s.mode), edges[eIdx].v});
+                else {
+                    const Edge& edge = edges[eIdx];
+                    const int nextMask = edge.body < 0 ? edge.v
+                        : (queuedMask & ~(1 << edge.body)) | (edge.v << edge.body);
+                    for (int body = 0; body < 2; ++body) {
+                        if (edge.body >= 0 ? edge.body != body : ((queuedMask ^ nextMask) & (1 << body)) == 0) continue;
+                        fx.push_back({t + latOf(body ? s.mode2 : s.mode),
+                            ((body + 1) << 1) | ((nextMask >> body) & 1)});
+                    }
+                    queuedMask = nextMask;
+                }
                 ++eIdx;
             }
+            if (g_twoPlayer) std::stable_sort(fx.begin() + fxIdx, fx.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
         }
         g_outcome.replayDiedT = diedT;
         if (g_histStatOn) {
@@ -6066,10 +6174,11 @@ inline int cliMainOnce(int argc, char** argv) {
 
         auto emit = [&](State s, const State& from, uint8_t action, const SearchKey& k) {
             auto finish = [&](State& stored) {
-                arena.push_back(Node{from.parent | ((uint32_t)action << 31)});
+                arena.push_back(Node::make(from.parent, action));
                 if (checkWanted) arenaMode.push_back(s.mode);
+                if (checkWanted && g_twoPlayer) arenaMode2.push_back(s.mode2);
                 s.parent = (uint32_t)(arena.size() - 1);
-                s.action = action;
+                s.action = action & 1;
                 stored = s;
                 // the goal is reached by a STATE, at its own x -- not by the
                 // layer's nominal timeline. Only in frame 0: `goalX` is a world
@@ -6439,9 +6548,11 @@ inline int cliMainOnce(int argc, char** argv) {
         // and fell into the pit. GD with the same press held to t=2200 reaches
         // x=2,996. The frontier collapse the previous session blamed on
         // granularity was this: the winning branch was never enumerated.
-        kids.assign(gidx.size() * 2, Child{});
-        kidKeys.assign(gidx.size() * 2, SearchKey{});
-        kidFlag.assign(gidx.size() * 2, 0);
+        const int actions = g_twoPlayer && std::any_of(gidx.begin(), gidx.end(),
+            [&](size_t j) { return cur[j].dual != 0; }) ? 4 : 2;
+        kids.assign(gidx.size() * actions, Child{});
+        kidKeys.assign(gidx.size() * actions, SearchKey{});
+        kidFlag.assign(gidx.size() * actions, 0);
         const bool dbgHere = (dbgLayers > 0 && t - t0 <= dbgLayers);
         const bool orbsEmpty = orbs.empty();
         // --twinskip / --twinaudit (search_census.hpp): is this parent's pressed child a twin
@@ -6519,13 +6630,18 @@ inline int cliMainOnce(int argc, char** argv) {
         // (the x --capmap reads, so a ladder window lifts both over the same stretch).
         const int gridNow = gridAtX(bestX);
         auto stepKidAt = [&](size_t i, bool mayTwin) {
-            const State& s = cur[gidx[i >> 1]];
-            const int input = (int)(i & 1);
+            const State& s = cur[gidx[i / actions]];
+            const int mask = (int)(i % actions);
+            if (mask >= gdinput::branches(g_twoPlayer, s.dual)) return;
+            const int input = mask & 1;
             // --minpulse / --inputgrid (search_census.hpp): may the button change on this tick?
             const bool edgeLocked =
                 (g_minPulse > 1 && (int)s.edgeAge + 1 < g_minPulse)
                 || (gridNow > 1 && (K.t % gridNow) != 0);
             if (edgeLocked && input != (int)s.action) return;
+            const bool edgeLocked2 = (g_minPulse > 1 && (int)s.edgeAge2 + 1 < g_minPulse)
+                || (gridNow > 1 && (K.t % gridNow) != 0);
+            if (g_twoPlayer && s.dual && edgeLocked2 && ((mask >> 1) & 1) != s.action2) return;
             // ...and NOT next to a toggle block it has not fired (nearPressBox), which the
             // button fires: SubZero 4003's uid 4001 is passed by an airborne cube, so with
             // the pressed child pruned no state ever entered it (2026-09-24).
@@ -6535,16 +6651,17 @@ inline int cliMainOnce(int argc, char** argv) {
             // is the only one left.
             if (input == 1 && s.mode == 0 && !s.grounded && orbsEmpty
                 // A remote partner has its own rings and input-sensitive mode.
-                && !s.dashing && !(s.dual && (s.dashing2 || s.xAbs2 != s.xAbs))
+                && !s.dashing && !(s.dual && (g_twoPlayer || s.dashing2 || s.xAbs2 != s.xAbs))
                 && !nearPressBox(s) && !g_airPress
                 && !(edgeLocked && s.action == 1))
                 return;
             // --latgap: no edge on a tick GD cannot put one (frames.hpp g_latGap)
             if (s.latLock && input != (int)s.action)
                 return;
+            if (g_twoPlayer && s.dual && s.latLock2 && ((mask >> 1) & 1) != s.action2) return;
             // --twinskip: decided after the step pass, from the released sibling (slot i-1):
             // copied in when that one stayed in the air, stepped for real otherwise.
-            if (input == 1 && mayTwin && twinOn && pressMoot(s)) {
+            if (actions == 2 && input == 1 && mayTwin && twinOn && pressMoot(s)) {
                 if (!g_twinAudit) {
                     kidFlag[i] = 3;
                     return;
@@ -6553,7 +6670,7 @@ inline int cliMainOnce(int argc, char** argv) {
             }
             Child& kid = kids[i];
             bool dead = false;
-            kid.s = stepBoth(s, input, K, dead);
+            kid.s = stepBoth(s, mask, K, dead);
             // GAMEPLAY ROTATION: turn the child if this tick crossed one. Must
             // happen BEFORE keyOf below -- the turn rewrites x, y, vy and the
             // frame, and a key taken in the old frame would put two different
@@ -6580,8 +6697,7 @@ inline int cliMainOnce(int argc, char** argv) {
             // Only the cost reads the anchor's raw hold. Do not rewrite `action`: other
             // bodies can have pending delayed input, including in a mixed Wave dual.
             if (g_waveStraight)
-                kid.s.waveTurns = waveTurnCost(s.waveTurns, K.t == t0 + 1 ? s.held : s.action, input,
-                                              waveActive(s.mode, s.dual, s.mode2));
+                kid.s.waveTurns = inputTurnCost(s, mask, K.t == t0 + 1);
             if (g_minPulse > 1)
                 kid.s.edgeAge = (input != (int)s.action)
                                     ? 0 : (uint8_t)std::min(254, (int)s.edgeAge + 1);
@@ -6859,7 +6975,7 @@ inline int cliMainOnce(int argc, char** argv) {
         // The claim needs the released sibling to have STAYED in the air, alive: a body that
         // lands on this tick jumps on this tick if the button is down (measured on lv22 t=372:
         // released vy 0.000, pressed 11.180, same y), and a death is not worth reasoning about.
-        if (twinOn) {
+        if (twinOn && actions == 2) {
             auto airborne = [&](size_t a) {
                 const Child& k = kids[a];
                 return kidFlag[a] == 2 && !k.s.grounded && !k.s.onSlope;
@@ -6930,7 +7046,7 @@ inline int cliMainOnce(int argc, char** argv) {
         }
         ppMark(1);
         // --searchcensus: did the two inputs of each parent lead anywhere different? Print only.
-        if (g_searchCensus > 0)
+        if (g_searchCensus > 0 && actions == 2)
             for (size_t j = 0; j < gidx.size(); ++j)
                 census.siblings(cur[gidx[j]], kidFlag[2 * j], kidFlag[2 * j + 1], kids[2 * j].s,
                                 kids[2 * j + 1].s, kidKeys[2 * j], kidKeys[2 * j + 1],
@@ -6966,8 +7082,9 @@ inline int cliMainOnce(int argc, char** argv) {
         // fate wins over a dead one rather than the last one written.
         if (g_refWatch && g_refParent >= 0) {
             for (size_t i = 0; i < kids.size(); ++i) {
-                if ((int)gidx[i >> 1] != g_refParent) continue;
-                const int a = (int)(i & 1);
+                if ((int)gidx[i / actions] != g_refParent) continue;
+                const int a = (int)(i % actions);
+                if (a >= 2) continue;   // legacy reference diagnostics have two slots
                 if (g_refKidFate[a] == 2) continue;   // already alive somewhere
                 g_refKidFate[a] = (int)kidFlag[i];
                 g_refKidWhy[a] = kids[i].why ? kids[i].why : "";
@@ -7112,13 +7229,14 @@ inline int cliMainOnce(int argc, char** argv) {
                 if (r.bOrd == kNone) src = r.hiIdx;   // never split: hi == lo
                 else if (i == r.aOrd) src = r.bWasHi ? r.loIdx : r.hiIdx;
                 else src = r.bWasHi ? r.hiIdx : r.loIdx;
-                const State& from = cur[gidx[src >> 1]];
-                const uint8_t action = (uint8_t)(src & 1);
-                arena.push_back(Node{from.parent | ((uint32_t)action << 31)});
+                const State& from = cur[gidx[src / actions]];
+                const uint8_t action = (uint8_t)(src % actions);
+                arena.push_back(Node::make(from.parent, action));
                 if (checkWanted) arenaMode.push_back(kids[src].s.mode);
+                if (checkWanted && g_twoPlayer) arenaMode2.push_back(kids[src].s.mode2);
                 nxt.push_back(kids[src].s);
                 nxt.back().parent = (uint32_t)(arena.size() - 1);
-                nxt.back().action = action;
+                nxt.back().action = action & 1;
             }
             if (!solved || g_waveStraight) {
                 // Across shards, use the same route cost and ordinal tie-break as emit.
@@ -7139,14 +7257,15 @@ inline int cliMainOnce(int argc, char** argv) {
                 }
                 if (g != kNone && (!solved || preferWaveRoute(gw, gt, goalState.waveTurns,
                                                              goalState.tight, g_waveStraight))) {
-                    const State& from = cur[gidx[g >> 1]];
-                    const uint8_t action = (uint8_t)(g & 1);
+                    const State& from = cur[gidx[g / actions]];
+                    const uint8_t action = (uint8_t)(g % actions);
                     arena.push_back(
-                        Node{from.parent | ((uint32_t)action << 31)});
+                        Node::make(from.parent, action));
                     if (checkWanted) arenaMode.push_back(kids[g].s.mode);
+                    if (checkWanted && g_twoPlayer) arenaMode2.push_back(kids[g].s.mode2);
                     goalState = kids[g].s;
                     goalState.parent = (uint32_t)(arena.size() - 1);
-                    goalState.action = action;
+                    goalState.action = action & 1;
                     solved = true;
                 }
             }
@@ -7157,8 +7276,8 @@ inline int cliMainOnce(int argc, char** argv) {
         for (size_t i = 0; i < kids.size(); ++i) {
             const Child& kid = kids[i];
             if (!kid.valid) continue;
-            const State& s = cur[gidx[i >> 1]];
-            const int input = (int)(i & 1);
+            const State& s = cur[gidx[i / actions]];
+            const int input = (int)(i % actions);
             const State& c = kid.s;
             const bool dead = kid.dead != 0;
             ++nBorn;
@@ -7873,22 +7992,23 @@ inline int cliMainOnce(int argc, char** argv) {
             // ALREADY been published can be reached from here -- a published prefix is ticks
             // and levels, never indices (dp/progress.hpp) -- so this only has to keep the live
             // array consistent for the next LCA walk.
-            std::vector<uint8_t> nm;
+            std::vector<uint8_t> nm, nm2;
             if (checkWanted) nm.reserve(keep);
             for (size_t i = 0; i < arena.size(); ++i) {
                 if (!mark[i]) continue;
                 remap[i] = (uint32_t)na.size();
                 // a parent always precedes its children in the arena, so
                 // remap[parent()] is already final here
-                na.push_back(Node{remap[arena[i].parent()]
-                                  | ((uint32_t)arena[i].action() << 31)});
+                na.push_back(Node::make(remap[arena[i].parent()], arena[i].action()));
                 if (checkWanted) nm.push_back(arenaMode[i]);
+                if (checkWanted && g_twoPlayer) nm2.push_back(arenaMode2[i]);
             }
             const size_t before = arena.size();
             arena.swap(na);
             na = std::vector<Node>();   // release the old allocation NOW
             if (checkWanted) {
                 arenaMode.swap(nm);
+                if (g_twoPlayer) arenaMode2.swap(nm2);
                 nm = std::vector<uint8_t>();
             }
             for (State& s : cur) s.parent = remap[s.parent];
@@ -7939,20 +8059,22 @@ inline int cliMainOnce(int argc, char** argv) {
         // Every state in `cur` is alive in the model through tick t, so the game killing this
         // lineage at or before t is a disagreement with the model by construction.
         if (checkWanted && !solved && !cur.empty() && isCheckpointLayer(t - t0)) {
-            std::vector<uint8_t> plvl, pmode;
+            std::vector<uint8_t> plvl, pmode, pmode2;
             plvl.reserve((size_t)(t - t0));
             pmode.reserve((size_t)(t - t0));
             for (uint32_t i = cur.front().parent; i != 0; i = arena[i].parent()) {
                 plvl.push_back(arena[i].action());
                 pmode.push_back(arenaMode[i]);
+                if (g_twoPlayer) pmode2.push_back(arenaMode2[i]);
             }
             std::reverse(plvl.begin(), plvl.end());
             std::reverse(pmode.begin(), pmode.end());
+            std::reverse(pmode2.begin(), pmode2.end());
             SearchCheckpoints::Point p;
             p.t0 = t0;
             p.tick = t0 + (long long)plvl.size();
             for (const PlanEdge& e :
-                 planEdges(plvl, pmode, t0, (int)init.held, init.mode, g_oldLatency))
+                 maskedPlanEdges(plvl, pmode, pmode2, t0, init))
                 p.edges.emplace_back(e.press, e.level);
             g_check.publish(std::move(p));
         }
@@ -8325,7 +8447,7 @@ inline int cliMainOnce(int argc, char** argv) {
         std::printf("rejoin: the prefix is %zu ticks, not %lld - not joined\n", lvl.size(),
                     g_rjJoinT - t0);
     }
-    std::vector<uint8_t> modeAt(lvl.size(), 0);  // filled by the resim below
+    std::vector<uint8_t> modeAt(lvl.size(), 0), modeAt2(lvl.size(), 0);  // witness modes, per body
 
     // re-simulate the witness and write its per-tick trace (for diffing
     // against a GD dump to localize model divergences)
@@ -8365,7 +8487,9 @@ inline int cliMainOnce(int argc, char** argv) {
         // the tick, so a later reader (--rejoinuse) can tell the walk's deaths from its corpse
         // rows -- the walk runs on through a kill, and y/vy alone do not say where it fired.
         tr << "tick,x,y,vy,mode,grounded,dual,y2,vy2,flip2,act,flip,frame"
-              ",rotspent,rotchan,rotrev,dead,key,key_fields,x2,gravity,gravity2\n";
+              ",rotspent,rotchan,rotrev,dead,key,key_fields,x2,gravity,gravity2";
+        if (g_twoPlayer) tr << ",inputkey,mode2,mini2,grounded2";
+        tr << "\n";
         std::ofstream sn;
         if (!snapLogPath.empty()) {
             sn.open(snapLogPath);
@@ -8495,14 +8619,13 @@ inline int cliMainOnce(int argc, char** argv) {
             const int rFrame0 = (int)s.frame;
             State c = stepBoth(s, lvl[i], K, rdead);
             if (g_waveStraight)
-                c.waveTurns = waveTurnCost(s.waveTurns, s.action, lvl[i],
-                                          waveActive(s.mode, s.dual, s.mode2));
+                c.waveTurns = inputTurnCost(s, lvl[i]);
             // ...and turn, the way the search's kid does at :3108. Same gate
             // (`!dead && !g_rotTrig.empty()`), same arguments, and it has to run
             // BEFORE the row is written or the trace records a position in a
             // coordinate system the plan had already left.
             if (!rdead && !g_rotTrig.empty()) {
-                applyRotation(c, xPrevR, (double)rDxUsed, t, lvl[i],
+                applyRotation(c, xPrevR, (double)rDxUsed, t, lvl[i] & 1,
                               rPrevGrounded, rPrevY, true);
                 if ((int)c.frame != rFrame0) {
                     rLf = &frameLevel(L, (int)c.frame);
@@ -8513,7 +8636,7 @@ inline int cliMainOnce(int argc, char** argv) {
             // so the witness walks the world the search planned in. Same gate as
             // the search's: alive, and not on a tick that turned the player.
             if (coinOn && !rdead && (int)c.frame == rFrame0)
-                itemGates(c, s.action, (int)lvl[i], K, rFrame0, (double)c.xAbs,
+                itemGates(c, s.action, (int)(lvl[i] & 1), K, rFrame0, (double)c.xAbs,
                           (double)c.y, hazardHalfFor(c.mode, c.mini != 0), t);
             // ...and rdead is not read. It was declared, passed, and dropped:
             // the witness resim walks the whole plan whether or not the player
@@ -8550,9 +8673,10 @@ inline int cliMainOnce(int argc, char** argv) {
                 ++g_resimDead;
             }
             ++g_resimTicks;
-            c.action = (uint8_t)lvl[i];
+            c.action = (uint8_t)(lvl[i] & 1);
             s = c;
             modeAt[i] = s.mode;
+            modeAt2[i] = s.mode2;
             const SearchKey traceKey = keyOf(s, (long long)t);
             tr << t << ',' << (double)s.xAbs << ',' << s.y << ',' << s.vy << ','
                << (int)s.mode << ',' << (int)s.grounded << ',' << (int)s.dual
@@ -8562,7 +8686,10 @@ inline int cliMainOnce(int argc, char** argv) {
                << ',' << (unsigned)s.rotRev << ',' << (rdead ? 1 : 0)
                << ',' << (unsigned long long)SearchKeyHash{}(traceKey)
                << ',' << keyText(traceKey) << ',' << s.xAbs2
-               << ',' << s.gravityMod << ',' << s.gravityMod2 << "\n";
+               << ',' << s.gravityMod << ',' << s.gravityMod2;
+            if (g_twoPlayer) tr << ',' << inputKeyOf(s) << ',' << (int)s.mode2
+                << ',' << (int)s.mini2 << ',' << (int)s.grounded2;
+            tr << "\n";
             // --rejoinuse: past the join the walk must retrace the old plan's walk -- the same
             // fields on every tick the old trace has, and no kill it did not have. The first tick
             // it does not is the join failing its own premise (repair.hpp refuses the join).
@@ -8660,7 +8787,7 @@ inline int cliMainOnce(int argc, char** argv) {
         // start from the mode at the START of the effect tick, then take
         // the mode at the tick that guess points at.
         const std::vector<PlanEdge> pe =
-            planEdges(lvl, modeAt, t0, (int)init.held, init.mode, g_oldLatency);
+            maskedPlanEdges(lvl, modeAt, modeAt2, t0, init);
         for (const PlanEdge& e : pe) {
             out << "input=" << e.press << ',' << e.level << "\n";
             ++edges;

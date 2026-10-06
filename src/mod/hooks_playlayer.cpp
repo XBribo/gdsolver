@@ -743,10 +743,11 @@ class $modify(PlayLayer) {
         // p2 dies never get booked and the run spins idle). The position used is p1's: all
         // recordings are p1-based, and the two dual bodies share the same x (y is mirrored)
         const bool isP1 = caller == 1;
-        const bool isP2Dual = caller == 2 && before.dual;
+        const bool isP2Dual = caller == 2 && (before.dual || g_activeP2Collision > 0);
         // Exclude anti-cheat pseudo-calls: record only on an actual transition into the
         // dead state
-        if (solver::deathEndsAttempt(before, after, caller) && !solver::g_deathBooked) {
+        const bool p2PassDeath = isP2Dual && !before.p2 && after.p2;
+        if ((solver::deathEndsAttempt(before, after, caller) || p2PassDeath) && !solver::g_deathBooked) {
             auto pos = (isP1 || !m_player1) ? player->getPosition()
                                             : m_player1->getPosition();
             if (isP2Dual) {

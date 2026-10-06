@@ -608,7 +608,7 @@ class $modify(PlayerObject) {
         // ...and whether THIS tick's press is still queued behind us (see above).
         const int pend = (g_nextInput < g_cfg.inputs.size()
                           && g_cfg.inputs[g_nextInput].step == g_tick
-                          && g_cfg.inputs[g_nextInput].down) ? 1 : 0;
+                          && (g_cfg.inputs[g_nextInput].down & 1)) ? 1 : 0;
         // `uid` names WHICH orb, and the line is unusable without it wherever more
         // than one is in reach. Two open questions both need exactly this field:
         //   - lv14 t=13,363 has a yellow and a gravity orb bracketing the player,

@@ -106,12 +106,15 @@ struct AnchorRow {
     // GD's m_controlsDisabled (the dump's ctrlOff column, same source). While
     // set, the button is ignored entirely (id 2899, frames.hpp's g_ctrlWin note);
     // addWorldArgs turns runs of it into --ctrlwin under cfg `dpctrlwin`.
-    int ctrlOff = 0;
+    int ctrlOff = 0, ctrlOff2 = 0;
     // The press latch, bytes [player+0x985] (held) and [player+0x986] (a press
     // not yet consumed), per body. dp's State::pressSpent is "held, and the
     // press already spent" -- set by a consumer, cleared on release -- so it is
     // 0x985 && !0x986 (histPayload). -1 = no second body.
     int b985 = 0, b986 = 0, b985_2 = -1, b986_2 = -1;
+    bool twoPlayer = false;
+    int buttons = 0;
+    int spiderAge2 = 255;
     // cfg `coinroute`: the coins GD had credited by the end of this tick (bit i = the i-th coin
     // in x order, the order dp's L.coins has), from the pickupItem hook. An anchor passes it as
     // --coinmask, or the anchored search would read every coin behind it as missed.
@@ -288,6 +291,14 @@ inline void record(GJBaseGameLayer* l, long long t) {
     r.flip = p->m_isUpsideDown ? 1 : 0;
     r.mini = (p->m_vehicleSize < 0.9f) ? 1 : 0;
     r.dual = l->m_gameState.m_isDualMode ? 1 : 0;
+    r.twoPlayer = l->m_levelSettings && l->m_levelSettings->m_twoPlayerMode;
+    r.buttons = playerHeld(p) | (r.dual ? (playerHeld(l->m_player2) << 1) : 0);
+    if (r.twoPlayer && r.dual && l->m_player2) {
+        const char* body = reinterpret_cast<const char*>(l->m_player2);
+        const double clock = *reinterpret_cast<const double*>(body + gdoff::kPlayerTotalTime);
+        const double stamp = *reinterpret_cast<const double*>(body + gdoff::kPlayerLastSpiderFlipTime);
+        r.spiderAge2 = (int)std::min(255.0, std::max(0.0, std::round((clock - stamp) * 240.0)));
+    }
     r.teleported = p->m_wasTeleported ? 1 : 0;
     r.teleported2 = (r.dual && l->m_player2 && l->m_player2->m_wasTeleported) ? 1 : 0;
     r.gravityMod = p->m_gravityMod;
@@ -331,6 +342,7 @@ inline void record(GJBaseGameLayer* l, long long t) {
     // to 2.2081 like every other raw offset here.
     r.boost = *(reinterpret_cast<uint8_t const*>(p) + gdoff::kPlayerAccelerating) ? 1 : 0;
     r.ctrlOff = p->m_controlsDisabled ? 1 : 0;
+    r.ctrlOff2 = r.dual && l->m_player2 && l->m_player2->m_controlsDisabled ? 1 : 0;
     // The press latch (see AnchorRow::b985). Raw 2.2081 offsets: pushButton sets
     // both at 0x397fbc, releaseButton clears them, a consumer clears 0x986.
     r.b985 = *(reinterpret_cast<uint8_t const*>(p) + gdoff::kPlayerJumpBuffered) ? 1 : 0;
@@ -2097,26 +2109,29 @@ inline void addWorldArgs(std::vector<std::string>& a) {
     // plan the windows were recorded on. A window still open at the last
     // recorded tick closes there; past the recording the model has no windows,
     // which is the hole it always had.
-    std::string wins;
-    long long t0 = -1, last = -1;
     const long long n = anchors::depth();
-    for (long long t = 1; t < n; ++t) {
-        const AnchorRow* r = anchors::row(t);
-        if (!r) continue;
-        last = t;
-        if (r->ctrlOff && t0 < 0) t0 = t;
-        if (!r->ctrlOff && t0 >= 0) {
-            wins += (wins.empty() ? "" : ",") + std::to_string(t0) + ":"
-                    + std::to_string(t - 1);
-            t0 = -1;
+    for (int body = 0; body < 2; ++body) {
+        std::string wins;
+        long long t0 = -1, last = -1;
+        for (long long t = 1; t < n; ++t) {
+            const AnchorRow* r = anchors::row(t);
+            if (!r) continue;
+            last = t;
+            const bool off = body ? r->twoPlayer && r->ctrlOff2 : r->ctrlOff;
+            if (off && t0 < 0) t0 = t;
+            if (!off && t0 >= 0) {
+                wins += (wins.empty() ? "" : ",") + std::to_string(t0) + ":"
+                        + std::to_string(t - 1);
+                t0 = -1;
+            }
         }
-    }
-    if (t0 >= 0)
-        wins += (wins.empty() ? "" : ",") + std::to_string(t0) + ":"
-                + std::to_string(last);
-    if (!wins.empty()) {
-        a.push_back("--ctrlwin");
-        a.push_back(wins);
+        if (t0 >= 0)
+            wins += (wins.empty() ? "" : ",") + std::to_string(t0) + ":"
+                    + std::to_string(last);
+        if (!wins.empty()) {
+            a.push_back(body ? "--ctrlwin2" : "--ctrlwin");
+            a.push_back(wins);
+        }
     }
     // The level's own compatibility flags, written beside objrects when the session opened.
     // This one is NOT under dpWorld: kA39 changes the SHAPE of every circular hazard's test
@@ -2266,7 +2281,7 @@ inline bool g_repeatRejected = false;
 // Record the complete click sequence, including the verified prefix and an empty plan.
 inline solver::PlanEdges planEdges(const std::vector<InputCmd>& plan) {
     solver::PlanEdges edges;
-    for (const auto& c : plan) edges.emplace_back(c.step, c.down ? 1 : 0);
+    for (const auto& c : plan) edges.emplace_back(c.step, c.down);
     return edges;
 }
 
@@ -2635,18 +2650,21 @@ inline int groundedOf2(const AnchorRow& r) {
 // physics next to the wall.
 constexpr int kRobotHoverTicks = 67;   // measured 2026-08-10; see the driver's robot_hover_left
 
-inline int robotHoverLeft(long long t0) {
+inline int robotHoverLeft(long long t0, bool second = false) {
     const AnchorRow* cur = anchors::row(t0);
-    if (!cur || cur->mode != 5 || cur->onGround) return 0;   // grounded = GD has dropped it
+    if (!cur || (second ? cur->m2 : cur->mode) != 5
+        || (second ? cur->g2 : cur->onGround)) return 0;   // grounded = GD has dropped it
     // Falling is not hovering: a robot at terminal velocity holds vy just as flat, and crediting
     // that invents a budget nobody armed. Zero is NOT excluded -- a hover keeps whatever vy it
     // began with, and a pad or orb can set that to zero.
-    const float vp = cur->flip ? -cur->vy : cur->vy;
+    const float velocity = second ? cur->v2 : cur->vy;
+    const float vp = (second ? cur->f2 : cur->flip) ? -velocity : velocity;
     if (vp < 0.f) return 0;
     long long j = t0;
     for (int i = 0; i <= kRobotHoverTicks; ++i) {
         const AnchorRow* prev = anchors::row(j - 1);
-        if (!prev || prev->onGround || prev->vy != cur->vy) break;
+        if (!prev || (second ? prev->g2 : prev->onGround)
+            || (second ? prev->v2 : prev->vy) != velocity) break;
         --j;
     }
     // cfg `dphoverstrict=1`: NO FLAT RUN AT ALL IS NOT A FULL BUDGET. When vy already differs from
@@ -2660,7 +2678,8 @@ inline int robotHoverLeft(long long t0) {
     // spent two iterations at x=17,600 on it.
     if (j == t0) {
         const AnchorRow* next = anchors::row(t0 + 1);
-        const bool startsHere = next && !next->onGround && next->vy == cur->vy;
+        const bool startsHere = next && !(second ? next->g2 : next->onGround)
+            && (second ? next->v2 : next->vy) == velocity;
         return startsHere ? kRobotHoverTicks : 0;
     }
     const long long left = kRobotHoverTicks - (t0 - j);
@@ -2675,7 +2694,7 @@ inline int heldBefore(const std::vector<InputCmd>& plan, long long t0) {
     int held = 0;
     for (const InputCmd& c : plan) {
         if (c.step >= t0) break;
-        held = c.down ? 1 : 0;
+        held = c.down & 1;
     }
     return held;
 }
@@ -2692,13 +2711,15 @@ inline int heldBefore(const std::vector<InputCmd>& plan, long long t0) {
 // flipped and died at x=9,890 -- the same plan, three times in one cold run. With the bit, the
 // same tail replayed from the same anchor matches GD on every tick 7241..7300 and dies on 9601.
 // Gated by cfg `dpswingpending`.
-inline int swingPendingAt(const std::vector<InputCmd>& plan, long long t0) {
+inline int swingPendingAt(const std::vector<InputCmd>& plan, long long t0, int body = 0) {
     int prev = 0, last = 0;
     long long lastStep = -1;
     for (const InputCmd& c : plan) {
         if (c.step >= t0) break;
+        const int next = (c.down >> body) & 1;
+        if (next == last) continue;   // an edge of the other body is not this body's pending flip
         prev = last;
-        last = c.down ? 1 : 0;
+        last = next;
         lastStep = c.step;
     }
     return (lastStep == t0 - 1 && last == 1 && prev == 0) ? 1 : 0;
@@ -2941,6 +2962,12 @@ inline std::string anchorPayloadAll(long long t0) {
     add(g_cfg.touchPayload ? anchorPayload(t0) : std::string());
     add(g_cfg.portalPayload ? portalPayload(t0) : std::string());
     add(histPayload(t0));
+    if (const AnchorRow* r = anchors::row(t0); r && r->twoPlayer) {
+        add("buttons=" + std::to_string(r->buttons & 1) + "," + std::to_string((r->buttons >> 1) & 1));
+        add("buffers=" + std::to_string(r->b985) + "," + std::to_string(std::max(0, r->b985_2)));
+        const int hover = r->m2 == 7 ? swingPendingAt(g_plan, t0, 1) : robotHoverLeft(t0, true);
+        add("aux2=" + std::to_string(hover) + "," + std::to_string(r->spiderAge2));
+    }
     if (const AnchorRow* r = anchors::row(t0); r && r->dual)
         add("position2=" + num(r->x2) + "," + num(r->y2));
     if (const AnchorRow* r = anchors::row(t0))
@@ -3026,6 +3053,8 @@ struct TraceRow {
     double x = 0, y = 0, vy = 0, y2 = 0, vy2 = 0, x2 = 0;
     double gravityMod = 1, gravityMod2 = 1;
     int mode = 0, grounded = 0, dual = 0, act = -1;
+    unsigned long long inputKey = 0;
+    int mode2 = 0, mini2 = 0, flip2 = 0, grounded2 = 0;
     // The MODEL's own flip and mini (trace columns 24 and 16; -1 = an old
     // trace without them). The fixup key must be built from these, not from
     // the anchor row: the solver matches records against MODEL states, and at
@@ -3220,10 +3249,13 @@ inline bool loadTrace(const std::string& path, std::map<long long, TraceRow>& ou
         r.mode = integer(c, "mode");
         r.grounded = integer(c, "grounded");
         r.dual = integer(c, "dual");
+        r.inputKey = std::strtoull(text(c, "inputkey").c_str(), nullptr, 10);
+        r.mode2 = integer(c, "mode2"); r.mini2 = integer(c, "mini2");
+        r.flip2 = integer(c, "flip2"); r.grounded2 = integer(c, "grounded2");
         r.y2 = num(c, "y2");
         r.vy2 = num(c, "vy2");
         const std::string a = text(c, "act");
-        r.act = (a == "0" || a == "1") ? std::atoi(a.c_str()) : -1;
+        r.act = (a == "0" || a == "1" || a == "2" || a == "3") ? std::atoi(a.c_str()) : -1;
         // -1, not 0. These two are the only classification columns that are
         // also part of the record key, and -1 is what :1521's fallback tests
         // for -- "the model's row does not carry it, so use GD's". 0 is a
@@ -3254,6 +3286,8 @@ struct FixupKey {
     double gravityMod = 1, gravityMod2 = 1;
     int in = 0, mode = 0, mini = 0, flip = 0, g = 0, kill = 0, dual = 0;
     std::string itemAnchor;
+    unsigned long long inputKey = 0;
+    int mode2 = 0, mini2 = 0, flip2 = 0, ground2 = 0;
 };
 
 // Read a record back into its key. `dual` is not a column -- the second body rides in a named
@@ -3274,6 +3308,9 @@ inline bool parseFixupKey(const std::string& line, FixupKey& k,
         std::sscanf(line.c_str() + px, ",x2=%lf", &k.x2);
     if (const size_t pg = line.find(",gravity="); pg != std::string::npos)
         std::sscanf(line.c_str() + pg, ",gravity=%lf/%lf", &k.gravityMod, &k.gravityMod2);
+    if (const size_t p = line.find(",inputkey="); p != std::string::npos)
+        std::sscanf(line.c_str() + p, ",inputkey=%llu,pm2=%d,pmini2=%d,pflip2=%d,pg2=%d",
+            &k.inputKey, &k.mode2, &k.mini2, &k.flip2, &k.ground2);
     if (const size_t p = line.find(",itemanchor="); p != std::string::npos)
         k.itemAnchor = line.substr(p + 12);
     if (dvOut) *dvOut = dvy;
@@ -3297,6 +3334,8 @@ inline bool parseFixupKey(const std::string& line, FixupKey& k,
 // three ticks (t=8,567..8,569) were refused every pass for the whole budget because x, y and vy
 // matched an entry whose mode, gravity or second body did not.
 inline bool sameTransition(const FixupKey& a, const FixupKey& b) {
+    if (a.inputKey != b.inputKey || (a.inputKey && (a.mode2 != b.mode2
+        || a.mini2 != b.mini2 || a.flip2 != b.flip2 || a.ground2 != b.ground2))) return false;
     if (a.itemAnchor != b.itemAnchor) return false;
     if (a.in != b.in || a.kill != b.kill || a.mode != b.mode || a.mini != b.mini
         || a.flip != b.flip || a.g != b.g || a.dual != b.dual)
@@ -3415,7 +3454,7 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
     // A dual transition is recordable now (dp/fixup.hpp), but only if BOTH bodies were observed
     // on both sides of it -- a record with half a pair in it would be applied to a pair.
     const bool dual = (mPrev->second.dual != 0);
-    if (dual && !(gPrev->dual && mCur->second.dual && (!gCur || gCur->dual))) return FixupHalfPair;
+    if (dual && (!gPrev->dual || (!kill && !(mCur->second.dual && gCur && gCur->dual)))) return FixupHalfPair;
     const int act = mCur->second.act;
     if (act < 0) return FixupNoInput;
     // Deltas describe what GD did instead of the model. A kill has no "instead" -- the run ended
@@ -3493,6 +3532,9 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
     key.vy2 = mPrev->second.vy2;
     key.gravityMod = mPrev->second.gravityMod;
     key.gravityMod2 = mPrev->second.gravityMod2;
+    key.inputKey = mPrev->second.inputKey;
+    key.mode2 = mPrev->second.mode2; key.mini2 = mPrev->second.mini2;
+    key.flip2 = mPrev->second.flip2; key.ground2 = mPrev->second.grounded2;
     if (gPrev && gPrev->itemState) key.itemAnchor = *gPrev->itemState;
     // ...and "covered" is refined by the solver's own answer, the only side that can see the
     // gate: covered by a record the solver keeps back is a model wall. It REPLACES FixupOnFile
@@ -3523,6 +3565,9 @@ inline int writeFixup(long long t, int kill, const std::map<long long, TraceRow>
         std::ofstream f(noop ? g_fixupNoopPath : g_fixupPath, std::ios::app);
         if (!f) return FixupIoError;
         f << line;
+        if (key.inputKey)
+            f << ",inputkey=" << key.inputKey << ",pm2=" << key.mode2
+              << ",pmini2=" << key.mini2 << ",pflip2=" << key.flip2 << ",pg2=" << key.ground2;
         if (gPrev && gPrev->itemState)
             f << ",itemtick=" << t - 1 << ",itemanchor=" << *gPrev->itemState;
         f << "\n";
@@ -3976,6 +4021,15 @@ inline int fixupPass(long long t0, const std::string& startArgStr, const std::st
             r.x2 = a->x2;
             r.vy2 = a->v2;
             r.gravityMod = a->gravityMod; r.gravityMod2 = a->gravityMod2;
+            r.mode2 = a->m2; r.mini2 = a->mini2;
+            r.flip2 = a->f2; r.grounded2 = groundedOf2(*a);
+            if (a->twoPlayer && a->dual)
+                r.inputKey = 0x1000000u | (a->buttons & 1) | ((a->buttons & 1) << 1)
+                    | (a->b985 << 2) | (((a->buttons >> 1) & 1) << 3)
+                    | (((a->buttons >> 1) & 1) << 4) | (std::max(0, a->b985_2) << 5)
+                    | ((unsigned long long)a->spiderAge2 << 48)
+                    | ((unsigned long long)(a->mode == 7 ? swingPendingAt(g_plan, t0) : robotHoverLeft(t0)) << 17)
+                    | ((unsigned long long)(a->m2 == 7 ? swingPendingAt(g_plan, t0, 1) : robotHoverLeft(t0, true)) << 32);
             r.act = -1;    // no transition ENDS at t0, so no input is attributed to it
             // model == GD at t0 by construction, so GD's flags stand in for the
             // model's -- with the same frame-3 flip mirror startArg applies.
@@ -5494,7 +5548,8 @@ inline bool runLadder(long long dt) {
 inline std::string planFnv(const std::vector<InputCmd>& p) {
     uint64_t h = 1469598103934665603ULL;
     for (const InputCmd& c : p) {
-        const uint64_t v = (uint64_t)c.step * 2u + (uint64_t)(c.down ? 1 : 0);
+        const uint64_t v = ((uint64_t)c.step * 2u + (c.down & 1))
+            | ((uint64_t)(c.down & 2) << 32);   // retain legacy digests without aliasing P2 with a later tick
         for (int i = 0; i < 8; ++i) {
             h ^= (uint8_t)(v >> (i * 8));
             h *= 1099511628211ULL;
@@ -5808,9 +5863,18 @@ inline void addFirstStart(std::vector<std::string>& a) {
     if (g_firstStart.empty()) return;
     a.push_back("--start");
     a.push_back(g_firstStart);
-    if (g_spawnRow.itemState) {
+    if (g_spawnRow.itemState || g_spawnRow.twoPlayer) {
         a.push_back("--anchor-state");
-        a.push_back("itemstate=" + *g_spawnRow.itemState + ";player=-");
+        std::string payload = "player=-";
+        if (g_spawnRow.itemState) payload = "itemstate=" + *g_spawnRow.itemState + ";" + payload;
+        if (g_spawnRow.twoPlayer) {
+            payload += ";buttons=" + std::to_string(g_spawnRow.buttons & 1) + ","
+                + std::to_string((g_spawnRow.buttons >> 1) & 1);
+            payload += ";buffers=" + std::to_string(g_spawnRow.b985) + ","
+                + std::to_string(std::max(0, g_spawnRow.b985_2));
+            payload += ";aux2=0," + std::to_string(g_spawnRow.spiderAge2);
+        }
+        a.push_back(std::move(payload));
     }
     if (!g_firstBand.empty()) {
         a.push_back("--startband");
@@ -6786,7 +6850,7 @@ inline void ckConsider() {
         plan.push_back(c);
     }
     for (const std::pair<long long, int>& e : cp.edges)
-        plan.push_back(InputCmd{(int)e.first, e.second != 0});
+        plan.push_back(InputCmd{(int)e.first, (uint8_t)e.second});
     std::sort(plan.begin(), plan.end(),
               [](const InputCmd& a, const InputCmd& c) { return a.step < c.step; });
     g_ckCall = cp.call;
@@ -6817,7 +6881,7 @@ inline void ckObsCompare(double jobSec) {
     auto upTo = [](const std::vector<InputCmd>& p, long long last) {
         std::vector<std::pair<int, int>> v;
         for (const InputCmd& c : p)
-            if (c.step <= last) v.push_back({c.step, c.down ? 1 : 0});
+            if (c.step <= last) v.push_back({c.step, c.down});
         std::sort(v.begin(), v.end());
         return v;
     };

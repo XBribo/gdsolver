@@ -48,6 +48,8 @@ struct Fixup {
     float y2 = 0, vy2 = 0, dy2 = 0, dvy2 = 0;
     float x2 = 0;   // named tail; legacy records inherit the primary X
     float gravityMod = 1.f, gravityMod2 = 1.f;
+    unsigned long long inputKey = 0;
+    int mode2 = 0, mini2 = 0, flip2 = 0, ground2 = 0;
     std::string itemAnchor;
     long long itemTick = -1;
     const ItemMemory* itemWitness = nullptr;
@@ -115,6 +117,9 @@ inline int g_fixupCallRotSeen = 0;
 // Kills are also matched FIRST for the same reason: a verdict must not lose
 // to a trajectory patch from the neighbouring tick.
 inline bool fixupMatches(const Fixup& f, const State& s, int input) {
+    if (f.inputKey != inputKeyOf(s)) return false;
+    if (f.inputKey && (f.mode2 != s.mode2 || f.mini2 != s.mini2
+        || f.flip2 != s.flip2 || f.ground2 != s.grounded2)) return false;
     if (s.item && (!f.itemWitness || f.itemWitness->words != s.item->words
         || itemBits(f.itemClock) != itemBits(s.itemClock))) return false;
     if (!s.item && !f.itemAnchor.empty()) return false;
@@ -379,7 +384,7 @@ inline void applyPlayerEffect(State& c, const PlayerEffect& e, int triggeringPla
             c.rotStep = (float)(ballRotRate(c.mini != 0, true, c.dx) * c.gravityMod);
             c.rotNeg = (uint8_t)!((c.flip != 0) ^ (c.rev != 0));
         }
-        if (c.dual && sameModeFlags(c.mode, c.mode2)) {
+        if (!g_twoPlayer && c.dual && sameModeFlags(c.mode, c.mode2)) {
             const uint8_t partner = (uint8_t)!c.flip;
             if (c.flip2 != partner) {
                 c.flip2 = partner; c.vy2 *= 0.5f;
@@ -486,7 +491,10 @@ inline void playerTriggerTick(State& c, const StepCtx& K, PlayerPhase phase, dou
     }
 }
 
-inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bool& dead) {
+inline State stepBoth(const State& entering, int mask, const StepCtx& baseK, bool& dead) {
+    mask = gdinput::canonical(mask, g_twoPlayer, entering.dual);
+    const int input = mask & 1;
+    const int input2 = g_twoPlayer ? ((mask >> 1) & 1) : input;
     std::optional<State> queued;
     if (!g_playerRoots.empty() || entering.item) {
         queued.emplace(entering);
@@ -505,6 +513,8 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     if (g_touchCensus) g_tcBranch = 0;
     g_preBtnSet = false;
     State c = stepOne(s, input, K, d1, &p1FlippedGravity);
+    c.inputMask = (uint8_t)mask;
+    if (g_twoPlayer) c.action = (uint8_t)input;
     if (g_touchCensus) g_tcBranchP1 = g_tcBranch;
     // p1's pre-button y, saved before p2's stepOne can overwrite it
     const bool preBtnSet = g_preBtnSet;
@@ -530,8 +540,8 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
         if (!g_fixups.empty()) {
             const Obj* dyn = nearDynObjectPtr(s, K);
             if (!dyn)
-                applyFixup(s, input, c, dead);
-            else if (findFixup(g_fixupKills, s, input) || findFixup(g_fixupDeltas, s, input))
+                applyFixup(s, mask, c, dead);
+            else if (findFixup(g_fixupKills, s, mask) || findFixup(g_fixupDeltas, s, mask))
                 g_fxBlockedUid = dyn->uid;   // matched, and the gate kept it back
         }
         if (g_fxWatchT >= 0 && K.t == g_fxWatchT) fxDescribe(s, input, K, c, fxHits0);
@@ -544,7 +554,7 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
         itemSourceTick(c, s, K, 1, true);
         dead = d1;
         markTouched(c, K, touchPreY(s, c, preBtnSet, preBtnY), s.action != 0);
-        if (!g_fixups.empty()) applyFixup(s, input, c, dead);
+        if (!g_fixups.empty()) applyFixup(s, mask, c, dead);
         return c;
     }
     State sb = s;
@@ -596,7 +606,7 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     // inverse of the new polarity and halves only if that changed it; a plain
     // toggle would equal that only for a mirrored pair. See the p2 -> p1 half after
     // p2's step.
-    if (p1FlippedGravity && s.dual
+    if (!g_twoPlayer && p1FlippedGravity && s.dual
         && sameModeFlags(s.mode, s.mode2)) {
         const uint8_t want = (uint8_t)!c.flip;
         if (sb.flip != want) {
@@ -609,11 +619,11 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     g_halfNow = 1;
     // --dualband: the second half's portal band reads p1's finished mode, and says if it wrote
     g_bandPortalWrote = false;
-    if (g_dualBand) g_dualOtherMode = (int)c.mode;
+    if (g_dualBand || g_twoPlayer) g_dualOtherMode = (int)c.mode;
     BodyWindow p2Window;
     const StepCtx p2K = (s.xAbs2 != s.xAbs && K.slices[0])
         ? p2Window.at(sb, K) : K;
-    State cb = stepOne(sb, input, p2K, d2, &p2FlippedGravity);
+    State cb = stepOne(sb, input2, p2K, d2, &p2FlippedGravity);
     const double p2TouchY = touchPreY(sb, cb, g_preBtnSet, g_preBtnY);
     g_dualOtherMode = -1;
     const bool p2WroteBand = g_bandPortalWrote;
@@ -629,6 +639,18 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     // Native collisionCheckObjects (0x21580d) lets p2 exit dual too; its
     // layer flag write survives the rest of this already-started collision pass.
     c.dual = cb.dual;
+    if (g_twoPlayer) {
+        c.held2 = cb.held2; c.jumpBuf2 = cb.jumpBuf2;
+        c.rHover2 = cb.rHover2; c.pFlap2 = cb.pFlap2; c.pNoTerm2 = cb.pNoTerm2;
+        c.pSpiderTap2 = cb.pSpiderTap2; c.ogLinger2 = cb.ogLinger2; c.spiderJumpT2 = cb.spiderJumpT2;
+        c.action2 = c.dual ? (uint8_t)input2 : 0;
+        c.edgeAge2 = input2 != s.action2 ? 0 : (uint8_t)std::min(254, (int)s.edgeAge2 + 1);
+        c.latLock2 = c.dual && (cb.mode2 == 1 || cb.mode2 == 3) && !(s.mode2 == 1 || s.mode2 == 3);
+        if (!c.dual) {
+            c.held2 = c.jumpBuf2 = c.edgeAge2 = c.rHover2 = c.pFlap2 = c.pNoTerm2 = 0;
+            c.pSpiderTap2 = c.ogLinger2 = 0; c.spiderJumpT2 = 255;
+        }
+    }
     c.xAbs2 = cb.xAbs2;
     c.gravityMod2 = cb.gravityMod2;
     c.spinMod2 = cb.spinMod2;
@@ -696,7 +718,7 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     // either body, after p1's, so the band the second half wrote is the pair's (frames.hpp
     // g_dualBand). Taken only when that half's portal wrote it (g_bandPortalWrote); otherwise
     // p1's stands.
-    if (g_dualBand && s.dual && p2WroteBand) {
+    if ((g_dualBand || g_twoPlayer) && s.dual && p2WroteBand) {
         c.bandFloor = cb.bandFloor;
         c.bandCeil = cb.bandCeil;
         c.bandRefY = cb.bandRefY;
@@ -712,7 +734,7 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     // bodies start flipped (p1 fires 1->0, the partner call leaves p2 alone,
     // p2 fires and sets p1 back to 1: vy * 1/4), which is why the portal pass
     // no longer has r101's same-box skip.
-    if (p2FlippedGravity && s.dual
+    if (!g_twoPlayer && p2FlippedGravity && s.dual
         && sameModeFlags(s.mode, s.mode2)) {
         const uint8_t want = (uint8_t)!c.flip2;
         if (c.flip != want) {
@@ -742,13 +764,13 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     // alone. The rule below flipped p2 instead.
     const bool p1IsToucher = c.mode != s.mode
                              && c.mode2 == s.mode2 && s.mode2 == c.mode;
-    if (p1IsToucher) {
+    if (!g_twoPlayer && p1IsToucher) {
         const uint8_t want = c.flip2 ? 0 : 1;
         if (c.flip != want) {
             c.flip = want;
             c.vy *= 0.5f;
         }
-    } else if (c.mode2 != s.mode2 && c.mode2 == c.mode) {
+    } else if (!g_twoPlayer && c.mode2 != s.mode2 && c.mode2 == c.mode) {
         const uint8_t want = c.flip ? 0 : 1;
         if (c.flip2 != want) {
             c.flip2 = want;
@@ -786,7 +808,7 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     // A flipped body that tapped on this tick did not tap in GD: the repel came first and
     // flipGravity took its ground away, so the tap's writes are undone here -- the polarity the
     // tap left is the repel's too; its vy, spent press and cleared byte are put back.
-    if (s.dual && !d1 && !d2 && c.mode == 2 && c.mode2 == 2
+    if (!g_twoPlayer && s.dual && !d1 && !d2 && c.mode == 2 && c.mode2 == 2
         && (p1HitG || p2HitG)) {
         const uint8_t f1 = p1Tapped ? (uint8_t)!c.flip : c.flip;
         const uint8_t f2 = p2Tapped ? (uint8_t)!c.flip2 : c.flip2;
@@ -823,7 +845,7 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     // alive pinned at the 2000 cap for hundreds of ticks.
     // 26% of the 30 px columns in that section have geometry on one side only,
     // so this is worth taking. See g_dualFreeQ for what it does with it.
-    c.freeHalf = 1;
+    c.freeHalf = g_twoPlayer ? 0 : 1;   // an independently controlled body is not passive drift
     if (p2K.near) {
         for (const Obj* o : *p2K.near) {
             if (std::fabs((double)c.y2 - o->cy) < o->hh + 45.0) { c.freeHalf = 0; break; }
@@ -840,7 +862,7 @@ inline State stepBoth(const State& entering, int input, const StepCtx& baseK, bo
     // unusable even if something had managed to write it down. Applied here, after both bodies
     // are merged, for the same reason the single case applies it after stepOne: the record is
     // GD's answer to the whole transition.
-    if (!g_fixups.empty()) applyFixup(s, input, c, dead);
+    if (!g_fixups.empty()) applyFixup(s, mask, c, dead);
     return c;
 }
 

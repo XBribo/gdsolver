@@ -160,7 +160,7 @@ inline bool loadInputsFile(const std::string& path, std::vector<InputCmd>& out) 
         if (line.rfind("input=", 0) != 0) continue;
         int t = 0, d = 0;
         if (sscanf(line.c_str() + 6, "%d,%d", &t, &d) == 2)
-            out.push_back({t, d != 0});
+            out.push_back({t, (uint8_t)(d & 3)});
     }
     return !out.empty();
 }
@@ -173,7 +173,7 @@ inline bool writeInputsFile(const std::string& path, const std::vector<InputCmd>
     std::ofstream f(path, std::ios::trunc);
     if (!f) return false;
     for (const InputCmd& c : plan)
-        f << "input=" << c.step << "," << (c.down ? 1 : 0) << "\n";
+        f << "input=" << c.step << "," << (int)c.down << "\n";
     return true;
 }
 

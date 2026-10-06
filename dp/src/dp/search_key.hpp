@@ -161,6 +161,7 @@ struct SearchKey {
     std::array<uint16_t, kTouchBits> movingFire{};
     const std::vector<uint64_t>* itemWords = nullptr;
     uint64_t itemClock = 0;
+    uint64_t inputKey = 0;   // optional two-player history; old traces retain their exact schema
 
     // Keep comparison, hashing and trace encoding on the same field list.
     template <class Self>
@@ -180,7 +181,7 @@ struct SearchKey {
     }
     // Compare all canonical dimensions, not the storage representation.
     bool operator==(const SearchKey& b) const {
-        return fields(*this) == fields(b) && itemClock == b.itemClock
+        return fields(*this) == fields(b) && inputKey == b.inputKey && itemClock == b.itemClock
             && (itemWords == b.itemWords || (itemWords && b.itemWords && *itemWords == *b.itemWords));
     }
     // Negate the same complete equality used by the dedupe tables.
@@ -188,6 +189,7 @@ struct SearchKey {
     // Order full keys for the cell-cap and clearance diagnostics.
     bool operator<(const SearchKey& b) const {
         if (fields(*this) != fields(b)) return fields(*this) < fields(b);
+        if (inputKey != b.inputKey) return inputKey < b.inputKey;
         if (itemClock != b.itemClock) return itemClock < b.itemClock;
         if (!itemWords || !b.itemWords) return !itemWords && b.itemWords;
         return *itemWords < *b.itemWords;
@@ -216,6 +218,7 @@ struct SearchKeyHash {
             x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
             h = (h ^ (x ^ (x >> 31))) * 0x100000001B3ull;
         });
+        if (k.inputKey) h = (h ^ k.inputKey) * 0x100000001B3ull;
         if (k.itemWords) {
             h = (h ^ k.itemClock) * 0x100000001B3ull;
             for (uint64_t v : *k.itemWords) h = (h ^ v) * 0x100000001B3ull;
@@ -227,6 +230,7 @@ struct SearchKeyHash {
 // Versioned full keys let rejoinfull reject legacy digest-only traces.
 inline std::string keyText(const SearchKey& k) {
     std::ostringstream out;
+    if (k.inputKey) out << "v5:" << std::hex << k.inputKey << ':';
     out << (k.itemWords ? "v4" : "v3") << std::hex;
     keyWords(k, [&](auto v) { out << ':' << (uint64_t)v; });
     if (k.itemWords) {
@@ -238,6 +242,18 @@ inline std::string keyText(const SearchKey& k) {
 
 // Decode exactly one canonical full key; truncated, extra and old keys fail.
 inline bool parseKeyText(const std::string& text, SearchKey& result) {
+    if (text.rfind("v5:", 0) == 0) {
+        const size_t end = text.find(':', 3);
+        if (end == std::string::npos) return false;
+        uint64_t inputs = 0;
+        const auto parsed = std::from_chars(text.data() + 3, text.data() + end, inputs, 16);
+        const std::string base = text.substr(end + 1);
+        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + end || !inputs
+            || (base.rfind("v3:", 0) != 0 && base.rfind("v4:", 0) != 0)
+            || !parseKeyText(base, result)) return false;
+        result.inputKey = inputs;
+        return keyText(result) == text;
+    }
     std::istringstream in(text);
     std::string word;
     if (!std::getline(in, word, ':') || (word != "v3" && word != "v4")) return false;
@@ -274,6 +290,7 @@ inline bool parseKeyText(const std::string& text, SearchKey& result) {
 // Preserve the existing grid and conditional dimensions; t is the owning layer.
 inline SearchKey keyOf(const State& s, long long t) {
     SearchKey k;
+    k.inputKey = inputKeyOf(s);
     if (s.item) { k.itemWords = &s.item->words; k.itemClock = itemBits(s.itemClock); }
     std::memcpy(&k.gravity, &s.gravityMod, sizeof(k.gravity));
     std::memcpy(&k.gravity2, &s.gravityMod2, sizeof(k.gravity2));

@@ -2,6 +2,7 @@
 #include "dp/level_loader.hpp"
 #include "dp/wave_policy.hpp"
 #include "dp/item_program.hpp"
+#include "dp/input.hpp"
 
 namespace dp {
 
@@ -1132,7 +1133,33 @@ struct State {
     // A cube's rotation stake keeps the multiplier from its last runNormalRotation call.
     // A later gravity trigger changes acceleration immediately, not this existing stake.
     float spinMod = 1.f, spinMod2 = 1.f;
+    // Independent input history; seeded by buttons and buffers, swapped and merged per body.
+    uint8_t held2 = 0, action2 = 0, jumpBuf2 = 0, edgeAge2 = 0, latLock2 = 0;
+    uint8_t inputMask = 0;   // observed input into this tick, before a solo portal clears P2
+    uint8_t rHover2 = 0, pFlap2 = 0, pNoTerm2 = 0, pSpiderTap2 = 0, ogLinger2 = 0;
+    uint8_t spiderJumpT2 = 255;
 };
+
+// Exact input identity for dual fixups and keys; zero preserves every legacy key.
+inline unsigned long long inputKeyOf(const State& s) {
+    if (!gdinput::independent(g_twoPlayer, s.dual)) return 0;
+    return 0x1000000u | s.action | (s.held << 1) | (s.jumpBuf << 2)
+        | (s.action2 << 3) | (s.held2 << 4) | (s.jumpBuf2 << 5)
+        | (g_minPulse > 1 ? ((uint32_t)s.edgeAge2 << 8) : 0) | (s.latLock2 << 16)
+        | ((uint64_t)s.rHover << 17) | ((uint64_t)s.pFlap << 7) | ((uint64_t)s.latLock << 25)
+        | ((uint64_t)s.rHover2 << 32) | ((uint64_t)s.pFlap2 << 40)
+        | ((uint64_t)s.spiderJumpT2 << 48) | ((uint64_t)s.pNoTerm2 << 56)
+        | ((uint64_t)s.pSpiderTap2 << 57) | ((uint64_t)s.ogLinger2 << 58);
+}
+
+// Count only direction changes of the corresponding active Wave body.
+inline uint32_t inputTurnCost(const State& s, int mask, bool first = false) {
+    if (!g_twoPlayer) return waveTurnCost(s.waveTurns, first ? s.held : s.action, mask,
+        waveActive(s.mode, s.dual, s.mode2));
+    uint32_t cost = waveTurnCost(s.waveTurns, first ? s.held : s.action, mask & 1, s.mode == 4);
+    if (s.dual) cost = waveTurnCost(cost, first ? s.held2 : s.action2, (mask >> 1) & 1, s.mode2 == 4);
+    return cost;
+}
 
 // THIS ASSERT IS A QUESTION, NOT A BUDGET. If you added a field and the build
 // stopped here, ask whether it ACCUMULATES -- whether its value at tick t
@@ -1225,8 +1252,9 @@ struct State {
 // [2026-10-05] 528 -> 544: per-body gravity and the cube's retained spin multiplier;
 // seeded by gravity/spin and printed by seeddump. Pending player events reuse fireB.
 // [2026-10-05] 544 -> 560: immutable Item snapshot and native level clock; restored by itemstate.
+// [2026-10-06] 560 -> 576: independent P2 inputs and pending actions; seeded by buttons/buffers/aux2.
 constexpr size_t kStateBytes =
-    (560u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
+    (576u +(size_t)(kTouchBits - 32) * sizeof(uint16_t)
           + (sizeof(TouchMask) - sizeof(uint32_t))
           + 2u * (sizeof(GravLatch) - sizeof(Bits<128>)) + 7u) / 8u * 8u;
 static_assert(sizeof(State) == kStateBytes,
@@ -1235,11 +1263,15 @@ static_assert(sizeof(State) == kStateBytes,
               "run oneoff/py/seedcheck.py to zero before updating this. (This "
               "says nothing about globals -- those belong in reset.hpp.)");
 
-// arena entry for witness reconstruction, packed: bit31 = action, rest parent
+// Legacy arenas keep bit 31; two-player arenas reserve the top two bits for input.
 struct Node {
     uint32_t packed;
-    uint32_t parent() const { return packed & 0x7fffffffu; }
-    uint8_t action() const { return (uint8_t)(packed >> 31); }
+    uint32_t parent() const { return packed & (g_twoPlayer ? 0x3fffffffu : 0x7fffffffu); }
+    uint8_t action() const { return (uint8_t)(packed >> (g_twoPlayer ? 30 : 31)); }
+    // Use the same encoding during expansion, goal insertion and arena compaction.
+    static Node make(uint32_t parent, int input) {
+        return {parent | ((uint32_t)input << (g_twoPlayer ? 30 : 31))};
+    }
 };
 // "no value" sentinel for the parallel dedupe's u32 slots (file scope: the
 // dedupe's structs are local classes inside main, which MSVC will not let

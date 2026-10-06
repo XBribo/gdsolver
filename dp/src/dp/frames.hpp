@@ -873,7 +873,7 @@ inline std::string g_anchorState;
 // says. Declaring ownership keeps "replaces wholesale" true WITHIN a
 // subsystem and leaves the others honestly alone.
 inline const char* const kAnchorKeys[] = {"owns", "touch", "portal", "portal2",
-                                          "hist", "position2", "gravity", "spin", "player", "itemstate"};
+                                          "hist", "position2", "gravity", "spin", "player", "itemstate", "buttons", "buffers", "aux2"};
 
 // Parse a complete finite pair for position and per-body physics anchors.
 inline bool parseFinitePair(const std::string& value, double& a, double& b) {
@@ -1243,9 +1243,12 @@ inline bool g_spentPadSeed = true;
 // scheme. A cold run from the head has no such information and the model jumps
 // as before (an unresolved hole).
 inline std::vector<std::pair<long long, long long>> g_ctrlWin;
+inline std::vector<std::pair<long long, long long>> g_ctrlWin2;
 
+// Native Options controls are per player in independent-input levels.
 inline bool ctrlOffAt(long long t) {
-    for (const auto& w : g_ctrlWin)
+    const auto& windows = g_twoPlayer && g_halfNow == 1 ? g_ctrlWin2 : g_ctrlWin;
+    for (const auto& w : windows)
         if (t >= w.first && t <= w.second) return true;
     return false;
 }
@@ -1255,8 +1258,11 @@ inline bool ctrlOffAt(long long t) {
 // on exactly this tick does not accumulate rHover. Filled only when a replay is
 // loaded (always empty during the search).
 inline std::vector<long long> g_winRePushJump;
+inline std::vector<long long> g_winRePushJump2;
+// Each body's enableControls re-push consumes only its own physical press ledger.
 inline bool rePushNoHoverAt(long long t) {
-    for (long long v : g_winRePushJump)
+    const auto& jumps = g_twoPlayer && g_halfNow == 1 ? g_winRePushJump2 : g_winRePushJump;
+    for (long long v : jumps)
         if (t == v) return true;
     return false;
 }

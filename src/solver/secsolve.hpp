@@ -525,8 +525,9 @@ inline bool g_died = false;     // did a death verdict come in the previous step
 // long before this header -- can ask the same question rather than a copy of it (two flags that
 // mean the same thing drift, and the one that drifts is always the one nobody is looking at).
 inline bool& g_active = g_secSearching;
-inline int g_feed = 0;               // button state given at this tick (0/1)
+inline int g_feed = 0;               // input mask given at this tick (P1 bit 0, P2 bit 1)
 inline int g_held = 0;               // currently pressing? (for handleButton deltas)
+inline bool g_twoPlayer = false;     // immutable level setting; expansion also requires parent.dual
 // Can be turned off with cfg `secjumpbuf=0` (default ON): legacy checkpoint rearm
 // sets m_jumpBuffered. Search checkpoints overwrite this with their saved input.
 // Fast snapshots preserve their saved buffers after rearm.
@@ -946,6 +947,7 @@ struct Node {
     float y2;
     bool wave = false;           // either active body; not part of the physical key
     uint32_t waveTurns = 0;      // turns since the section head (the prefix is constant)
+    uint8_t waveMask = 0;        // independent inputs pay only for their own Wave body
 };
 inline std::vector<Node> g_nodes;
 // THE CHECKPOINT DOES NOT CARRY EVERY PLAYER MEMBER (cfg `seccpplayer`, on). A load puts back
@@ -1193,6 +1195,7 @@ inline void reset() {
     g_rungCoin = -1;
     g_feed = 0;
     g_held = 0;
+    g_twoPlayer = false;
     g_ckptInputs = {};
     g_nodes.clear();
     g_dash.clear();
@@ -1241,7 +1244,8 @@ inline long long keyOf(double y, double vy, int mode, int mini, int flip,
         const uint8_t* b = (const uint8_t*)&v;
         for (size_t i = 0; i < sizeof(v); ++i) { h ^= b[i]; h *= 1099511628211ull; }
     };
-    mix(((((long long)mode * 3 + mini) * 2 + flip) * 2 + held) * 2 + dash);
+    mix(((((long long)mode * 3 + mini) * 2 + flip) * 2 + (held & 1)) * 2 + dash);
+    if (g_twoPlayer) mix(held);   // distinguish all four masks without packed-field aliases
     mix(qy);
     mix(qv);
     mix(qx);

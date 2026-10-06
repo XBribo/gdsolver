@@ -863,6 +863,8 @@ class $modify(GJBaseGameLayer) {
                             g_headHeld = (it != m_player1->m_holdingButtons.end()
                                           && it->second) ? 1 : 0;
                         }
+                        if (m_levelSettings && m_levelSettings->m_twoPlayerMode && m_gameState.m_isDualMode)
+                            g_headHeld |= playerHeld(m_player2) << 1;
                         ev("CHECKPOINT_made", (double)g_ckptTick);
                         // Also emit x/y: without matching against the post-restore position
                         // we would miss that "the point where the checkpoint was made" and
@@ -2137,8 +2139,9 @@ class $modify(GJBaseGameLayer) {
         // a bot's UI holding nothing), and because draining it cannot make a
         // section restore less faithful. Not kept as an explanation.
         pl->m_queuedButtons.clear();
-        for (auto* p : {m_player1, m_player2})
-            if (p) p->m_holdingButtons[1] = heldAfter != 0;
+        if (m_player1) m_player1->m_holdingButtons[1] = (heldAfter & 1) != 0;
+        if (m_player2) m_player2->m_holdingButtons[1] =
+            m_levelSettings && m_levelSettings->m_twoPlayerMode ? (heldAfter & 2) != 0 : heldAfter != 0;
         secsolve::g_held = heldAfter;
         if (armedInputs) secCaptureInputs(*armedInputs);
         // Head replays must not inherit fields left by qualification or another branch.
@@ -2599,7 +2602,7 @@ class $modify(GJBaseGameLayer) {
         const float dt = g_cfg.fastdt;
         int held = 0;
         for (const auto& in : g_cfg.inputs)
-            if (in.step <= g_ckptTick) held = in.down ? 1 : 0;
+            if (in.step <= g_ckptTick) held = (int)in.down;
         secRestore(pl);
         for (int i = 0; i < 2; ++i) secStep(held, dt);   // the frozen ticks
         std::vector<float> px((size_t)nobj), py((size_t)nobj);
@@ -2777,7 +2780,7 @@ class $modify(GJBaseGameLayer) {
 
         int held = 0;
         for (const auto& in : g_cfg.inputs)
-            if (in.step <= g_ckptTick) held = in.down ? 1 : 0;
+            if (in.step <= g_ckptTick) held = (int)in.down;
         g_active = true;
         int freeze = 0;
         std::vector<uint64_t> base, again, after;
@@ -3092,7 +3095,7 @@ class $modify(GJBaseGameLayer) {
         size_t idx = 0;
         for (long long t = 0; t <= base + (long long)seq.size(); ++t) {
             while (idx < g_cfg.inputs.size() && g_cfg.inputs[idx].step <= t) {
-                held = g_cfg.inputs[idx].down ? 1 : 0;
+                held = (int)g_cfg.inputs[idx].down;
                 ++idx;
             }
             if (t >= base && (size_t)(t - base) < seq.size())
@@ -3341,15 +3344,21 @@ class $modify(GJBaseGameLayer) {
         // that head and drifted 11.5 px off the plan it was replaying before the 20-layer
         // check put it back. The leaf and check replays already restored the head with
         // g_headHeld; only the expansion disagreed with them.
-        g_nodes.push_back({-1, (uint8_t)(g_headHeld ? 1 : 0), 0, 0.f, 0.f, 0.f, 0,
+        secsolve::g_twoPlayer = m_levelSettings && m_levelSettings->m_twoPlayerMode;
+        g_nodes.push_back({-1, (uint8_t)g_headHeld, 0, 0.f, 0.f, 0.f, 0,
                            (uint8_t)(m_player1 && m_player1->m_vehicleSize < 0.9f ? 1 : 0),
                            (uint8_t)(secDualP2() ? 1 : 0), secDualY2()});
-        // The two bodies share one input, so either active Wave enables the route cost.
+        // Shared input pays once; independent input pays only for each Wave body's edge.
         auto waveHere = [&]() {
             return m_player1 && dp::waveActive((uint8_t)modeIdx(m_player1),
                 m_gameState.m_isDualMode, m_player2 ? (uint8_t)modeIdx(m_player2) : 0);
         };
+        auto waveMaskHere = [&]() -> uint8_t {
+            return (m_player1 && modeIdx(m_player1) == 4 ? 1 : 0)
+                | (m_gameState.m_isDualMode && m_player2 && modeIdx(m_player2) == 4 ? 2 : 0);
+        };
         g_nodes.back().wave = waveHere();
+        g_nodes.back().waveMask = waveMaskHere();
         g_dash.assign(1, secsolve::DashState{});  // section head (input unused)
         g_vy.assign(1, m_player1 ? m_player1->m_yVelocity : 0.0);
         g_accel.assign(1, m_player1 ? m_player1->m_accelerationOrSpeed : 0.0);
@@ -4340,7 +4349,7 @@ class $modify(GJBaseGameLayer) {
             int held = 0;
             for (const auto& in : g_cfg.inputs) {
                 if (in.step > tHere) break;
-                held = in.down ? 1 : 0;
+                held = (int)in.down;
             }
             return held;
         };
@@ -4494,11 +4503,20 @@ class $modify(GJBaseGameLayer) {
                 } else if ((size_t)ni >= snaps.size() || snaps[(size_t)ni].empty()) {
                     continue;
                 }
-                for (int bi = 0; bi < 2; ++bi) {
+                for (int bi = 0; bi < gdinput::branches(secsolve::g_twoPlayer, g_nodes[(size_t)ni].dual); ++bi) {
                     const auto& parent = g_nodes[(size_t)ni];
-                    const int branch = g_cfg.dpWaveStraight && parent.wave ? (parent.in ^ bi) : bi;
-                    const uint32_t waveTurns = g_cfg.dpWaveStraight
-                        ? dp::waveTurnCost(parent.waveTurns, parent.in, branch, parent.wave) : 0;
+                    const int branch = g_cfg.dpWaveStraight && parent.wave
+                        ? (gdinput::canonical(parent.in, secsolve::g_twoPlayer, parent.dual) ^ bi) : bi;
+                    uint32_t waveTurns = 0;
+                    if (g_cfg.dpWaveStraight) {
+                        if (gdinput::independent(secsolve::g_twoPlayer, parent.dual)) {
+                            const int changed = (parent.in ^ branch) & parent.waveMask;
+                            waveTurns = parent.waveTurns + (changed & 1) + ((changed >> 1) & 1);
+                        } else {
+                            waveTurns = dp::waveTurnCost(parent.waveTurns, parent.in & 1,
+                                branch & 1, parent.wave);
+                        }
+                    }
                     g_died = false;          // pick up this step's death verdict
                     std::unique_ptr<solver::SectionDiagnosticStep> fastDiag;
                     if (diagnose && !diagReported) {
@@ -4808,7 +4826,7 @@ class $modify(GJBaseGameLayer) {
                                            (uint16_t)secsolve::cntNow(this),
                                            (uint8_t)(p->m_vehicleSize < 0.9f ? 1 : 0),
                                            (uint8_t)(secDualP2() ? 1 : 0), secDualY2(),
-                                           waveHere(), waveTurns});
+                                           waveHere(), waveTurns, waveMaskHere()});
                         g_dash.emplace_back();
                         secCaptureDash(g_dash.back());
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);
@@ -4893,7 +4911,8 @@ class $modify(GJBaseGameLayer) {
                     }
                     const long long k = keyOf(py, pv, (int)modeIdx(p),
                                               p->m_vehicleSize < 0.9f ? 1 : 0,
-                                              p->m_isUpsideDown ? 1 : 0, branch,
+                                              p->m_isUpsideDown ? 1 : 0,
+                                              gdinput::canonical(branch, secsolve::g_twoPlayer, secDualP2()),
                                               px, p->m_isDashing ? 1 : 0,
                                               cntHere)
                                         ^ (long long)((unsigned long long)bitsHere
@@ -4924,7 +4943,7 @@ class $modify(GJBaseGameLayer) {
                                            (uint16_t)cntHere,
                                            (uint8_t)(p->m_vehicleSize < 0.9f ? 1 : 0),
                                            (uint8_t)(secDualP2() ? 1 : 0), secDualY2(),
-                                           waveHere(), waveTurns});
+                                           waveHere(), waveTurns, waveMaskHere()});
                         g_dash.emplace_back();
                         secCaptureDash(g_dash.back());
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);
@@ -4967,7 +4986,7 @@ class $modify(GJBaseGameLayer) {
                                            (uint16_t)cntHere,
                                            (uint8_t)(p->m_vehicleSize < 0.9f ? 1 : 0),
                                            (uint8_t)(secDualP2() ? 1 : 0), secDualY2(),
-                                           waveHere(), waveTurns});
+                                           waveHere(), waveTurns, waveMaskHere()});
                         g_dash.emplace_back();
                         secCaptureDash(g_dash.back());
                         g_vy.push_back(p ? p->m_yVelocity : 0.0);
@@ -5076,7 +5095,8 @@ class $modify(GJBaseGameLayer) {
                             + (n.dual ? std::min(k - 1, (long long)((n.y2 - y2lo) / y2s
                                                                      * (double)k))
                                       : k);
-                    return c * 2 + (n.in ? 1 : 0);
+                    return secsolve::g_twoPlayer ? c * 4 + gdinput::canonical(n.in, true, n.dual)
+                        : c * 2 + (n.in ? 1 : 0);
                 };
                 auto occupied = [&](long long k) {
                     std::unordered_set<long long> c;
@@ -5932,10 +5952,10 @@ class $modify(GJBaseGameLayer) {
                 std::vector<InputCmd> plan;
                 uint8_t held = 0;
                 for (const InputCmd& c : g_cfg.inputs)
-                    if ((long long)c.step < base) { plan.push_back(c); held = c.down ? 1 : 0; }
+                    if ((long long)c.step < base) { plan.push_back(c); held = c.down; }
                 for (size_t i = 0; i < seq.size(); ++i)
                     if (seq[i] != held) {
-                        plan.push_back(InputCmd{(int)(base + (long long)i), seq[i] != 0});
+                        plan.push_back(InputCmd{(int)(base + (long long)i), (uint8_t)seq[i]});
                         held = seq[i];
                     }
                 // cfg dpsecreuse: the rest of the plan this rung was fired from is kept through
@@ -6123,9 +6143,12 @@ class $modify(GJBaseGameLayer) {
             g_nextInputAtStart = g_nextInput;
         }
         if (secsolve::g_active) {
+            const bool two = m_levelSettings && m_levelSettings->m_twoPlayerMode;
+            secsolve::g_held = gdinput::canonical(secsolve::g_held, two, m_gameState.m_isDualMode);
+            secsolve::g_feed = gdinput::canonical(secsolve::g_feed, two, m_gameState.m_isDualMode);
             if (secsolve::g_feed != secsolve::g_held) {
                 g_injecting = true;
-                this->handleButton(secsolve::g_feed != 0, 1, true);
+                injectInputMask(this, secsolve::g_feed, secsolve::g_held);
                 g_injecting = false;
                 secsolve::g_held = secsolve::g_feed;
             }
@@ -6146,9 +6169,10 @@ class $modify(GJBaseGameLayer) {
                 auto& in = g_cfg.inputs[g_nextInput];
                 ev("INJECT_handleButton", in.step, in.down);
                 g_injecting = true;
-                this->handleButton(in.down, 1 /*jump*/, true /*player1*/);
+                injectInputMask(this, in.down, playerHeld(m_player1)
+                    | (m_gameState.m_isDualMode ? (playerHeld(m_player2) << 1) : 0));
                 g_injecting = false;
-                if (in.down) orbtrace::g_lastPress = g_tick;
+                if (in.down & 1) orbtrace::g_lastPress = g_tick;
                 ++solver::g_injThisAttempt;
                 ++g_nextInput;
             }
@@ -7467,6 +7491,14 @@ class $modify(GJBaseGameLayer) {
 
     int checkCollisions(PlayerObject* player, float dt, bool ignoreDamage) {
         bool isP1 = (player == m_player1);
+        // P2 can cross a solo portal and die later in this same native collision pass.
+        const bool activeP2 = player == m_player2 && m_gameState.m_isDualMode
+            && m_levelSettings && m_levelSettings->m_twoPlayerMode;
+        struct CollisionScope {
+            bool active;
+            explicit CollisionScope(bool on) : active(on) { if (active) ++g_activeP2Collision; }
+            ~CollisionScope() { if (active) --g_activeP2Collision; }
+        } collisionScope(activeP2);
         // Do not skip checkCollisions wholesale here: GD's collision state would go stale,
         // and the first test right after releasing noclip misdetects and dies instantly.
         // Pass-through is done via the no-op on the collidedWithObject side

@@ -1256,6 +1256,7 @@ inline void buildPois(GJBaseGameLayer* l) {
            << "\ndynamicLevelHeight=" << (ls->m_dynamicLevelHeight ? 1 : 0)
            << "\nplatformerMode=" << (ls->m_platformerMode ? 1 : 0)
            << "\nreverseGameplay=" << (ls->m_reverseGameplay ? 1 : 0)
+           << "\ntwoPlayerMode=" << (ls->m_twoPlayerMode ? 1 : 0)
            << "\n";
         log::info("levelsettings: fixRadiusCollision={} platformer={} "
                   "reverse={}", (int)ls->m_fixRadiusCollision,

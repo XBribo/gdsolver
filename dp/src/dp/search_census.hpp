@@ -47,7 +47,6 @@ inline bool g_twinAudit = false;
 // Where the rule forbids the one child an existing prune would have kept (an airborne cube whose
 // press is moot and whose release is locked), the held child is kept instead: a parent is never
 // left with no child by the rule.
-inline int g_minPulse = 0;
 inline int g_inputGrid = 0;
 // --gridmap x0:k0,x1:k1,...: the input grid as a step function of the frontier's leading x (the
 // previous layer's, as --capmap reads it). From x_i on the grid is k_i, where 0 means

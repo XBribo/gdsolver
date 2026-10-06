@@ -272,7 +272,9 @@ inline void resetInvocationState() {
     g_spentPad.clear();
     g_spentPadSeed = true;
     g_ctrlWin.clear();
+    g_ctrlWin2.clear();
     g_winRePushJump.clear();
+    g_winRePushJump2.clear();
 
     // level.hpp -- the rotated copies belong to the level that built them, and g_baseLv points
     // into cliMain's own frame
@@ -322,6 +324,7 @@ inline void resetInvocationState() {
     g_fixGravityBug = 0;
     g_fixNegativeScale = 0;
     g_fixRobotJump = 0;
+    g_twoPlayer = false;
     g_dynamicLevelHeight = 0;
     g_maxPlayY = 1e18;
     g_goalSpare = kDefGoalSpare;

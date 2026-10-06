@@ -1645,6 +1645,112 @@ static void itemProgramRules() {
     resetInvocationState();
 }
 
+// Independent input starts only inside a two-player dual and survives every per-body operation.
+static void twoPlayerInputs() {
+    using namespace dp;
+    resetInvocationState();
+    check(gdinput::branches(false, true) == 2 && gdinput::branches(true, false) == 2
+          && gdinput::branches(true, true) == 4 && gdinput::canonical(3, true, false) == 1,
+          "four input combinations require both two-player mode and an active dual");
+    check(gdinput::playerArgument(1, false) && !gdinput::playerArgument(2, false)
+          && !gdinput::playerArgument(1, true) && gdinput::playerArgument(2, true),
+          "P1/P2 injection arguments account for the native swapped-controls setting");
+    std::vector<const Obj*> empty;
+    const auto ship = gdapprox::ShipParams::normal(), shipMini = gdapprox::ShipParams::mini();
+    const auto ufo = gdapprox::UfoParams::normal(), ufoMini = gdapprox::UfoParams::mini();
+    State s{};
+    s.mode = s.mode2 = 4; s.xAbs = s.xAbs2 = 100; s.y = 200; s.y2 = 300;
+    s.dx = 1.6f; s.dual = 1;
+    s.bandFloor = 90; s.bandCeil = 390;
+    StepCtx k{101.6, 100, 1.6f, 1, &empty, &empty, &empty, &empty, &empty, &empty,
+        &ship, &shipMini, &ufo, &ufoMini};
+    bool dead = false;
+    auto sharedFirst = stepBoth(s, 1, k, dead); sharedFirst.action = 1;
+    const auto shared = stepBoth(sharedFirst, 1, k, dead);
+    check(shared.y > sharedFirst.y && shared.y2 > sharedFirst.y2, "ordinary dual retains its shared button");
+    g_twoPlayer = true;
+    const auto first1 = stepBoth(s, 1, k, dead), first2 = stepBoth(s, 2, k, dead);
+    const auto firstBoth = stepBoth(s, 3, k, dead);
+    const auto p1 = stepBoth(first1, 1, k, dead), p2 = stepBoth(first2, 2, k, dead);
+    const auto both = stepBoth(firstBoth, 3, k, dead);
+    check(p1.y > first1.y && p1.y2 < first1.y2 && p2.y < first2.y && p2.y2 > first2.y2
+          && both.y > firstBoth.y && both.y2 > firstBoth.y2,
+          "P1-only, P2-only and simultaneous inputs move the intended Wave bodies");
+    State swapped = p2;
+    swapHalves(swapped); swapHalves(swapped);
+    check(swapped.held == p2.held && swapped.held2 == p2.held2
+          && swapped.action2 == p2.action2 && swapped.jumpBuf2 == p2.jumpBuf2,
+          "independent press histories follow their body through swapping and merging");
+    State hovering = s;
+    hovering.mode = 0; hovering.mode2 = 5; hovering.vy2 = 5;
+    hovering.rHover2 = 10; hovering.action2 = hovering.held2 = hovering.jumpBuf2 = 1;
+    const auto hover = stepBoth(hovering, 2, k, dead);
+    check(hover.rHover == 0 && hover.rHover2 > 0 && hover.rHover2 < 10 && hover.vy2 == 5,
+          "P2's Robot hold consumes its own hover budget, never P1's");
+    State terminal = s;
+    terminal.mode = terminal.mode2 = 0; terminal.vy = terminal.vy2 = -20;
+    terminal.pNoTerm2 = 1;
+    const auto falling = stepBoth(terminal, 0, k, dead);
+    check(falling.vy >= -16 && falling.vy2 < -19,
+          "P2's one-tick terminal exemption is independent of P1's physics");
+    g_ctrlWin = {{1, 3}};
+    check(ctrlOffAt(2), "P1's recorded control-disabled window suppresses P1");
+    g_halfNow = 1;
+    check(!ctrlOffAt(2), "P1's control-disabled window cannot suppress independent P2");
+    g_ctrlWin2 = {{2, 4}};
+    check(ctrlOffAt(4), "P2 reads its own recorded control-disabled window");
+    g_halfNow = 0;
+    check(!ctrlOffAt(4), "P2's control-disabled window cannot suppress independent P1");
+    g_ctrlWin.clear(); g_ctrlWin2.clear();
+    State cost = s; cost.mode2 = 0;
+    check(inputTurnCost(cost, 2) == 0 && inputTurnCost(cost, 1) == 1,
+          "changing only a non-Wave partner does not increase P1's Wave turn cost");
+    SearchKey parsed;
+    check(keyOf(p1, 1) != keyOf(p2, 1)
+          && parseKeyText(keyText(keyOf(p2, 1)), parsed) && parsed == keyOf(p2, 1),
+          "two-player keys distinguish input history and round-trip the optional schema");
+    State pending = s; pending.pNoTerm2 = 1;
+    const auto largeKey = inputKeyOf(pending);
+    unsigned long long decoded = 0;
+    const std::string decimal = std::to_string(largeKey);
+    check(largeKey > (1ull << 53) && std::sscanf(decimal.c_str(), "%llu", &decoded) == 1
+          && decoded == largeKey && parseKeyText(keyText(keyOf(pending, 1)), parsed)
+          && parsed == keyOf(pending, 1),
+          "large per-body pending keys retain exact bits in decimal fixup and full-key formats");
+    Fixup f{};
+    f.x = s.xAbs; f.x2 = s.xAbs2; f.y = s.y; f.y2 = s.y2; f.vy = s.vy; f.vy2 = s.vy2;
+    f.in = 2; f.mode = 4; f.mode2 = 4; f.dual = 1; f.inputKey = inputKeyOf(s);
+    f.dy = 0; f.dy2 = 3;
+    g_fixups = g_fixupDeltas = {f};
+    State repaired = s;
+    applyFixup(s, 2, repaired, dead);
+    State wrong = s; wrong.action2 = 1;
+    check(repaired.y == s.y && repaired.y2 == s.y2 + 3
+          && !fixupMatches(f, s, 1) && !fixupMatches(f, wrong, 2),
+          "P2-only repair preserves P1 and rejects the other input combination or history");
+    g_fixups.clear(); g_fixupDeltas.clear();
+    Obj portal{}; portal.uid = 10; portal.id = 287; portal.type = 24;
+    portal.cx = 101.6; portal.cy = 200; portal.hw = 20; portal.hh = 50;
+    std::vector<const Obj*> portals{&portal}; k.ports = &portals;
+    const auto solo = stepBoth(both, 3, k, dead);
+    check(!solo.dual && !solo.held2 && !solo.action2 && !solo.jumpBuf2
+          && gdinput::branches(g_twoPlayer, solo.dual) == 2,
+          "a solo portal releases P2 and restores the two-child single-button search");
+    portal.id = 286; portal.type = 23;
+    State single = s; single.dual = 0; single.held = single.action = 1;
+    const auto born = stepBoth(single, 3, k, dead);
+    check(born.dual && born.inputMask == 1 && !born.held2 && !born.action2 && !born.jumpBuf2,
+          "dual birth ignores a premature P2 input and clears the inherited P2 press");
+    const auto following = stepBoth(born, 2, k, dead);
+    check(following.inputMask == 2 && following.action == 0 && following.action2 == 1,
+          "P2's independent input becomes available after the dual birth, never before");
+    const auto node = Node::make(17, 3);
+    check(node.parent() == 17 && node.action() == 3, "arena reconstruction preserves both input bits");
+    resetInvocationState();
+    check(!g_twoPlayer && Node::make(17, 1).action() == 1,
+          "another invocation restores the original single-button encoding");
+}
+
 int main(int argc, char** argv) {
     if (argc > 2 && !std::strcmp(argv[1], "--groups-corpus")) return groupsCorpus(argc, argv);
     groupsParser();
@@ -1677,6 +1783,7 @@ int main(int argc, char** argv) {
     itemTimerRules();
     itemPressRules();
     itemProgramRules();
+    twoPlayerInputs();
     std::printf(g_fail ? "FAILED\n" : "all ok\n");
     return g_fail;
 }

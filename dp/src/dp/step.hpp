@@ -1583,7 +1583,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // buffered tap (s.jumpBuf) is updateJump's, before the collisions, and is not held back.
     // The same order may hold for other presses that meet a launch; this is the measured one.
     if (!g_ballTapNested && s.mode == 2 && input && !s.action
-        && s.onSlope && s.rideLanded && !(!g_ctrlWin.empty() && ctrlOffAt(K.t))) {
+        && s.onSlope && s.rideLanded && !ctrlOffAt(K.t)) {
         // the per-tick diagnostics as the caller left them, put back when the re-run is dropped
         const char* const clampWhy0 = g_clampWhy;
         const int clampUid0 = g_clampUid;
@@ -1667,7 +1667,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
     // from the raw input, so a hand kept pressed across the window counts as a
     // continuation from the tick the window lifts (GD measurement: on lv22, holding
     // from t=14,100 onward makes the ship climb from the lift at t=14,225).
-    if (!g_ctrlWin.empty() && ctrlOffAt(K.t)) input = 0;
+    if (ctrlOffAt(K.t)) input = 0;
     // The ring a ship or UFO takes fired at the end of the previous tick (speed.hpp, the fly
     // rings), so this tick runs from the state it left.
     // --dualflyring: ...in a dual as well. pushButton runs per player and each body walks its own
@@ -13038,6 +13038,14 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
             if (p->type == 23 || p->type == 24) {
                 const uint8_t wantDual = (p->type == 23) ? 1 : 0;
                 if (c.dual == wantDual) continue;
+                // toggleDualMode clears independent P2 jump input on birth and releases it on exit.
+                if (g_twoPlayer) {
+                    if (g_halfNow == 1 && !wantDual)
+                        c.held = c.action = c.jumpBuf = c.edgeAge = c.latLock = 0;
+                    else c.held2 = c.action2 = c.jumpBuf2 = c.edgeAge2 = c.latLock2 = 0;
+                    c.rHover2 = c.pFlap2 = c.pNoTerm2 = c.pSpiderTap2 = c.ogLinger2 = 0;
+                    c.spiderJumpT2 = 255;
+                }
                 if (wantDual) {
                     c.xAbs2 = c.xAbs;
                     c.tpSkip2 = 0;
@@ -13047,6 +13055,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                     // now (this pass's earlier portals included), and with no
                     // press behind it -- it has not been anywhere yet.
                     c.mode2 = c.mode;
+                    if (g_twoPlayer) c.latLock2 = c.mode2 == 1 || c.mode2 == 3;
                     c.mini2 = c.mini;
                     if (g_dualSlide) c.slideT2 = c.slideT;   // --dualslide: born with p1's arm
                     c.ceilT2 = 0;
@@ -13150,7 +13159,7 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
                 // OTHER body's -- s.mode2 in the first half, p1's finished mode in the second
                 // (frames.hpp g_dualOtherMode; stepBoth swaps the halves for p2).
                 const int otherMode = (g_dualOtherMode >= 0) ? g_dualOtherMode : (int)s.mode2;
-                const double H = inDual ? (g_dualBand ? std::max(bandHeightDual(wantMode),
+                const double H = inDual ? ((g_dualBand || g_twoPlayer) ? std::max(bandHeightDual(wantMode),
                                                                   bandHeightDual(otherMode))
                                                       : bandHeightDual(wantMode))
                                         : bandHeightFor(p->type);
@@ -16806,6 +16815,16 @@ inline State stepOne(const State& s, int input, const StepCtx& K, bool& dead,
 // see different geometry, so nothing about the second can be derived from the
 // first once either of them touches anything.
 inline void swapHalves(State& s) {
+    if (g_twoPlayer) {
+        std::swap(s.held, s.held2);
+        std::swap(s.action, s.action2);
+        std::swap(s.jumpBuf, s.jumpBuf2);
+        std::swap(s.edgeAge, s.edgeAge2);
+        std::swap(s.latLock, s.latLock2);
+        std::swap(s.rHover, s.rHover2); std::swap(s.pFlap, s.pFlap2);
+        std::swap(s.pNoTerm, s.pNoTerm2); std::swap(s.pSpiderTap, s.pSpiderTap2);
+        std::swap(s.ogLinger, s.ogLinger2); std::swap(s.spiderJumpT, s.spiderJumpT2);
+    }
     std::swap(s.xAbs, s.xAbs2);
     std::swap(s.gravityMod, s.gravityMod2);
     std::swap(s.spinMod, s.spinMod2);
